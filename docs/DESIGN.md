@@ -1,6 +1,6 @@
 # TendrilFlow 总设计
 
-TendrilFlow 是一个面向本地编码 Agent 的任务协作工作台。它的第一版目标是把 Codex CLI 组织成一个可启动、可分配任务、可观察沟通、可交接上下文、可审查结果的本地多 agent 系统。
+TendrilFlow 是一个面向本地编码 Agent 的任务协作工作台。它的第一版目标是把 Codex CLI 等 coding agents 组织成一个可启动、可分配任务、可观察沟通、可交接上下文、可审查结果的本地多 agent 系统。
 
 ## 1. 产品定位
 
@@ -16,8 +16,9 @@ TendrilFlow 解决的问题是：当用户同时使用多个 coding agents 处�
 - 以 Agent Room 展示沟通
 - 以文件保存 transcript
 - 以结构化交接保证上下文不丢
+- 优先通过 Agent Client Protocol（ACP）连接外部 coding agents
 
-第一版 provider 是 Codex CLI。后续可以通过 adapter 接入 Kimi、Gemini 或其他 CLI/SDK agent。
+第一版 provider 以 Codex CLI 为主要目标。Agent 通信优先走 ACP；当某个 agent 没有稳定 ACP 支持时，通过 legacy CLI adapter 兜底。后续可以通过 adapter 接入 Kimi、Gemini 或其他 CLI/SDK agent。
 
 ## 2. MVP 已确认范围
 
@@ -28,7 +29,9 @@ MVP 包含：
 - Agent Launcher
 - Agent Room
 - Orchestrator
-- Codex CLI Adapter
+- ACP Adapter
+- Legacy CLI Adapter
+- Codex CLI integration
 - Work Agent
 - Observe Agent
 - Debug Agent
@@ -46,6 +49,7 @@ MVP 不包含：
 - agent 私有草稿区
 - 原始 chain-of-thought 暴露
 - 云端多用户协作
+- 自定义或扩展 ACP 协议本身
 
 ## 3. 核心模块
 
@@ -63,11 +67,15 @@ MVP 不包含：
 
 负责启动和管理 agent 进程。
 
-第一版只需要支持 Codex CLI：
+第一版需要支持两类 agent 进程：
+
+- ACP-compatible agent：首选路径，例如支持 ACP 的 Gemini CLI、Kimi CLI、Codex ACP adapter 或其他 coding agent。
+- Legacy CLI agent：兜底路径，例如尚未提供稳定 ACP 接口的 CLI agent。
 
 - 配置 agent 名称和角色
 - 配置工作目录
 - 配置启动命令
+- 配置 transport 类型：`acp` 或 `legacy_cli`
 - 记录运行状态
 - 停止或重启 agent
 
@@ -126,6 +134,7 @@ Orchestrator 是 TendrilFlow 的协调核心。
 - 路由用户消息和 agent 消息
 - 维护 agent 状态
 - 收集 agent 输出
+- 将 ACP session updates 或 legacy CLI 输出归一化为 TendrilFlow events
 - 写入 transcript 文件
 - 触发讨论、review、debug 和交接流程
 - 保持 provider 逻辑隔离在 adapter 层
@@ -134,7 +143,12 @@ Orchestrator 是 TendrilFlow 的协调核心。
 
 Agent Adapter 封装 provider 特有逻辑。
 
-第一版实现 Codex CLI Adapter。
+第一版 adapter 分两层：
+
+- ACP Adapter：首选路径，负责与 ACP-compatible agents 通信。
+- Legacy CLI Adapter：兜底路径，负责以进程输入输出方式驱动普通 CLI agent。
+
+ACP 不取代 TendrilFlow 的任务模型。Task Board、Agent Room、角色、讨论、交接、review 和 transcript 都是 TendrilFlow 自己的上层协作模型。
 
 统一能力：
 
@@ -146,7 +160,70 @@ Agent Adapter 封装 provider 特有逻辑。
 - `attach_task_context`
 - `emit_event`
 
-## 4. 角色模型
+### ACP Adapter
+
+ACP Adapter 是首选 agent transport。
+
+职责：
+
+- 启动 ACP agent 进程
+- 完成 ACP initialize/session handshake
+- 创建或加载 agent session
+- 向 agent 发送 prompt
+- 取消正在执行的 prompt
+- 接收 session update、agent message、tool call、agent plan 等事件
+- 将 ACP 事件转换为 TendrilFlow 内部事件
+
+TendrilFlow 不直接把 ACP 原始消息暴露给 UI。UI 只消费 TendrilFlow room events。
+
+### Legacy CLI Adapter
+
+Legacy CLI Adapter 用于没有稳定 ACP 支持的 agent。
+
+职责：
+
+- 启动普通 CLI 进程
+- 向 stdin 写入用户或 orchestrator 消息
+- 读取 stdout/stderr
+- 基于进程输出生成 TendrilFlow events
+- 在无法结构化识别时，将输出保存为 `agent_message` 或 `tool_call_summary`
+
+Legacy CLI Adapter 是兼容层，不应成为长期主路径。
+
+## 4. ACP 集成策略
+
+ACP 是 TendrilFlow 的首选 agent transport，而不是 TendrilFlow 的全部架构。
+
+推荐分层：
+
+```text
+Local Web App
+  -> TendrilFlow Orchestrator
+  -> Agent Adapter Layer
+  -> ACP Agent / Legacy CLI Agent
+```
+
+ACP 负责客户端和 coding agent 之间的标准化通信。TendrilFlow 负责多 agent 协作产品层，包括：
+
+- Task Board
+- Agent Room
+- Coordinator
+- 讨论机制
+- 交接机制
+- Review workflow
+- 文件 transcript
+- 可审计 trace
+
+ACP Adapter 的输出必须归一化为 `.tendrilflow/tasks/{task_id}/events.jsonl` 中的事件，避免 UI、Task Board 或 Coordinator 直接依赖某个 provider 的协议细节。
+
+参考资料：
+
+- [Agent Client Protocol Introduction](https://agentclientprotocol.com/get-started/introduction)
+- [ACP Agents Registry](https://agentclientprotocol.com/get-started/agents)
+- [Gemini CLI ACP Mode](https://geminicli.com/docs/cli/acp-mode/)
+- [GitHub Copilot CLI ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
+
+## 5. 角色模型
 
 ### Work Agent
 
@@ -214,7 +291,7 @@ Coordinator Agent 进入 MVP。
 
 Coordinator 不是自动独裁调度器。MVP 中它应给出建议和组织流程，用户仍保留最终控制权。
 
-## 5. 数据和文件存储
+## 6. 数据和文件存储
 
 Transcript 使用文件存储。
 
@@ -268,7 +345,20 @@ MVP 事件类型：
 - `review_comment`
 - `final_report`
 
-## 6. 协作流程
+### ACP 到 TendrilFlow 事件映射
+
+ACP Adapter 应将协议事件转换为 TendrilFlow room events：
+
+- agent text/message update -> `agent_message`
+- tool call or terminal activity -> `tool_call_summary`
+- agent plan update -> `decision_record` 或 `agent_message`
+- permission/status/session state -> `status_change`
+- prompt completion -> `system_event` 或 `final_report`
+- adapter failure -> `system_event`
+
+映射目标不是完整复刻 ACP，而是生成用户可读、可追踪、可用于 handoff 和 review 的任务事件流。
+
+## 7. 协作流程
 
 ### 基础任务流
 
@@ -309,7 +399,7 @@ Handoff card 内容：
 
 接手 agent 必须先确认理解交接内容，再继续执行。
 
-## 7. Trace 策略
+## 8. Trace 策略
 
 TendrilFlow 不暴露原始 chain-of-thought。
 
@@ -328,7 +418,7 @@ TendrilFlow 不暴露原始 chain-of-thought。
 
 这能提供足够透明度，同时避免依赖私有推理过程。
 
-## 8. 与 Coze Studio 的区别
+## 9. 与 Coze Studio 的区别
 
 Coze Studio 是通用 AI Agent 应用开发平台，重点是创建 agent、配置资源、编排 workflow，并发布应用。
 
@@ -340,14 +430,17 @@ TendrilFlow 的重点不是创建通用 AI 应用，而是管理本地 coding ag
 - Coze Studio 聚焦 agent 应用构建，TendrilFlow 聚焦真实代码任务执行。
 - Coze Studio 强调 workflow 和资源配置，TendrilFlow 强调 task room、handoff、review 和可恢复执行。
 - Coze Studio 的 agent 多运行在平台抽象中，TendrilFlow 管理外部 CLI/SDK agent 进程。
+- ACP 解决的是 TendrilFlow 到 coding agent 的通信标准化；Coze 解决的是 agent app 构建和发布。
 
-## 9. 验收场景
+## 10. 验收场景
 
 - 用户能启动 local web app。
 - 用户能启动一个 Codex work agent。
+- 用户能启动一个 ACP-compatible agent。
 - 用户能创建本地任务并分配给 agent。
 - 用户能在 Agent Room 看到 transcript。
 - `events.jsonl` 能持续记录房间事件。
+- ACP session update 能转换为 TendrilFlow room event。
 - 用户能 `@coordinator` 触发任务拆分或分配建议。
 - 用户能 `@review-agent` 触发 review。
 - 用户能 `@debug-agent` 触发失败分析。

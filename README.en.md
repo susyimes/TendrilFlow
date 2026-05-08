@@ -10,7 +10,7 @@ The name comes from the image of tendrils reaching into different parts of a tas
 
 TendrilFlow is not a general AI agent application builder. It is designed to organize local CLI or SDK agents, such as Codex CLI, Kimi, Gemini, or custom agents, into a controllable, observable, and handoff-friendly task team.
 
-The first implementation target is Codex CLI. Future providers should be added through adapters.
+The preferred agent transport is Agent Client Protocol (ACP). Agents without stable ACP support can still be connected through a legacy CLI adapter. Future providers should be added through adapters.
 
 ## Confirmed MVP Decisions
 
@@ -19,6 +19,7 @@ The first implementation target is Codex CLI. Future providers should be added t
 - Agent communication: visible by default in the Agent Room.
 - Coordinator role: included in the MVP.
 - External task boards: not included in v1. Tasks come from the local Task Board or direct user dispatch.
+- Agent transport: ACP first, legacy CLI fallback.
 
 ## Core Modules
 
@@ -26,7 +27,7 @@ The first implementation target is Codex CLI. Future providers should be added t
 - Task Board: creates, assigns, and tracks tasks.
 - Agent Room: shows group-style task collaboration.
 - Orchestrator: routes messages, tracks state, stores transcript files, and coordinates handoff or review.
-- Agent Adapter: isolates provider-specific behavior, starting with Codex CLI.
+- Agent Adapter: isolates provider-specific behavior through an ACP Adapter and a legacy CLI fallback.
 
 ## Agent Roles
 
@@ -77,13 +78,37 @@ Coze Studio is closer to a general AI agent application development platform. It
 
 TendrilFlow focuses on local coding agents that already exist. It organizes tools like Codex CLI, Kimi, and Gemini into a workspace for real repository tasks, discussion, handoff, review, and recovery.
 
+## ACP Integration Strategy
+
+ACP is TendrilFlow's preferred agent transport, not TendrilFlow's whole architecture.
+
+TendrilFlow keeps its own task, room, role, handoff, and trace model. ACP is used to standardize communication with external coding agents.
+
+Recommended layering:
+
+```text
+Local Web App
+  -> TendrilFlow Orchestrator
+  -> Agent Adapter Layer
+  -> ACP Agent / Legacy CLI Agent
+```
+
+References:
+
+- [Agent Client Protocol Introduction](https://agentclientprotocol.com/get-started/introduction)
+- [ACP Agents Registry](https://agentclientprotocol.com/get-started/agents)
+- [Gemini CLI ACP Mode](https://geminicli.com/docs/cli/acp-mode/)
+- [GitHub Copilot CLI ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
+
 ## MVP Scope
 
 Included:
 
 - local web app
 - file-based transcript storage
-- one Codex CLI adapter
+- ACP Adapter as the preferred agent transport
+- legacy CLI adapter as fallback
+- Codex CLI integration
 - local Task Board
 - manual task creation
 - manual agent launch
@@ -100,3 +125,4 @@ Not included in v1:
 - RAG or knowledge base platform
 - private agent scratchpads
 - raw COT exposure
+- custom extensions to the ACP specification itself

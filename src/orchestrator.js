@@ -15,10 +15,35 @@ class Orchestrator {
     this.store = new FileStore(this.rootDir);
     this.sessions = new Map();
     this.stoppingAgents = new Set();
+    this.detachedSessionsReconciled = false;
   }
 
   async init() {
     await this.store.init();
+    if (!this.detachedSessionsReconciled) {
+      await this.reconcileDetachedAgentSessions();
+      this.detachedSessionsReconciled = true;
+    }
+  }
+
+  async reconcileDetachedAgentSessions() {
+    const agents = await this.store.listAgents();
+    for (const agent of agents) {
+      if (agent.status !== "running" || this.sessions.has(agent.id)) {
+        continue;
+      }
+      await this.store.patchAgent(agent.id, {
+        status: "stopped",
+        current_task_id: null,
+        last_error: "Detached from prior TendrilFlow server session; start the agent again."
+      });
+      await this.store.appendAgentLog(agent, {
+        type: "status_change",
+        content: {
+          text: "Marked stopped because this server has no attached CLI session for the persisted running state."
+        }
+      });
+    }
   }
 
   async state() {
@@ -379,14 +404,23 @@ class Orchestrator {
       return this.taskWithEvents(taskId);
     }
 
-    for (const agent of targets) {
-      await this.routeToAgent(task, agent, message);
-    }
-    if (actor.kind === "user") {
-      const delegations = this.resolveHostDelegations(message, agents, targets);
+    const delegations = actor.kind === "user" ? this.resolveHostDelegations(message, agents, targets) : [];
+    if (delegations.length) {
       for (const delegation of delegations) {
         await this.executeHostDelegationTool(task, delegation);
       }
+      const delegatedTargetIds = new Set(delegations.map((delegation) => delegation.target.id));
+      const remainingTargets = targets.filter(
+        (agent) => agent.role !== "host" && !delegatedTargetIds.has(agent.id)
+      );
+      for (const agent of remainingTargets) {
+        await this.routeToAgent(task, agent, message);
+      }
+      return this.taskWithEvents(taskId);
+    }
+
+    for (const agent of targets) {
+      await this.routeToAgent(task, agent, message);
     }
     return this.taskWithEvents(taskId);
   }
@@ -679,6 +713,14 @@ class Orchestrator {
       sent = await session.sendMessage(task, await this.buildAgentContextMessage(task, message, agent));
     }
     if (!sent) {
+      const latestAgent = await this.store.getAgent(agent.id);
+      if (!session && latestAgent?.status === "running") {
+        await this.store.patchAgent(agent.id, {
+          status: "stopped",
+          current_task_id: null,
+          last_error: "No attached CLI session; start the agent again."
+        });
+      }
       await this.store.appendAgentLog(agent, {
         type: session ? "error" : "status_change",
         task_id: task.task_id,

@@ -425,6 +425,28 @@ test("explicit agent stop remains stopped after the child process exits", async 
   assert.equal((await orchestrator.store.getAgent(review.id)).status, "stopped");
 });
 
+test("startup marks persisted running agents stopped when no session is attached", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const stale = await createTestAgent(orchestrator, {
+    name: "stale-agent",
+    role: "work"
+  });
+  await orchestrator.store.patchAgent(stale.id, {
+    status: "running",
+    current_task_id: "task_missing"
+  });
+
+  const nextOrchestrator = new Orchestrator(root);
+  await nextOrchestrator.init();
+
+  const reconciled = await nextOrchestrator.store.getAgent(stale.id);
+  const logs = await nextOrchestrator.store.readAgentLogs(stale.id);
+  assert.equal(reconciled.status, "stopped");
+  assert.equal(reconciled.current_task_id, null);
+  assert.match(reconciled.last_error, /Detached from prior TendrilFlow server session/);
+  assert.ok(logs.some((event) => event.content?.text?.includes("no attached CLI session")));
+});
+
 test("routes @host, @群主, @review-agent, and @debug-agent into visible room events", async () => {
   const { orchestrator } = await makeOrchestrator();
   const worker = await createTestAgent(orchestrator, { name: "codex-worker", role: "work" });
@@ -504,6 +526,7 @@ test("user-to-host delegation routes one review request to the named agent", asy
     )
   );
   assert.ok(events.some((event) => event.type === "review_comment" && event.actor.id === reviewer.id));
+  assert.ok(!events.some((event) => event.actor?.id === "agent_host" && event.content?.source === "role_profile"));
 });
 
 test("agent-authored host-like text does not trigger orchestration delegation", async () => {

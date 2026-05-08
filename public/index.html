@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TendrilFlow</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark">TF</div>
+          <div>
+            <h1>TendrilFlow</h1>
+            <p id="workspacePath"></p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <label class="language-control">
+            <span data-i18n="language">语言</span>
+            <select id="languageSelect" aria-label="Language">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <button id="refreshButton" class="ghost-button" type="button" data-i18n="refresh">刷新</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar">
+          <section class="side-section">
+            <div class="section-heading">
+              <div>
+                <h2 data-i18n="groups">群组</h2>
+                <p data-i18n="groupsHint">agent 群组</p>
+              </div>
+            </div>
+
+            <form id="groupForm" class="group-create-form">
+              <label>
+                <span data-i18n="groupName">群组名称</span>
+                <input name="name" required data-i18n-placeholder="groupNamePlaceholder" placeholder="功能开发群" />
+              </label>
+              <button type="submit" data-i18n="createGroup">创建群组</button>
+            </form>
+
+            <div id="groupList" class="group-list"></div>
+          </section>
+        </aside>
+
+        <section class="room-panel">
+          <div id="taskRoomView" class="room-view">
+            <div class="room-header">
+              <div class="room-title-block">
+                <span class="eyebrow" data-i18n="agentRoom">Agent Room</span>
+                <h2 id="roomTitle">Agent Room</h2>
+                <p id="roomMeta"></p>
+              </div>
+              <div class="room-controls">
+                <label>
+                  <span data-i18n="status">状态</span>
+                  <select id="taskStatusSelect"></select>
+                </label>
+                <label>
+                  <span data-i18n="owner">负责人</span>
+                  <select id="taskOwnerSelect"></select>
+                </label>
+                <button id="deleteTaskButton" class="danger-button" type="button" data-i18n="deleteTask">删除任务</button>
+              </div>
+            </div>
+
+            <div class="room-action-bar">
+              <div class="focus-summary">
+                <span class="focus-label" data-i18n="primaryAction">当前动作</span>
+                <strong id="nextActionText"></strong>
+                <span id="focusOwnerText"></span>
+              </div>
+              <div class="focus-actions">
+                <button id="startOwnerButton" class="ghost-button" type="button" data-i18n="startOwner">启动负责人</button>
+                <button id="ownerContinueButton" type="button" data-i18n="continueOwner">继续执行</button>
+              </div>
+            </div>
+
+            <div class="quick-actions">
+              <button type="button" data-room-action="plan" data-i18n="actionPlan">拆分计划</button>
+              <button type="button" data-room-action="review" data-i18n="actionReview">请求审查</button>
+              <button type="button" data-room-action="debug" data-i18n="actionDebug">排查阻塞</button>
+              <button id="finalReportButton" type="button" data-i18n="finalReport">最终报告</button>
+            </div>
+
+            <div id="eventStream" class="event-stream"></div>
+
+            <form id="messageForm" class="message-form">
+              <div id="mentionSuggest" class="mention-suggest hidden"></div>
+              <textarea name="text" rows="3" data-i18n-placeholder="messagePlaceholder" placeholder="@codex-worker 继续执行"></textarea>
+              <button type="submit" data-i18n="send">发送</button>
+            </form>
+          </div>
+
+          <div id="agentConsoleView" class="agent-console hidden">
+            <div class="room-header">
+              <div class="room-title-block">
+                <span class="eyebrow" data-i18n="agentConsole">Agent Console</span>
+                <h2 id="consoleTitle">Agent Console</h2>
+                <p id="consoleMeta"></p>
+              </div>
+              <div class="console-actions">
+                <button id="backToRoomButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
+                <button id="consoleStartButton" type="button" data-i18n="start">启动</button>
+                <button id="consoleStopButton" class="ghost-button" type="button" data-i18n="stop">停止</button>
+                <button id="consoleDeleteButton" class="danger-button" type="button" data-i18n="delete">删除</button>
+              </div>
+            </div>
+            <div id="consoleSummary" class="console-summary"></div>
+            <div id="agentLogStream" class="event-stream agent-log-stream"></div>
+          </div>
+
+          <div id="handoffRulesView" class="handoff-rules-view hidden">
+            <div class="room-header">
+              <div class="room-title-block">
+                <span class="eyebrow" data-i18n="handoffRules">交接规则</span>
+                <h2 id="handoffRulesTitle">交接规则</h2>
+                <p id="handoffRulesMeta"></p>
+              </div>
+              <div class="console-actions">
+                <button id="backFromRulesButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
+              </div>
+            </div>
+            <div class="handoff-policy-strip">
+              <strong data-i18n="defaultHandoffOwner">默认交接由群主定义</strong>
+              <span data-i18n="customHandoffCanvasHint">自定义规则在这里以 agent 连线方式调整</span>
+            </div>
+            <div class="handoff-rules-layout">
+              <div id="handoffRulesCanvas" class="handoff-canvas"></div>
+              <aside class="rules-editor">
+                <form id="handoffRuleForm" class="stacked-form">
+                  <label>
+                    <span data-i18n="ruleFrom">从</span>
+                    <select name="from_agent_id"></select>
+                  </label>
+                  <label>
+                    <span data-i18n="ruleTo">到</span>
+                    <select name="to_agent_id"></select>
+                  </label>
+                  <label>
+                    <span data-i18n="ruleTrigger">触发条件</span>
+                    <select name="trigger"></select>
+                  </label>
+                  <label>
+                    <span data-i18n="ruleLabel">规则名称</span>
+                    <input name="label" data-i18n-placeholder="ruleLabelPlaceholder" placeholder="阻塞时交给群主" />
+                  </label>
+                  <label>
+                    <span data-i18n="ruleDescription">说明</span>
+                    <textarea name="description" rows="3" data-i18n-placeholder="ruleDescriptionPlaceholder" placeholder="何时使用这条交接线"></textarea>
+                  </label>
+                  <button type="submit" data-i18n="addRule">添加规则</button>
+                </form>
+                <div id="handoffRuleList" class="handoff-rule-list"></div>
+              </aside>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <section class="inspector-section">
+            <div class="section-heading">
+              <div>
+                <h2 data-i18n="groupTasks">群组任务</h2>
+                <p id="groupTaskHint"></p>
+              </div>
+            </div>
+
+            <form id="taskForm" class="task-create-form">
+              <div class="task-create-main">
+                <label>
+                  <span data-i18n="taskTitle">标题</span>
+                  <input name="title" required data-i18n-placeholder="taskTitlePlaceholder" placeholder="实现一个功能" />
+                </label>
+                <label>
+                  <span data-i18n="owner">负责人</span>
+                  <select name="owner_agent_id"></select>
+                </label>
+              </div>
+              <details class="form-drawer">
+                <summary data-i18n="moreContext">补充上下文</summary>
+                <label>
+                  <span data-i18n="taskDescription">描述</span>
+                  <textarea name="description" rows="3" data-i18n-placeholder="taskDescriptionPlaceholder" placeholder="任务目标、验收标准、上下文"></textarea>
+                </label>
+              </details>
+              <button type="submit" data-i18n="createTask">创建任务</button>
+            </form>
+
+            <div id="taskBoard" class="task-list"></div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="section-heading">
+              <div>
+                <h2 data-i18n="launcher">Agent Launcher</h2>
+                <p data-i18n="launcherHint">工作目录和模式在这里配置</p>
+              </div>
+            </div>
+
+            <form id="agentForm" class="stacked-form">
+              <div class="field-grid two-columns">
+                <label>
+                  <span data-i18n="agentName">名称</span>
+                  <input name="name" required value="new-agent" />
+                </label>
+                <label>
+                  <span data-i18n="provider">Provider</span>
+                  <select name="provider"></select>
+                </label>
+              </div>
+
+              <label>
+                <span data-i18n="role">角色</span>
+                <select name="role"></select>
+              </label>
+
+              <details class="form-drawer advanced-drawer">
+                <summary data-i18n="advancedConfig">高级配置</summary>
+                <label>
+                  <span data-i18n="runMode">运行方式</span>
+                  <select name="mode"></select>
+                </label>
+                <label class="prominent-field">
+                  <span data-i18n="workingDir">工作目录</span>
+                  <input name="cwd" />
+                </label>
+                <button id="useRootButton" class="ghost-button full-width" type="button" data-i18n="useWorkspaceRoot">使用项目根目录</button>
+                <label>
+                  <span data-i18n="command">启动命令</span>
+                  <input name="command" data-i18n-placeholder="commandPlaceholder" placeholder="node scripts/codex-agent.js --name new-agent --mode mock" />
+                </label>
+                <button id="commandPresetButton" class="ghost-button full-width" type="button" data-i18n="usePresetCommand">套用推荐命令</button>
+              </details>
+              <button type="submit" data-i18n="createAgent">创建 Agent</button>
+            </form>
+          </section>
+
+          <section class="inspector-section agents-section">
+            <div class="section-heading compact-heading">
+              <div>
+                <h2 data-i18n="groupAgents">群组 Agents</h2>
+                <p data-i18n="agentsHint">启动、停止、删除</p>
+              </div>
+              <button id="handoffRulesButton" class="ghost-button" type="button" data-i18n="handoffRules">交接规则</button>
+            </div>
+            <div id="agentList" class="agent-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,26 +1,35 @@
 # TendrilFlow
 
-[English README](./README.en.md)
+[English README](./README.en.md) | [总设计](./docs/DESIGN.md)
 
-TendrilFlow 是一个本地优先的多 Agent 任务协作系统。
+TendrilFlow 是一个面向本地编码 Agent 的任务协作工作台。
 
 名字来自“触手向不同方向伸展并处理任务”的意象：每个 agent 都可以承担一个清晰角色，围绕任务进行可见讨论，必要时完成结构化交接，并留下可审计的工作轨迹。
 
-## 产品意图
+## 产品定位
 
-TendrilFlow 的目标不是简单启动多个聊天窗口，而是把多个 CLI 或 SDK agent 组织成一个可控制、可观察、可交接的工作系统。
+TendrilFlow 的目标不是构建通用 AI Agent 应用平台，而是把 Codex CLI、Kimi、Gemini 或其他 CLI/SDK agent 组织成一个可控制、可观察、可交接的本地任务团队。
 
-第一阶段以 Codex CLI 作为主要执行 agent。后续版本应通过 adapter 扩展到 Kimi、Gemini 或其他本地/云端 agent。
+第一阶段以 Codex CLI 作为主要执行 agent。后续 provider 应通过 adapter 扩展，而不是让上层产品逻辑绑定某一个 agent 实现。
 
 核心能力包括：
 
-- 启动和配置 agents 的界面
-- 任务入口和任务板
+- 通过本地 Web App 启动和配置 agents
+- 在本地 Task Board 创建、分配和推进任务
 - 直接 `@agent` 或选中 agent 下发任务
 - 以群组形式展示 agent 间沟通
-- agent 间结构化讨论和交接
-- 可定制角色，例如 work、observe、debug、review
-- 可审计的工作轨迹，包括计划、决策、工具调用、状态变化、讨论、review 和交接记录
+- 支持 agent 间结构化讨论和交接
+- 内置 work、observe、debug、review、coordinator 等角色
+- 使用文件保存 task room transcript
+- 展示可审计工作轨迹，包括计划、决策、工具调用、状态变化、讨论、review 和交接记录
+
+## MVP 已确认决策
+
+- 第一版 UI：local web app。
+- Transcript 存储：文件存储，主事件流为 `.tendrilflow/tasks/{task_id}/events.jsonl`。
+- Agent 沟通可见性：默认全部进入 Agent Room，对用户可见。
+- Coordinator role：进入 MVP，负责组织讨论、拆分任务、建议分配和推动交接。
+- 外部任务板：v1 不接入 GitHub Issues、Linear、Jira 等系统，任务只来自本地 Task Board 或用户直接下发。
 
 ## 核心体验
 
@@ -52,8 +61,6 @@ TendrilFlow 应该像一个 agent 工作指挥室。
 - 权限或执行模式
 - 启动命令
 - 运行状态
-
-后续 provider 应通过 adapter 接入，避免上层产品逻辑绑定某一个 agent 实现。
 
 ### Task Board
 
@@ -92,6 +99,7 @@ TendrilFlow 应该像一个 agent 工作指挥室。
 - 工具调用摘要
 - 任务状态变化
 - 讨论过程
+- 决策记录
 - 交接卡片
 - review comments
 - 最终任务报告
@@ -101,6 +109,7 @@ TendrilFlow 应该像一个 agent 工作指挥室。
 ```text
 @review-agent 请 review 当前变更
 @debug-agent 看一下为什么任务失败
+@coordinator 帮我拆分这个任务并安排执行顺序
 @codex-worker 从交接卡片继续执行
 ```
 
@@ -114,9 +123,9 @@ Orchestrator 应负责：
 - 路由消息到对应 agent
 - 跟踪 agent 状态
 - 收集 agent 进程输出
-- 存储事件流
+- 将 transcript 写入本地文件
 - 约束角色边界
-- 判断何时需要交接或 review
+- 判断何时需要讨论、交接或 review
 - 将 provider 相关逻辑隔离到 adapter 内部
 
 ### Agent Adapter
@@ -135,8 +144,6 @@ Orchestrator 应负责：
 - 附加任务上下文
 - 发出结构化事件
 
-Provider 特有行为应保留在 adapter 层。
-
 ## Agent 角色
 
 ### Work Agent
@@ -154,7 +161,7 @@ Provider 特有行为应保留在 adapter 层。
 
 ### Observe Agent
 
-上下文和协调角色。
+上下文和观察角色。
 
 职责：
 
@@ -193,7 +200,7 @@ Debug agent 应基于可观察 trace 工作，而不是依赖原始私有思维�
 
 ### Coordinator Agent
 
-可选的高层规划角色。
+MVP 内置的协调角色。
 
 职责：
 
@@ -201,6 +208,7 @@ Debug agent 应基于可观察 trace 工作，而不是依赖原始私有思维�
 - 推荐 agent 分配
 - 组织讨论
 - 总结决策
+- 推动交接
 - 解决任务归属冲突
 
 ## 沟通机制
@@ -261,8 +269,6 @@ Agent 应能围绕方案和风险进行讨论。
 
 接手 agent 应先确认理解交接内容，再继续执行。
 
-这个机制用于避免 agent 切换时丢失上下文。
-
 ## 推理与 Trace 策略
 
 产品不应暴露原始 chain-of-thought。
@@ -282,49 +288,57 @@ TendrilFlow 应展示的是可审计推理轨迹：
 
 这能让用户获得足够透明度和控制权，同时不依赖原始私有推理过程。
 
+## 与 Coze Studio 的区别
+
+Coze Studio 更像一个通用 AI Agent 应用开发平台，重点是创建 agent、配置资源、编排 workflow，并发布到业务应用。
+
+TendrilFlow 不做通用低代码 agent builder。它的重点是管理已经存在的本地 coding agents，把 Codex CLI、Kimi、Gemini 等工具组织成一个能围绕真实代码仓库执行任务、讨论、交接、review 和恢复的协作工作台。
+
 ## MVP 流程
 
-1. 用户创建任务。
-2. 用户把任务分配给一个 Codex work agent。
-3. TendrilFlow 创建任务房间。
+1. 用户在 local web app 创建任务。
+2. 用户把任务分配给一个 Codex work agent，或由 coordinator 建议分配。
+3. TendrilFlow 创建任务房间和本地 transcript 文件。
 4. Work agent 开始执行，并持续发出进度事件。
 5. 用户可以在房间里观察 transcript。
-6. 用户可以在需要时 `@debug-agent` 或 `@review-agent`。
+6. 用户可以在需要时 `@debug-agent`、`@review-agent` 或 `@coordinator`。
 7. Agents 在任务房间里讨论阻塞、方案或 review 结果。
 8. 如果任务 owner 变化，当前 agent 创建交接卡片。
 9. 接手 agent 确认交接并继续执行。
 10. 任务完成后，房间生成最终报告，任务进入 `done`。
 
-## 第一版建议
+## 第一版范围
 
 第一版应保持足够小：
 
-- 本地 Web UI
-- 本地数据存储
+- local web app
+- 文件存储 transcript
 - 一个 Codex CLI adapter
+- 本地 Task Board
 - 手动创建任务
 - 手动启动 agent
 - 手动 `@agent` 路由
+- Coordinator 进入 MVP
 - 任务房间 transcript
 - 结构化交接卡片
 - review 和 debug 作为可配置 agent profiles
 
-自动调度可以等控制界面和协作体验稳定后再做。
+第一版不做：
+
+- GitHub Issues、Linear、Jira 等外部任务板接入
+- 通用低代码 agent builder
+- 知识库/RAG 平台
+- agent 私有草稿区
+- 原始 COT 暴露
 
 ## 测试场景
 
 - 启动一个 Codex work agent，并看到状态变为 `running`。
 - 创建任务，并分配给选中的 agent。
+- 在任务房间里 `@coordinator`，看到任务拆分、分配建议和决策记录。
 - 在任务房间里 `@review-agent`，看到 review 输出进入 transcript。
 - 任务失败后 `@debug-agent`，看到基于日志和事件的失败分析。
 - 通过交接卡片把任务从 Agent A 转给 Agent B。
 - 任务完成后生成最终报告。
+- 确认 transcript 写入 `.tendrilflow/tasks/{task_id}/events.jsonl`。
 - 确认用户能以群组形式看到任务讨论、交接、review 和完成过程。
-
-## 开放问题
-
-- 第一版 UI 应该是 Web app、桌面 app，还是 terminal UI？
-- Orchestrator 的 transcript 应存 SQLite、文件，还是两者都存？
-- 后续是否需要 agent 私有草稿区，还是所有 agent 沟通都默认可见？
-- Coordinator role 是否进入 MVP，还是放到后续版本？
-- v1 是否接入 GitHub Issues、Linear、Jira 等外部任务板？

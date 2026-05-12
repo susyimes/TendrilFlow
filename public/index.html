@@ -6,282 +6,375 @@
     <title>TendrilFlow</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body>
-    <div class="app-shell">
-      <header class="topbar">
-        <div class="brand-block">
-          <div class="brand-mark">TF</div>
-          <div>
-            <h1>TendrilFlow</h1>
-            <p id="workspacePath"></p>
+  <body class="inspector-collapsed wc-theme">
+    <div class="wc-app">
+      <nav class="wc-rail" aria-label="Primary">
+        <div class="wc-rail-top">
+          <button id="railAvatar" class="wc-rail-avatar" type="button" title="" data-i18n-title="settings">TF</button>
+          <button class="wc-rail-icon active" type="button" data-rail-tab="chats" title="" data-i18n-title="chats" aria-label="Chats">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 5.5A2.5 2.5 0 0 1 5.5 3h10A2.5 2.5 0 0 1 18 5.5v6A2.5 2.5 0 0 1 15.5 14H10l-4 4v-4H5.5A2.5 2.5 0 0 1 3 11.5v-6zM8 17.4 11.6 14h3.9A4.5 4.5 0 0 0 20 9.5v-4A4.5 4.5 0 0 0 15.5 1h-10A4.5 4.5 0 0 0 1 5.5v6A4.5 4.5 0 0 0 5.5 16H6v3.5l2-2.1z"/></svg>
+          </button>
+          <button class="wc-rail-icon" type="button" data-rail-tab="contacts" title="" data-i18n-title="contacts" aria-label="Contacts">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0-6a2 2 0 1 1-2 2 2 2 0 0 1 2-2zm0 8c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5zm-6 5c.3-1.4 2.9-3 6-3s5.7 1.6 6 3z"/></svg>
+          </button>
+        </div>
+        <div class="wc-rail-bottom">
+          <button id="refreshButton" class="wc-rail-icon" type="button" title="" data-i18n-title="refresh" aria-label="Refresh">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 5V2L7 6l5 4V7c2.8 0 5 2.2 5 5a4.9 4.9 0 0 1-1 3l1.5 1.5A7 7 0 0 0 19 12c0-3.9-3.1-7-7-7zM7 12a4.9 4.9 0 0 1 1-3L6.5 7.5A7 7 0 0 0 5 12c0 3.9 3.1 7 7 7v3l5-4-5-4v3c-2.8 0-5-2.2-5-5z"/></svg>
+          </button>
+          <button id="settingsButton" class="wc-rail-icon" type="button" title="" data-i18n-title="settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13c.04-.3.06-.6.06-1s-.02-.7-.06-1l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.4a.5.5 0 0 0-.6-.2l-2.4 1A7.5 7.5 0 0 0 14.6 5l-.4-2.6a.5.5 0 0 0-.5-.4h-3.4a.5.5 0 0 0-.5.4L9.4 5a7.5 7.5 0 0 0-2 1.2l-2.4-1a.5.5 0 0 0-.6.2L2.4 8.8a.5.5 0 0 0 .1.6L4.6 11c-.04.3-.06.6-.06 1s.02.7.06 1L2.5 14.6a.5.5 0 0 0-.1.6l2 3.4a.5.5 0 0 0 .6.2l2.4-1a7.5 7.5 0 0 0 2 1.2l.4 2.6a.5.5 0 0 0 .5.4h3.4a.5.5 0 0 0 .5-.4l.4-2.6a7.5 7.5 0 0 0 2-1.2l2.4 1a.5.5 0 0 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.6L19.4 13zM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5z"/></svg>
+          </button>
+        </div>
+      </nav>
+
+      <aside class="wc-sidebar conv-sidebar">
+        <div class="wc-sidebar-top">
+          <div class="wc-search">
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10 4a6 6 0 1 0 3.8 10.6l4.3 4.3 1.4-1.4-4.3-4.3A6 6 0 0 0 10 4zm0 2a4 4 0 1 1-4 4 4 4 0 0 1 4-4z"/></svg>
+            <input id="convSearchInput" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索" />
+          </div>
+          <div class="wc-plus-wrap">
+            <button id="newButton" class="wc-plus" type="button" title="" data-i18n-title="newDm" aria-label="New">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
+            </button>
+            <div id="newMenu" class="wc-menu hidden" role="menu">
+              <button id="newDmButton" type="button" role="menuitem" data-i18n="newDm">+ 单聊</button>
+              <button id="newGroupButton" type="button" role="menuitem" data-i18n="newGroup">+ 群聊</button>
+            </div>
           </div>
         </div>
-        <div class="topbar-actions">
-          <button id="inspectorToggleButton" class="ghost-button" type="button" data-i18n="workbench">工作台</button>
-          <label class="language-control">
-            <span data-i18n="language">语言</span>
-            <select id="languageSelect" aria-label="Language">
-              <option value="zh">中文</option>
-              <option value="en">English</option>
-            </select>
-          </label>
-          <button id="refreshButton" class="ghost-button" type="button" data-i18n="refresh">刷新</button>
-        </div>
-      </header>
+        <div id="convList" class="conv-list" role="listbox" aria-label="Conversations"></div>
+      </aside>
 
-      <main class="workspace">
-        <aside class="sidebar">
-          <section class="side-section">
-            <div class="section-heading">
-              <div>
-                <h2 data-i18n="groups">群组</h2>
-                <p data-i18n="groupsHint">agent 群组</p>
+      <section class="wc-main room-panel">
+        <div id="taskRoomView" class="room-view">
+          <div class="chat-header">
+            <div class="chat-header-text">
+              <div class="chat-header-title-row">
+                <h2 id="chatTitle">TendrilFlow</h2>
+                <span id="chatStatusBadge" class="chat-status-badge"></span>
               </div>
+              <p id="chatSubtitle" class="chat-subtitle"></p>
             </div>
-
-            <form id="groupForm" class="group-create-form">
-              <label>
-                <span data-i18n="groupName">群组名称</span>
-                <input name="name" required data-i18n-placeholder="groupNamePlaceholder" placeholder="功能开发群" />
-              </label>
-              <button type="submit" data-i18n="createGroup">创建群组</button>
-            </form>
-
-            <div id="groupList" class="group-list"></div>
-          </section>
-        </aside>
-
-        <section class="room-panel">
-          <div id="taskRoomView" class="room-view">
-            <div class="room-header">
-              <div class="room-title-block">
-                <span class="eyebrow" data-i18n="agentRoom">Agent Room</span>
-                <h2 id="roomTitle">Agent Room</h2>
-                <p id="roomMeta"></p>
-              </div>
-              <div class="room-controls">
-                <label>
-                  <span data-i18n="status">状态</span>
-                  <select id="taskStatusSelect"></select>
-                </label>
-                <label>
-                  <span data-i18n="owner">负责人</span>
-                  <select id="taskOwnerSelect"></select>
-                </label>
-                <button id="deleteTaskButton" class="danger-button" type="button" data-i18n="deleteTask">删除任务</button>
-              </div>
+            <div class="chat-header-actions">
+              <button id="chatMembersButton" class="wc-iconbtn" type="button" title="" data-i18n-title="members" aria-label="Members">
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M16 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.7 0-8 1.4-8 4v2h16v-2c0-2.6-5.3-4-8-4zm8 0c-.3 0-.7 0-1.1.1A5.6 5.6 0 0 1 18 17v2h6v-2c0-2.6-5.3-4-8-4z"/></svg>
+              </button>
+              <button id="chatTasksButton" class="wc-iconbtn" type="button" title="" data-i18n-title="taskTab" aria-label="Tasks">
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm5 14 7-7-1.4-1.4L10 14.2 7.4 11.6 6 13z"/></svg>
+              </button>
+              <button id="chatReplayButton" class="wc-iconbtn" type="button" title="" data-i18n-title="replay" aria-label="Replay">
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg>
+              </button>
+              <button id="chatDetailToggle" class="wc-iconbtn" type="button" title="" data-i18n-title="detailPanel" aria-label="Details">
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>
+              </button>
             </div>
+          </div>
 
-            <div class="room-action-bar">
-              <div class="focus-summary">
+          <div id="dmBanner" class="dm-banner hidden">
+            <div class="dm-banner-text">
+              <strong data-i18n="dmBannerTitle">单聊模式</strong>
+              <span data-i18n="dmBannerHint">单聊只展示该 agent 的运行轨迹。给它布置任务请升级为群聊</span>
+            </div>
+            <button id="dmUpgradeButton" type="button" data-i18n="upgradeToGroup">升级为群聊</button>
+          </div>
+
+          <div id="eventStream" class="event-stream"></div>
+
+          <form id="messageForm" class="message-form">
+            <div id="roomQuickBar" class="composer-toolbar">
+              <div class="composer-tool-left">
+                <button type="button" class="wc-iconbtn ghost" data-room-action="plan" title="" data-i18n-title="actionPlan" aria-label="Plan">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M4 5h16v2H4zm0 6h16v2H4zm0 6h10v2H4z"/></svg>
+                </button>
+                <button type="button" class="wc-iconbtn ghost" data-room-action="review" title="" data-i18n-title="actionReview" aria-label="Review">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M9 16.2 5.5 12.7 4 14.2 9 19l11-11-1.4-1.4z"/></svg>
+                </button>
+                <button type="button" class="wc-iconbtn ghost" data-room-action="debug" title="" data-i18n-title="actionDebug" aria-label="Debug">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 8a4 4 0 0 1 4 4v1h4v2h-4v1a4 4 0 0 1-8 0v-1H4v-2h4v-1a4 4 0 0 1 4-4zm-1-4h2v3h-2z"/></svg>
+                </button>
+                <button id="finalReportButton" type="button" class="wc-iconbtn ghost" title="" data-i18n-title="finalReport" aria-label="Final report">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm-1 7V3.5L18.5 9z"/></svg>
+                </button>
+                <button id="startOwnerButton" type="button" class="wc-iconbtn ghost" title="" data-i18n-title="startOwner" aria-label="Start owner">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                </button>
+                <button id="ownerContinueButton" type="button" class="wc-iconbtn ghost" title="" data-i18n-title="continueOwner" aria-label="Continue">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M6 4h3v16H6zm5 4 8.5 4L11 16z"/></svg>
+                </button>
+                <button id="replayButton" type="button" class="wc-iconbtn ghost" title="" data-i18n-title="taskReplay" aria-label="Replay">
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M11 17V7l-7 5zm2 0 7-5-7-5z"/></svg>
+                </button>
+              </div>
+              <div class="composer-status">
                 <span class="focus-label" data-i18n="primaryAction">当前动作</span>
                 <strong id="nextActionText"></strong>
                 <span id="focusOwnerText"></span>
               </div>
-              <div class="focus-actions">
-                <button id="startOwnerButton" class="ghost-button" type="button" data-i18n="startOwner">启动负责人</button>
-                <button id="ownerContinueButton" type="button" data-i18n="continueOwner">继续执行</button>
-              </div>
             </div>
-
-            <div class="quick-actions">
-              <button type="button" data-room-action="plan" data-i18n="actionPlan">拆分计划</button>
-              <button type="button" data-room-action="review" data-i18n="actionReview">请求审查</button>
-              <button type="button" data-room-action="debug" data-i18n="actionDebug">排查阻塞</button>
-              <button id="replayButton" class="ghost-button" type="button" data-i18n="replay">任务复盘</button>
-              <button id="finalReportButton" type="button" data-i18n="finalReport">最终报告</button>
+            <div id="mentionSuggest" class="mention-suggest hidden"></div>
+            <textarea name="text" rows="3" data-i18n-placeholder="messagePlaceholder" placeholder="发送消息（@ 召唤成员，/ 触发动作）"></textarea>
+            <div class="message-form-bar">
+              <span class="composer-hint" data-i18n="composerHint">输入 @ 召唤成员，输入 / 使用快捷动作</span>
+              <button type="submit" data-i18n="send">发送(S)</button>
             </div>
+          </form>
+        </div>
 
-            <div id="eventStream" class="event-stream"></div>
-
-            <form id="messageForm" class="message-form">
-              <div id="mentionSuggest" class="mention-suggest hidden"></div>
-              <textarea name="text" rows="3" data-i18n-placeholder="messagePlaceholder" placeholder="@codex-worker 继续执行"></textarea>
-              <button type="submit" data-i18n="send">发送</button>
-            </form>
-          </div>
-
-          <div id="replayView" class="replay-view hidden">
-            <div class="room-header">
-              <div class="room-title-block">
-                <span class="eyebrow" data-i18n="taskReplay">Task Replay</span>
+        <div id="replayView" class="replay-view hidden">
+          <div class="chat-header subview-header">
+            <div class="chat-header-text">
+              <div class="chat-header-title-row">
                 <h2 id="replayTitle">Task Replay</h2>
-                <p id="replayMeta"></p>
               </div>
-              <div class="console-actions">
-                <button id="backFromReplayButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
-              </div>
+              <p id="replayMeta" class="chat-subtitle"></p>
             </div>
-            <div id="replayContent" class="replay-content"></div>
+            <div class="chat-header-actions">
+              <button id="backFromReplayButton" class="wc-textbtn" type="button" data-i18n="backToRoom">返回群组</button>
+            </div>
           </div>
+          <div id="replayContent" class="replay-content"></div>
+        </div>
 
-          <div id="agentConsoleView" class="agent-console hidden">
-            <div class="room-header">
-              <div class="room-title-block">
-                <span class="eyebrow" data-i18n="agentConsole">Agent Console</span>
+        <div id="agentConsoleView" class="agent-console hidden">
+          <div class="chat-header subview-header">
+            <div class="chat-header-text">
+              <div class="chat-header-title-row">
                 <h2 id="consoleTitle">Agent Console</h2>
-                <p id="consoleMeta"></p>
               </div>
-              <div class="console-actions">
-                <button id="backToRoomButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
-                <button id="consoleStartButton" type="button" data-i18n="start">启动</button>
-                <button id="consoleStopButton" class="ghost-button" type="button" data-i18n="stop">停止</button>
-                <button id="consoleDeleteButton" class="danger-button" type="button" data-i18n="delete">删除</button>
-              </div>
+              <p id="consoleMeta" class="chat-subtitle"></p>
             </div>
-            <div id="consoleSummary" class="console-summary"></div>
-            <div id="agentLogStream" class="event-stream agent-log-stream"></div>
+            <div class="chat-header-actions">
+              <button id="backToRoomButton" class="wc-textbtn" type="button" data-i18n="backToRoom">返回群组</button>
+              <button id="consoleStartButton" class="wc-textbtn primary" type="button" data-i18n="start">启动</button>
+              <button id="consoleStopButton" class="wc-textbtn" type="button" data-i18n="stop">停止</button>
+              <button id="consoleDeleteButton" class="wc-textbtn danger" type="button" data-i18n="delete">删除</button>
+            </div>
+          </div>
+          <div id="consoleSummary" class="console-summary"></div>
+          <div id="agentLogStream" class="event-stream agent-log-stream"></div>
+        </div>
+
+        <div id="handoffRulesView" class="handoff-rules-view hidden">
+          <div class="chat-header subview-header">
+            <div class="chat-header-text">
+              <div class="chat-header-title-row">
+                <h2 id="handoffRulesTitle">交接规则</h2>
+              </div>
+              <p id="handoffRulesMeta" class="chat-subtitle"></p>
+            </div>
+            <div class="chat-header-actions">
+              <button id="backFromRulesButton" class="wc-textbtn" type="button" data-i18n="backToRoom">返回群组</button>
+            </div>
+          </div>
+          <div class="handoff-policy-strip">
+            <strong data-i18n="defaultHandoffOwner">默认交接由群主定义</strong>
+            <span data-i18n="customHandoffCanvasHint">自定义规则在这里以 agent 连线方式调整</span>
+          </div>
+          <div class="handoff-rules-layout">
+            <div id="handoffRulesCanvas" class="handoff-canvas"></div>
+            <aside class="rules-editor">
+              <form id="handoffRuleForm" class="stacked-form">
+                <label>
+                  <span data-i18n="ruleFrom">从</span>
+                  <select name="from_agent_id"></select>
+                </label>
+                <label>
+                  <span data-i18n="ruleTo">到</span>
+                  <select name="to_agent_id"></select>
+                </label>
+                <label>
+                  <span data-i18n="ruleTrigger">触发条件</span>
+                  <select name="trigger"></select>
+                </label>
+                <label>
+                  <span data-i18n="ruleLabel">规则名称</span>
+                  <input name="label" data-i18n-placeholder="ruleLabelPlaceholder" placeholder="阻塞时交给群主" />
+                </label>
+                <label>
+                  <span data-i18n="ruleDescription">说明</span>
+                  <textarea name="description" rows="3" data-i18n-placeholder="ruleDescriptionPlaceholder" placeholder="何时使用这条交接线"></textarea>
+                </label>
+                <button type="submit" data-i18n="addRule">添加规则</button>
+              </form>
+              <div id="handoffRuleList" class="handoff-rule-list"></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <aside id="inspectorPanel" class="wc-details inspector">
+        <div class="inspector-header">
+          <h3 data-i18n="detailPanel">聊天信息</h3>
+          <button id="inspectorCloseButton" class="icon-text" type="button" aria-label="Close">×</button>
+        </div>
+        <nav id="inspectorTabs" class="inspector-tabs" aria-label="Detail Tabs">
+          <button type="button" data-inspector-tab="tasks" data-i18n="taskTab">任务</button>
+          <button type="button" data-inspector-tab="agents" data-i18n="members">成员</button>
+          <button type="button" data-inspector-tab="launcher" data-i18n="launcherTab">创建</button>
+        </nav>
+
+        <section class="inspector-section inspector-panel" data-inspector-panel="tasks">
+          <div class="section-heading">
+            <div>
+              <h2 data-i18n="groupTasks">群组任务</h2>
+              <p id="groupTaskHint"></p>
+            </div>
           </div>
 
-          <div id="handoffRulesView" class="handoff-rules-view hidden">
-            <div class="room-header">
-              <div class="room-title-block">
-                <span class="eyebrow" data-i18n="handoffRules">交接规则</span>
-                <h2 id="handoffRulesTitle">交接规则</h2>
-                <p id="handoffRulesMeta"></p>
-              </div>
-              <div class="console-actions">
-                <button id="backFromRulesButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
-              </div>
-            </div>
-            <div class="handoff-policy-strip">
-              <strong data-i18n="defaultHandoffOwner">默认交接由群主定义</strong>
-              <span data-i18n="customHandoffCanvasHint">自定义规则在这里以 agent 连线方式调整</span>
-            </div>
-            <div class="handoff-rules-layout">
-              <div id="handoffRulesCanvas" class="handoff-canvas"></div>
-              <aside class="rules-editor">
-                <form id="handoffRuleForm" class="stacked-form">
-                  <label>
-                    <span data-i18n="ruleFrom">从</span>
-                    <select name="from_agent_id"></select>
-                  </label>
-                  <label>
-                    <span data-i18n="ruleTo">到</span>
-                    <select name="to_agent_id"></select>
-                  </label>
-                  <label>
-                    <span data-i18n="ruleTrigger">触发条件</span>
-                    <select name="trigger"></select>
-                  </label>
-                  <label>
-                    <span data-i18n="ruleLabel">规则名称</span>
-                    <input name="label" data-i18n-placeholder="ruleLabelPlaceholder" placeholder="阻塞时交给群主" />
-                  </label>
-                  <label>
-                    <span data-i18n="ruleDescription">说明</span>
-                    <textarea name="description" rows="3" data-i18n-placeholder="ruleDescriptionPlaceholder" placeholder="何时使用这条交接线"></textarea>
-                  </label>
-                  <button type="submit" data-i18n="addRule">添加规则</button>
-                </form>
-                <div id="handoffRuleList" class="handoff-rule-list"></div>
-              </aside>
-            </div>
+          <div class="task-room-controls">
+            <label>
+              <span data-i18n="status">状态</span>
+              <select id="taskStatusSelect"></select>
+            </label>
+            <label>
+              <span data-i18n="owner">负责人</span>
+              <select id="taskOwnerSelect"></select>
+            </label>
+            <button id="deleteTaskButton" class="danger-button" type="button" data-i18n="deleteTask">删除任务</button>
           </div>
+
+          <form id="taskForm" class="task-create-form">
+            <div class="task-create-main">
+              <label>
+                <span data-i18n="taskTitle">标题</span>
+                <input name="title" required data-i18n-placeholder="taskTitlePlaceholder" placeholder="实现一个功能" />
+              </label>
+              <label>
+                <span data-i18n="owner">负责人</span>
+                <select name="owner_agent_id"></select>
+              </label>
+            </div>
+            <details class="form-drawer">
+              <summary data-i18n="moreContext">补充上下文</summary>
+              <label>
+                <span data-i18n="taskDescription">描述</span>
+                <textarea name="description" rows="3" data-i18n-placeholder="taskDescriptionPlaceholder" placeholder="任务目标、验收标准、上下文"></textarea>
+              </label>
+            </details>
+            <button type="submit" data-i18n="createTask">创建任务</button>
+          </form>
+
+          <div id="taskBoard" class="task-list"></div>
         </section>
 
-        <aside id="inspectorPanel" class="inspector">
-          <nav id="inspectorTabs" class="inspector-tabs" aria-label="Workbench">
-            <button type="button" data-inspector-tab="tasks" data-i18n="taskTab">任务</button>
-            <button type="button" data-inspector-tab="agents" data-i18n="agentsTab">成员</button>
-            <button type="button" data-inspector-tab="launcher" data-i18n="launcherTab">创建</button>
-          </nav>
-
-          <section class="inspector-section inspector-panel" data-inspector-panel="tasks">
-            <div class="section-heading">
-              <div>
-                <h2 data-i18n="groupTasks">群组任务</h2>
-                <p id="groupTaskHint"></p>
-              </div>
+        <section class="inspector-section inspector-panel agents-section" data-inspector-panel="agents">
+          <div class="section-heading compact-heading">
+            <div>
+              <h2 data-i18n="groupAgents">群组 Agents</h2>
+              <p data-i18n="agentsHint">启动、停止、删除</p>
             </div>
+            <button id="handoffRulesButton" class="ghost-button" type="button" data-i18n="handoffRules">交接规则</button>
+          </div>
+          <div id="agentList" class="agent-list"></div>
+        </section>
 
-            <form id="taskForm" class="task-create-form">
-              <div class="task-create-main">
-                <label>
-                  <span data-i18n="taskTitle">标题</span>
-                  <input name="title" required data-i18n-placeholder="taskTitlePlaceholder" placeholder="实现一个功能" />
-                </label>
-                <label>
-                  <span data-i18n="owner">负责人</span>
-                  <select name="owner_agent_id"></select>
-                </label>
-              </div>
-              <details class="form-drawer">
-                <summary data-i18n="moreContext">补充上下文</summary>
-                <label>
-                  <span data-i18n="taskDescription">描述</span>
-                  <textarea name="description" rows="3" data-i18n-placeholder="taskDescriptionPlaceholder" placeholder="任务目标、验收标准、上下文"></textarea>
-                </label>
-              </details>
-              <button type="submit" data-i18n="createTask">创建任务</button>
-            </form>
-
-            <div id="taskBoard" class="task-list"></div>
-          </section>
-
-          <section class="inspector-section inspector-panel agents-section" data-inspector-panel="agents">
-            <div class="section-heading compact-heading">
-              <div>
-                <h2 data-i18n="groupAgents">群组 Agents</h2>
-                <p data-i18n="agentsHint">启动、停止、删除</p>
-              </div>
-              <button id="handoffRulesButton" class="ghost-button" type="button" data-i18n="handoffRules">交接规则</button>
+        <section class="inspector-section inspector-panel launcher-panel" data-inspector-panel="launcher">
+          <div class="section-heading">
+            <div>
+              <h2 data-i18n="launcher">Agent Launcher</h2>
+              <p data-i18n="launcherHint">工作目录和模式在这里配置</p>
             </div>
-            <div id="agentList" class="agent-list"></div>
-          </section>
+          </div>
 
-          <section class="inspector-section inspector-panel launcher-panel" data-inspector-panel="launcher">
-            <div class="section-heading">
-              <div>
-                <h2 data-i18n="launcher">Agent Launcher</h2>
-                <p data-i18n="launcherHint">工作目录和模式在这里配置</p>
-              </div>
-            </div>
-
-            <form id="agentForm" class="stacked-form">
-              <div class="field-grid two-columns">
-                <label>
-                  <span data-i18n="agentName">名称</span>
-                  <input name="name" required value="new-agent" />
-                </label>
-                <label>
-                  <span data-i18n="provider">Provider</span>
-                  <select name="provider"></select>
-                </label>
-              </div>
-
+          <form id="agentForm" class="stacked-form">
+            <div class="field-grid two-columns">
               <label>
-                <span data-i18n="role">角色</span>
-                <select name="role"></select>
+                <span data-i18n="agentName">名称</span>
+                <input name="name" required value="new-agent" />
               </label>
+              <label>
+                <span data-i18n="provider">Provider</span>
+                <select name="provider"></select>
+              </label>
+            </div>
 
-              <details class="form-drawer advanced-drawer">
-                <summary data-i18n="advancedConfig">高级配置</summary>
-                <label>
-                  <span data-i18n="runMode">运行方式</span>
-                  <select name="mode"></select>
-                </label>
-                <label>
-                  <span data-i18n="isolation">隔离方式</span>
-                  <select name="isolation_mode"></select>
-                </label>
-                <label class="prominent-field">
-                  <span data-i18n="workingDir">工作目录</span>
-                  <input name="cwd" />
-                </label>
-                <button id="useRootButton" class="ghost-button full-width" type="button" data-i18n="useWorkspaceRoot">使用项目根目录</button>
-                <label>
-                  <span data-i18n="command">启动命令</span>
-                  <input name="command" data-i18n-placeholder="commandPlaceholder" placeholder="node scripts/codex-agent.js --name new-agent --mode mock" />
-                </label>
-                <button id="commandPresetButton" class="ghost-button full-width" type="button" data-i18n="usePresetCommand">套用推荐命令</button>
-              </details>
-              <button type="submit" data-i18n="createAgent">创建 Agent</button>
-            </form>
-          </section>
-        </aside>
-      </main>
+            <label>
+              <span data-i18n="role">角色</span>
+              <select name="role"></select>
+            </label>
+
+            <details class="form-drawer advanced-drawer">
+              <summary data-i18n="advancedConfig">高级配置</summary>
+              <label>
+                <span data-i18n="runMode">运行方式</span>
+                <select name="mode"></select>
+              </label>
+              <label>
+                <span data-i18n="isolation">隔离方式</span>
+                <select name="isolation_mode"></select>
+              </label>
+              <label class="prominent-field">
+                <span data-i18n="workingDir">工作目录</span>
+                <input name="cwd" />
+              </label>
+              <button id="useRootButton" class="ghost-button full-width" type="button" data-i18n="useWorkspaceRoot">使用项目根目录</button>
+              <label>
+                <span data-i18n="command">启动命令</span>
+                <input name="command" data-i18n-placeholder="commandPlaceholder" placeholder="node scripts/codex-agent.js --name new-agent --mode mock" />
+              </label>
+              <button id="commandPresetButton" class="ghost-button full-width" type="button" data-i18n="usePresetCommand">套用推荐命令</button>
+            </details>
+            <button type="submit" data-i18n="createAgent">创建 Agent</button>
+          </form>
+        </section>
+      </aside>
     </div>
+
+    <div id="settingsPopover" class="wc-popover hidden" role="dialog" aria-modal="true">
+      <div class="wc-popover-card">
+        <header>
+          <h3 data-i18n="settings">设置</h3>
+          <button type="button" class="icon-text" data-dialog-close>×</button>
+        </header>
+        <div class="wc-popover-body">
+          <label>
+            <span data-i18n="selectedWorkspace">当前 Workspace</span>
+            <select id="workspaceSelect"></select>
+          </label>
+          <label>
+            <span data-i18n="language">语言</span>
+            <select id="languageSelect">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <p class="wc-popover-meta" id="workspacePath"></p>
+        </div>
+      </div>
+    </div>
+
+    <div id="newGroupDialog" class="dialog hidden" role="dialog" aria-modal="true">
+      <div class="dialog-card">
+        <header>
+          <h3 data-i18n="newGroup">新建群聊</h3>
+          <button type="button" class="icon-text" data-dialog-close>×</button>
+        </header>
+        <form id="newGroupForm" class="stacked-form">
+          <label>
+            <span data-i18n="groupName">群组名称</span>
+            <input name="name" required data-i18n-placeholder="groupNamePlaceholder" placeholder="功能开发群" />
+          </label>
+          <button type="submit" data-i18n="createGroup">创建群组</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="newDmDialog" class="dialog hidden" role="dialog" aria-modal="true">
+      <div class="dialog-card">
+        <header>
+          <h3 data-i18n="newDm">发起单聊</h3>
+          <button type="button" class="icon-text" data-dialog-close>×</button>
+        </header>
+        <div class="dm-dialog-actions">
+          <button id="openNewGroupFromDmDialog" class="ghost-button" type="button" data-i18n="newGroup">+ 新建群聊</button>
+        </div>
+        <div id="newDmAgentList" class="dm-agent-list"></div>
+      </div>
+    </div>
+
     <script src="/app.js"></script>
   </body>
 </html>

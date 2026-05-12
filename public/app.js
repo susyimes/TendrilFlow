@@ -180,7 +180,34 @@ const i18n = {
     next_blocked: "请求排障，整理阻塞证据",
     next_review: "请求审查，处理 review comments",
     next_done: "任务已完成，可查看最终报告",
-    next_failed: "请求排障后重试或交接"
+    next_failed: "请求排障后重试或交接",
+    members: "成员",
+    detailPanel: "详情",
+    newDm: "+ 单聊",
+    newGroup: "+ 群聊",
+    searchPlaceholder: "搜索会话、agent、任务",
+    composerHint: "输入 @ 召唤成员，输入 / 使用快捷动作",
+    dmBannerTitle: "单聊模式",
+    dmBannerHint: "单聊只展示该 agent 的运行轨迹。给它布置任务请升级为群聊",
+    upgradeToGroup: "升级为群聊",
+    conversations: "会话",
+    convSectionPinned: "置顶",
+    convSectionTasks: "任务会话",
+    convSectionDMs: "单聊",
+    convSectionSystem: "系统",
+    noConversations: "还没有会话。点击右上方 + 单聊 或 + 群聊 开始",
+    noAgentsForDm: "当前 workspace 还没有 agent。先在详情面板新建一个",
+    dmEmptyTimeline: "还没有该 agent 的轨迹。点击启动让它运行起来",
+    dmPresence: "运行状态",
+    upgradeDmConfirmTitle: "升级为群聊？",
+    upgradeDmCreatedTask: "已为 {name} 创建新任务，进入群聊",
+    statusFresh: "活跃",
+    pickGroup: "选择目标群组",
+    selectGroupFirst: "先选择一个群组才能新建单聊",
+    deletedConversation: "会话已删除",
+    chats: "聊天",
+    contacts: "联系人",
+    settings: "设置"
   },
   en: {
     language: "Language",
@@ -363,7 +390,34 @@ const i18n = {
     next_blocked: "Ask debug to inspect the visible trace",
     next_review: "Request review and resolve comments",
     next_done: "Task is done. Check the final report",
-    next_failed: "Ask debug to recover, retry, or hand off"
+    next_failed: "Ask debug to recover, retry, or hand off",
+    members: "Members",
+    detailPanel: "Details",
+    newDm: "+ DM",
+    newGroup: "+ Group",
+    searchPlaceholder: "Search conversations, agents, tasks",
+    composerHint: "Type @ to mention members, / for quick actions",
+    dmBannerTitle: "Direct chat",
+    dmBannerHint: "DM only shows this agent's activity. Upgrade to a group chat to assign tasks",
+    upgradeToGroup: "Upgrade to group",
+    conversations: "Conversations",
+    convSectionPinned: "Pinned",
+    convSectionTasks: "Task conversations",
+    convSectionDMs: "Direct messages",
+    convSectionSystem: "System",
+    noConversations: "No conversations yet. Click + DM or + Group to start",
+    noAgentsForDm: "No agents in this workspace yet. Create one in the details panel",
+    dmEmptyTimeline: "No activity for this agent yet. Start it to see its trace",
+    dmPresence: "Run status",
+    upgradeDmConfirmTitle: "Upgrade to a group chat?",
+    upgradeDmCreatedTask: "Created a task for {name} and opened the group chat",
+    statusFresh: "Active",
+    pickGroup: "Pick a target group",
+    selectGroupFirst: "Pick a group first to start a DM",
+    deletedConversation: "Conversation deleted",
+    chats: "Chats",
+    contacts: "Contacts",
+    settings: "Settings"
   }
 };
 
@@ -393,9 +447,23 @@ const state = {
   userPinnedHistory: false,
   consoleShouldStickToBottom: true,
   consoleUserPinnedHistory: false,
-  inspectorOpen: localStorage.getItem("tendrilflow.inspectorOpen") !== "false",
+  inspectorOpen: localStorage.getItem("tendrilflow.inspectorOpen") === "true",
   activeInspectorTab: localStorage.getItem("tendrilflow.inspectorTab") || "tasks",
   expandedProcessBundles: new Set(),
+  // AgentChat redesign state
+  selectedConversationId: localStorage.getItem("tendrilflow.convId") || null,
+  selectedDmAgentId: null,
+  dmAgentDetail: null,
+  dmAgentLogs: [],
+  lastRenderedDmAgentId: null,
+  lastRenderedDmLogId: null,
+  dmShouldStickToBottom: true,
+  convSearch: "",
+  newDmDialogOpen: false,
+  newGroupDialogOpen: false,
+  newMenuOpen: false,
+  settingsPopoverOpen: false,
+  toastMessage: null,
   mention: {
     active: false,
     query: "",
@@ -419,6 +487,193 @@ function syncRouteFromHash() {
   state.handoffRulesOpen = /^#\/handoff-rules/.test(window.location.hash);
   state.replayOpen = /^#\/replay/.test(window.location.hash);
   state.agentConsoleId = state.handoffRulesOpen || state.replayOpen || !agentMatch ? null : decodeURIComponent(agentMatch[1]);
+}
+
+function conversationId(kind, id) {
+  return `${kind}:${id}`;
+}
+
+function parseConversationId(convId) {
+  if (!convId) {
+    return null;
+  }
+  const idx = convId.indexOf(":");
+  if (idx < 0) {
+    return null;
+  }
+  return { kind: convId.slice(0, idx), id: convId.slice(idx + 1) };
+}
+
+function currentConversationKind() {
+  if (state.selectedDmAgentId) {
+    return "dm";
+  }
+  if (state.selectedTaskId) {
+    return "task";
+  }
+  return null;
+}
+
+function selectConversation(conv) {
+  if (!conv) {
+    return;
+  }
+  state.selectedConversationId = conv.id;
+  localStorage.setItem("tendrilflow.convId", conv.id);
+  state.handoffRulesOpen = false;
+  state.replayOpen = false;
+  state.agentConsoleId = null;
+  if (conv.kind === "task") {
+    state.selectedDmAgentId = null;
+    state.dmAgentDetail = null;
+    state.dmAgentLogs = [];
+    state.selectedTaskId = conv.task_id;
+    if (conv.group_id) {
+      state.selectedGroupId = conv.group_id;
+      localStorage.setItem("tendrilflow.groupId", conv.group_id);
+    }
+    state.shouldStickToBottom = true;
+    state.userPinnedHistory = false;
+  } else if (conv.kind === "dm") {
+    state.selectedDmAgentId = conv.agent_id;
+    state.selectedTaskId = null;
+    state.selectedTask = null;
+    state.events = [];
+    if (conv.group_id) {
+      state.selectedGroupId = conv.group_id;
+      localStorage.setItem("tendrilflow.groupId", conv.group_id);
+    }
+    state.dmShouldStickToBottom = true;
+  } else if (conv.kind === "group") {
+    state.selectedDmAgentId = null;
+    state.dmAgentDetail = null;
+    state.dmAgentLogs = [];
+    if (conv.group_id) {
+      state.selectedGroupId = conv.group_id;
+      localStorage.setItem("tendrilflow.groupId", conv.group_id);
+    }
+    const firstTask = state.tasks
+      .filter((task) => task.workspace_id === state.selectedWorkspaceId && task.group_id === conv.group_id)
+      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0];
+    if (firstTask) {
+      state.selectedTaskId = firstTask.task_id;
+      state.selectedConversationId = conversationId("task", firstTask.task_id);
+      localStorage.setItem("tendrilflow.convId", state.selectedConversationId);
+    } else {
+      state.selectedTaskId = null;
+      state.selectedTask = null;
+      state.events = [];
+    }
+    state.shouldStickToBottom = true;
+    state.userPinnedHistory = false;
+  }
+}
+
+function buildConversations() {
+  const wsId = state.selectedWorkspaceId;
+  const query = String(state.convSearch || "").trim().toLowerCase();
+  const conversations = [];
+  const visibleGroups = state.groups.filter((group) => group.workspace_id === wsId);
+  const groupById = new Map(visibleGroups.map((group) => [group.group_id, group]));
+  const visibleTasks = state.tasks.filter(
+    (task) => task.workspace_id === wsId && groupById.has(task.group_id)
+  );
+  const visibleAgents = state.agents.filter(
+    (agent) => agent.workspace_id === wsId && groupById.has(agent.group_id)
+  );
+
+  for (const task of visibleTasks) {
+    const group = groupById.get(task.group_id);
+    const ownerAgent = state.agents.find((agent) => agent.id === task.owner_agent_id);
+    const lastEvent = task.last_event || null;
+    const preview = task.last_event_text || task.description || (group ? `${group.name}` : "");
+    const updatedAt = task.updated_at || task.created_at || lastEvent?.timestamp || null;
+    const presence = ownerAgent?.health?.status || "stopped";
+    conversations.push({
+      id: conversationId("task", task.task_id),
+      kind: "task",
+      task_id: task.task_id,
+      group_id: task.group_id,
+      title: task.title,
+      subtitle: group ? `${group.name} · ${agentName(task.owner_agent_id)}` : agentName(task.owner_agent_id),
+      preview,
+      status: task.status,
+      presence,
+      updated_at: updatedAt,
+      pinned: false,
+      tags: [group?.name].filter(Boolean)
+    });
+  }
+
+  for (const agent of visibleAgents) {
+    const group = groupById.get(agent.group_id);
+    conversations.push({
+      id: conversationId("dm", agent.id),
+      kind: "dm",
+      agent_id: agent.id,
+      group_id: agent.group_id,
+      title: agent.name,
+      subtitle: `${labelFor("role", agent.role)} · ${group?.name || ""}`.trim(),
+      preview: agent.health?.detail || labelFor("health", agent.health?.status || "stopped"),
+      status: agent.health?.status || "stopped",
+      presence: agent.health?.status || "stopped",
+      updated_at: agent.health?.last_event_at || agent.updated_at || null,
+      pinned: agent.role === "host",
+      tags: [group?.name].filter(Boolean)
+    });
+  }
+
+  const filtered = query
+    ? conversations.filter((conv) => {
+        const haystack = [conv.title, conv.subtitle, conv.preview, ...(conv.tags || [])]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(query);
+      })
+    : conversations;
+
+  filtered.sort((a, b) => {
+    if (a.pinned !== b.pinned) {
+      return a.pinned ? -1 : 1;
+    }
+    const at = a.updated_at || "";
+    const bt = b.updated_at || "";
+    return String(bt).localeCompare(String(at));
+  });
+
+  return filtered;
+}
+
+function findConversation(convId) {
+  return buildConversations().find((conv) => conv.id === convId) || null;
+}
+
+function ensureValidConversation() {
+  const current = state.selectedConversationId ? findConversation(state.selectedConversationId) : null;
+  if (current) {
+    selectConversation(current);
+    return current;
+  }
+  const conversations = buildConversations();
+  const fallback = conversations[0];
+  if (fallback) {
+    selectConversation(fallback);
+    return fallback;
+  }
+  state.selectedConversationId = null;
+  state.selectedTaskId = null;
+  state.selectedDmAgentId = null;
+  state.selectedTask = null;
+  state.events = [];
+  return null;
+}
+
+function showToast(message) {
+  state.toastMessage = message;
+  setTimeout(() => {
+    state.toastMessage = null;
+  }, 2400);
 }
 
 function openAgentConsole(agentId) {
@@ -487,6 +742,9 @@ function applyI18n() {
   });
   qsa("[data-i18n-placeholder]").forEach((node) => {
     node.placeholder = t(node.dataset.i18nPlaceholder);
+  });
+  qsa("[data-i18n-title]").forEach((node) => {
+    node.title = t(node.dataset.i18nTitle);
   });
 }
 
@@ -602,11 +860,15 @@ async function loadState(keepTask = true) {
   }
   localStorage.setItem("tendrilflow.groupId", state.selectedGroupId || "");
 
-  const visibleTasks = groupTasks();
-  if (!keepTask || !state.selectedTaskId || !visibleTasks.some((task) => task.task_id === state.selectedTaskId)) {
-    state.selectedTaskId = visibleTasks[0]?.task_id || null;
+  if (!keepTask) {
+    state.selectedTaskId = null;
+    state.selectedDmAgentId = null;
   }
+
+  ensureValidConversation();
+
   await loadSelectedTask();
+  await loadDmTimeline();
   await loadAgentDetail();
   await loadHandoffPolicy();
   await loadReplay();
@@ -633,6 +895,17 @@ async function loadAgentDetail() {
   const data = await api(`/api/agents/${encodeURIComponent(state.agentConsoleId)}?limit=300`).catch(() => null);
   state.agentDetail = data;
   state.agentLogs = data?.logs || [];
+}
+
+async function loadDmTimeline() {
+  if (!state.selectedDmAgentId) {
+    state.dmAgentDetail = null;
+    state.dmAgentLogs = [];
+    return;
+  }
+  const data = await api(`/api/agents/${encodeURIComponent(state.selectedDmAgentId)}?limit=300`).catch(() => null);
+  state.dmAgentDetail = data;
+  state.dmAgentLogs = data?.logs || [];
 }
 
 async function loadHandoffPolicy() {
@@ -665,13 +938,281 @@ function fillSelect(select, entries, selected) {
 
 function render() {
   applyI18n();
+  renderWorkspaceSelect();
   renderInspectorShell();
   renderMetaSelects();
-  renderGroups();
+  renderConversationList();
   renderAgentOptions();
   renderTasks();
+  renderChatHeader();
   renderMainPanel();
   renderAgents();
+  renderDialogs();
+}
+
+function renderWorkspaceSelect() {
+  const select = qs("#workspaceSelect");
+  if (!select) {
+    return;
+  }
+  const workspaces = state.workspaces || [];
+  if (!workspaces.length) {
+    select.innerHTML = `<option value="">-</option>`;
+    select.value = "";
+    return;
+  }
+  select.innerHTML = workspaces
+    .map((ws) => `<option value="${escapeHtml(ws.workspace_id)}">${escapeHtml(ws.name || ws.workspace_id)}</option>`)
+    .join("");
+  if (state.selectedWorkspaceId) {
+    select.value = state.selectedWorkspaceId;
+  }
+}
+
+function renderConversationList() {
+  const list = qs("#convList");
+  if (!list) {
+    return;
+  }
+  const conversations = buildConversations();
+  if (!conversations.length) {
+    list.innerHTML = `<div class="empty-state">${escapeHtml(t("noConversations"))}</div>`;
+    return;
+  }
+  const pinned = conversations.filter((conv) => conv.pinned);
+  const tasks = conversations.filter((conv) => !conv.pinned && conv.kind === "task");
+  const dms = conversations.filter((conv) => !conv.pinned && conv.kind === "dm");
+  const renderSection = (titleKey, items) => {
+    if (!items.length) {
+      return "";
+    }
+    return `
+      <div class="conv-section">
+        <div class="conv-section-title">${escapeHtml(t(titleKey))}</div>
+        ${items.map(renderConvItem).join("")}
+      </div>`;
+  };
+  list.innerHTML = `
+    ${pinned.length ? renderSection("convSectionPinned", pinned) : ""}
+    ${renderSection("convSectionTasks", tasks)}
+    ${renderSection("convSectionDMs", dms)}
+  `;
+}
+
+function renderConvItem(conv) {
+  const isActive = conv.id === state.selectedConversationId;
+  const initials = actorInitials(conv.title);
+  const time = formatRelativeTime(conv.updated_at);
+  const presenceClass = presenceClassFor(conv.presence);
+  const kindTag = labelForConvKind(conv.kind);
+  const statusBadge = conv.status
+    ? `<span class="conv-status-pill ${statusClass(conv.status)}">${escapeHtml(labelFor("status", conv.status) || conv.status)}</span>`
+    : "";
+  const unread = conv.unread_count
+    ? `<span class="conv-unread">${escapeHtml(conv.unread_count > 99 ? "99+" : conv.unread_count)}</span>`
+    : "";
+  return `
+    <div class="conv-item ${isActive ? "active" : ""}" data-conv-id="${escapeHtml(conv.id)}" role="option" aria-selected="${isActive ? "true" : "false"}">
+      <div class="conv-avatar kind-${escapeHtml(conv.kind)}">
+        ${escapeHtml(initials)}
+        ${presenceClass ? `<span class="conv-presence ${presenceClass}"></span>` : ""}
+      </div>
+      <div class="conv-body">
+        <div class="conv-row">
+          <span class="conv-title">${escapeHtml(conv.title || "")}</span>
+          <span class="conv-time">${escapeHtml(time)}</span>
+        </div>
+        <div class="conv-preview">
+          <span class="conv-kind-tag">${escapeHtml(kindTag)}</span>
+          <span>${escapeHtml(conv.preview || conv.subtitle || "")}</span>
+        </div>
+      </div>
+      <div class="conv-side">
+        ${unread}
+        ${statusBadge}
+      </div>
+    </div>`;
+}
+
+function labelForConvKind(kind) {
+  if (kind === "task") {
+    return state.lang === "zh" ? "任务" : "TASK";
+  }
+  if (kind === "dm") {
+    return state.lang === "zh" ? "单聊" : "DM";
+  }
+  if (kind === "group") {
+    return state.lang === "zh" ? "群聊" : "GROUP";
+  }
+  return state.lang === "zh" ? "系统" : "SYS";
+}
+
+function presenceClassFor(value) {
+  const v = String(value || "").toLowerCase();
+  if (["active", "running", "in_progress"].includes(v)) {
+    return "active";
+  }
+  if (["blocked", "failed"].includes(v)) {
+    return "blocked";
+  }
+  if (v === "review") {
+    return "review";
+  }
+  return "";
+}
+
+function formatRelativeTime(timestamp) {
+  if (!timestamp) {
+    return "";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const now = new Date();
+  const sameYMD = (a, b) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  if (sameYMD(date, now)) {
+    return date.toLocaleTimeString(state.lang === "zh" ? "zh-CN" : "en", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    });
+  }
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (sameYMD(date, yesterday)) {
+    return state.lang === "zh" ? "昨天" : "Yest.";
+  }
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const dayDiff = Math.floor((startOfToday - date) / 86_400_000);
+  if (dayDiff >= 0 && dayDiff < 7) {
+    const weekdayZh = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    return state.lang === "zh"
+      ? weekdayZh[date.getDay()]
+      : date.toLocaleDateString("en", { weekday: "short" });
+  }
+  if (date.getFullYear() === now.getFullYear()) {
+    return date.toLocaleDateString(state.lang === "zh" ? "zh-CN" : "en", {
+      month: "2-digit",
+      day: "2-digit"
+    });
+  }
+  return date.toLocaleDateString(state.lang === "zh" ? "zh-CN" : "en", {
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit"
+  });
+}
+
+function renderChatHeader() {
+  const title = qs("#chatTitle");
+  const subtitle = qs("#chatSubtitle");
+  const statusBadge = qs("#chatStatusBadge");
+  const banner = qs("#dmBanner");
+  if (!title) {
+    return;
+  }
+  const isDm = Boolean(state.selectedDmAgentId);
+  const task = state.selectedTask;
+  if (banner) {
+    banner.classList.toggle("hidden", !isDm);
+  }
+  qs("#chatReplayButton").disabled = isDm || !task;
+
+  if (isDm) {
+    const agent = getAgent(state.selectedDmAgentId) || state.dmAgentDetail?.agent;
+    const group = state.groups.find((g) => g.group_id === agent?.group_id);
+    title.textContent = agent?.name || t("agentConsole");
+    const parts = [];
+    if (group?.name) {
+      parts.push(group.name);
+    }
+    if (agent?.role) {
+      parts.push(labelFor("role", agent.role));
+    }
+    if (agent?.health?.status) {
+      parts.push(`${t("health")}: ${labelFor("health", agent.health.status)}`);
+    }
+    subtitle.textContent = parts.join(" · ");
+    statusBadge.className = `chat-status-badge ${agent?.health?.status || ""}`;
+    statusBadge.textContent = agent?.health?.status ? labelFor("health", agent.health.status) : "";
+    return;
+  }
+
+  if (task) {
+    const group = state.groups.find((g) => g.group_id === task.group_id);
+    const memberCount = state.agents.filter(
+      (a) => a.workspace_id === task.workspace_id && a.group_id === task.group_id
+    ).length;
+    title.textContent = task.title;
+    const parts = [];
+    if (group?.name) {
+      parts.push(group.name);
+    }
+    parts.push(`${memberCount} ${t("agentsUnit")}`);
+    parts.push(`${t("owner")}: ${agentName(task.owner_agent_id)}`);
+    subtitle.textContent = parts.join(" · ");
+    statusBadge.className = `chat-status-badge ${task.status || ""}`;
+    statusBadge.textContent = task.status ? labelFor("status", task.status) : "";
+    return;
+  }
+
+  const group = currentGroup();
+  title.textContent = group?.name || t("agentRoom");
+  subtitle.textContent = group ? t("selectTask") : t("noConversations");
+  statusBadge.className = "chat-status-badge";
+  statusBadge.textContent = "";
+}
+
+function renderDialogs() {
+  qs("#newGroupDialog").classList.toggle("hidden", !state.newGroupDialogOpen);
+  qs("#newDmDialog").classList.toggle("hidden", !state.newDmDialogOpen);
+  qs("#settingsPopover")?.classList.toggle("hidden", !state.settingsPopoverOpen);
+  qs("#newMenu")?.classList.toggle("hidden", !state.newMenuOpen);
+  if (state.newDmDialogOpen) {
+    renderNewDmAgentList();
+  }
+}
+
+function renderNewDmAgentList() {
+  const container = qs("#newDmAgentList");
+  if (!container) {
+    return;
+  }
+  const wsId = state.selectedWorkspaceId;
+  const agents = state.agents.filter((agent) => agent.workspace_id === wsId);
+  if (!agents.length) {
+    container.innerHTML = `<div class="empty-state dm-empty">${escapeHtml(t("noAgentsForDm"))}</div>`;
+    return;
+  }
+  container.innerHTML = agents
+    .map((agent) => {
+      const group = state.groups.find((g) => g.group_id === agent.group_id);
+      const presence = presenceClassFor(agent.health?.status);
+      const initials = actorInitials(agent.name);
+      return `
+        <div class="conv-item" data-new-dm-agent="${escapeHtml(agent.id)}">
+          <div class="conv-avatar kind-dm">
+            ${escapeHtml(initials)}
+            ${presence ? `<span class="conv-presence ${presence}"></span>` : ""}
+          </div>
+          <div class="conv-body">
+            <div class="conv-row">
+              <span class="conv-title">${escapeHtml(agent.name)}</span>
+              <span class="conv-time">${escapeHtml(labelFor("role", agent.role))}</span>
+            </div>
+            <div class="conv-preview">
+              <span>${escapeHtml(group?.name || "")} · ${escapeHtml(labelFor("health", agent.health?.status || "stopped"))}</span>
+            </div>
+          </div>
+          <div class="conv-side"></div>
+        </div>`;
+    })
+    .join("");
 }
 
 function renderInspectorShell() {
@@ -679,7 +1220,10 @@ function renderInspectorShell() {
     state.activeInspectorTab = "tasks";
   }
   document.body.classList.toggle("inspector-collapsed", !state.inspectorOpen);
-  qs("#inspectorToggleButton").classList.toggle("active", state.inspectorOpen);
+  const toggle = qs("#chatDetailToggle");
+  if (toggle) {
+    toggle.classList.toggle("active", state.inspectorOpen);
+  }
   qsa("#inspectorTabs [data-inspector-tab]").forEach((button) => {
     const active = button.dataset.inspectorTab === state.activeInspectorTab;
     button.classList.toggle("active", active);
@@ -704,9 +1248,90 @@ function renderMainPanel() {
     renderHandoffRules();
   } else if (showReplay) {
     renderReplay();
+  } else if (state.selectedDmAgentId) {
+    renderDmTimeline();
   } else {
     renderRoom();
   }
+}
+
+function renderDmTimeline() {
+  const agent = getAgent(state.selectedDmAgentId) || state.dmAgentDetail?.agent;
+  const stream = qs("#eventStream");
+  qs("#roomQuickBar")?.classList.add("hidden");
+
+  qs("#taskStatusSelect").disabled = true;
+  qs("#taskOwnerSelect").disabled = true;
+  qs("#deleteTaskButton").disabled = true;
+  qs("#finalReportButton").disabled = true;
+  qs("#startOwnerButton").disabled = true;
+  qs("#ownerContinueButton").disabled = true;
+  qsa("#messageForm textarea, #messageForm button[type='submit']").forEach((node) => {
+    node.disabled = !agent;
+  });
+
+  if (!state.dmAgentLogs.length) {
+    stream.innerHTML = `<div class="empty-state">${escapeHtml(t("dmEmptyTimeline"))}</div>`;
+    state.lastRenderedDmAgentId = agent?.id || null;
+    state.lastRenderedDmLogId = null;
+    return;
+  }
+  const previousAgentId = state.lastRenderedDmAgentId;
+  const previousLogId = state.lastRenderedDmLogId;
+  const nextLogId = state.dmAgentLogs.at(-1)?.event_id || null;
+  const agentChanged = previousAgentId !== (agent?.id || null);
+  const logChanged = previousLogId !== nextLogId;
+  const oldScrollTop = stream.scrollTop;
+  stream.innerHTML = state.dmAgentLogs.map((log) => renderDmLogAsChat(log, agent)).join("");
+  if (agentChanged || state.dmShouldStickToBottom || logChanged) {
+    stream.scrollTop = stream.scrollHeight;
+  } else {
+    stream.scrollTop = oldScrollTop;
+  }
+  state.dmShouldStickToBottom = false;
+  state.lastRenderedDmAgentId = agent?.id || null;
+  state.lastRenderedDmLogId = nextLogId;
+}
+
+function renderDmLogAsChat(log, agent) {
+  const time = formatTime(log.timestamp);
+  const type = log.type || "";
+  const isUser = type === "stdin" || log.actor?.kind === "user";
+  const isSystem = ["process_started", "process_exit", "status_change", "error"].includes(type);
+  const text = typeof log.content === "string" ? log.content : (log.content?.text || JSON.stringify(log.content));
+  if (isSystem) {
+    return `
+      <article class="chat-row from-system">
+        <div class="system-message">
+          <div class="system-icon">i</div>
+          <div class="system-body">
+            <div class="system-meta">
+              <span class="event-type">${escapeHtml(type)}</span>
+              <span>${escapeHtml(time)}</span>
+            </div>
+            ${text ? `<div class="system-text">${escapeHtml(text)}</div>` : ""}
+          </div>
+        </div>
+      </article>`;
+  }
+  const actor = isUser ? t("you") : agent?.name || "agent";
+  const initials = actorInitials(actor);
+  const rowClass = isUser ? "chat-row from-user" : "chat-row from-agent";
+  return `
+    <article class="${rowClass}">
+      ${isUser ? "" : `<div class="chat-avatar">${escapeHtml(initials)}</div>`}
+      <div class="chat-message">
+        <div class="chat-meta">
+          <span class="chat-author">${escapeHtml(actor)}</span>
+          <span>${escapeHtml(time)}</span>
+          <span class="event-type">${escapeHtml(type)}</span>
+        </div>
+        <div class="chat-bubble">
+          <div class="event-content">${escapeHtml(text || "")}</div>
+        </div>
+      </div>
+      ${isUser ? `<div class="chat-avatar user-avatar">${escapeHtml(initials)}</div>` : ""}
+    </article>`;
 }
 
 function renderMetaSelects() {
@@ -744,33 +1369,6 @@ function renderMetaSelects() {
     state.meta.statuses.map((item) => [item, labelFor("status", item)]),
     status
   );
-}
-
-function renderGroups() {
-  const container = qs("#groupList");
-  const groups = workspaceGroups();
-  if (!groups.length) {
-    container.innerHTML = `<div class="empty-state">${escapeHtml(t("noGroups"))}</div>`;
-    return;
-  }
-  container.innerHTML = groups
-    .map((group) => {
-      const tasks = state.tasks.filter(
-        (task) => task.workspace_id === group.workspace_id && task.group_id === group.group_id
-      );
-      const agents = state.agents.filter(
-        (agent) => agent.workspace_id === group.workspace_id && agent.group_id === group.group_id
-      );
-      return `
-        <article class="group-item ${group.group_id === state.selectedGroupId ? "active" : ""}" data-group-id="${escapeHtml(group.group_id)}">
-          <div class="group-main">
-            <div class="group-title">${escapeHtml(group.name)}</div>
-            <div class="group-meta">${escapeHtml(agents.length)} ${escapeHtml(t("agentsUnit"))} · ${escapeHtml(tasks.length)} ${escapeHtml(t("tasksUnit"))}</div>
-          </div>
-          <span class="group-badge">${escapeHtml(tasks.filter((task) => task.status !== "done").length)}</span>
-        </article>`;
-    })
-    .join("");
 }
 
 function renderAgentOptions() {
@@ -824,10 +1422,7 @@ function renderTaskMeta(task) {
 
 function renderRoom() {
   const task = state.selectedTask;
-  qs("#roomTitle").textContent = task ? task.title : t("agentRoom");
-  qs("#roomMeta").textContent = task
-    ? `${t("roomOwner")}: ${agentName(task.owner_agent_id)} · ${t("roomPath")}: ${task.room_path}`
-    : t("selectTask");
+  qs("#roomQuickBar")?.classList.remove("hidden");
   qs("#taskStatusSelect").disabled = !task;
   qs("#taskOwnerSelect").disabled = !task;
   qs("#finalReportButton").disabled = !task;
@@ -842,10 +1437,10 @@ function renderRoom() {
     ? `${t("owner")}: ${agentName(task.owner_agent_id)}`
     : "";
 
-  qsa(".quick-actions button[data-room-action]").forEach((button) => {
+  qsa("[data-room-action]").forEach((button) => {
     button.disabled = !task;
   });
-  qsa("#messageForm textarea, #messageForm button").forEach((node) => {
+  qsa("#messageForm textarea, #messageForm button[type='submit']").forEach((node) => {
     node.disabled = !task;
   });
 
@@ -967,6 +1562,7 @@ function renderAgents() {
           <div class="agent-actions">
             <button type="button" data-agent-start="${escapeHtml(agent.id)}">${escapeHtml(t("start"))}</button>
             <button type="button" class="ghost-button" data-agent-stop="${escapeHtml(agent.id)}">${escapeHtml(t("stop"))}</button>
+            <button type="button" class="ghost-button" data-agent-console="${escapeHtml(agent.id)}">${escapeHtml(t("agentConsole"))}</button>
             <button type="button" class="danger-button" data-agent-delete="${escapeHtml(agent.id)}">${escapeHtml(t("delete"))}</button>
           </div>
         </article>`
@@ -1974,9 +2570,60 @@ async function saveHandoffRules(rules) {
 
 function bindEvents() {
   qs("#refreshButton").addEventListener("click", () => loadState());
-  qs("#inspectorToggleButton").addEventListener("click", () => {
+
+  qs("#settingsButton")?.addEventListener("click", () => {
+    state.settingsPopoverOpen = !state.settingsPopoverOpen;
+    render();
+  });
+  qs("#railAvatar")?.addEventListener("click", () => {
+    state.settingsPopoverOpen = !state.settingsPopoverOpen;
+    render();
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.settingsPopoverOpen) {
+      return;
+    }
+    const popover = qs("#settingsPopover");
+    if (popover && popover.contains(event.target)) {
+      return;
+    }
+    if (event.target.closest("#settingsButton") || event.target.closest("#railAvatar")) {
+      return;
+    }
+    state.settingsPopoverOpen = false;
+    render();
+  });
+
+  qs("#chatDetailToggle").addEventListener("click", () => {
     state.inspectorOpen = !state.inspectorOpen;
     localStorage.setItem("tendrilflow.inspectorOpen", String(state.inspectorOpen));
+    render();
+  });
+  qs("#inspectorCloseButton").addEventListener("click", () => {
+    state.inspectorOpen = false;
+    localStorage.setItem("tendrilflow.inspectorOpen", "false");
+    render();
+  });
+  qs("#chatMembersButton").addEventListener("click", () => {
+    state.activeInspectorTab = "agents";
+    state.inspectorOpen = true;
+    localStorage.setItem("tendrilflow.inspectorTab", "agents");
+    localStorage.setItem("tendrilflow.inspectorOpen", "true");
+    render();
+  });
+  qs("#chatTasksButton").addEventListener("click", () => {
+    state.activeInspectorTab = "tasks";
+    state.inspectorOpen = true;
+    localStorage.setItem("tendrilflow.inspectorTab", "tasks");
+    localStorage.setItem("tendrilflow.inspectorOpen", "true");
+    render();
+  });
+  qs("#chatReplayButton").addEventListener("click", async () => {
+    if (state.selectedDmAgentId || !state.selectedTaskId) {
+      return;
+    }
+    openReplay();
+    await loadReplay();
     render();
   });
   qs("#inspectorTabs").addEventListener("click", (event) => {
@@ -1990,13 +2637,94 @@ function bindEvents() {
     localStorage.setItem("tendrilflow.inspectorOpen", "true");
     render();
   });
+
   qs("#languageSelect").addEventListener("change", (event) => {
     state.lang = event.target.value;
     localStorage.setItem("tendrilflow.lang", state.lang);
     render();
   });
 
-  qs("#groupForm").addEventListener("submit", async (event) => {
+  qs("#workspaceSelect").addEventListener("change", async (event) => {
+    state.selectedWorkspaceId = event.target.value || null;
+    localStorage.setItem("tendrilflow.workspaceId", state.selectedWorkspaceId || "");
+    state.selectedGroupId = null;
+    state.selectedTaskId = null;
+    state.selectedDmAgentId = null;
+    state.selectedConversationId = null;
+    await loadState(false);
+  });
+
+  qs("#convSearchInput").addEventListener("input", (event) => {
+    state.convSearch = event.target.value;
+    renderConversationList();
+  });
+
+  qs("#convList").addEventListener("click", async (event) => {
+    const item = event.target.closest("[data-conv-id]");
+    if (!item) {
+      return;
+    }
+    const conv = findConversation(item.dataset.convId);
+    if (!conv) {
+      return;
+    }
+    selectConversation(conv);
+    await loadSelectedTask();
+    await loadDmTimeline();
+    await loadReplay();
+    render();
+  });
+
+  qs("#newButton")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    state.newMenuOpen = !state.newMenuOpen;
+    render();
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.newMenuOpen) {
+      return;
+    }
+    const menu = qs("#newMenu");
+    if (menu && menu.contains(event.target)) {
+      return;
+    }
+    if (event.target.closest("#newButton")) {
+      return;
+    }
+    state.newMenuOpen = false;
+    render();
+  });
+  qs("#newGroupButton")?.addEventListener("click", () => {
+    state.newMenuOpen = false;
+    state.newGroupDialogOpen = true;
+    render();
+    setTimeout(() => qs('#newGroupForm input[name="name"]')?.focus(), 0);
+  });
+  qs("#newDmButton")?.addEventListener("click", () => {
+    state.newMenuOpen = false;
+    state.newDmDialogOpen = true;
+    render();
+  });
+  qsa("[data-dialog-close]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.newGroupDialogOpen = false;
+      state.newDmDialogOpen = false;
+      render();
+    });
+  });
+  qs("#newGroupDialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      state.newGroupDialogOpen = false;
+      render();
+    }
+  });
+  qs("#newDmDialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      state.newDmDialogOpen = false;
+      render();
+    }
+  });
+  qs("#newGroupForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const payload = Object.fromEntries(form.entries());
@@ -2004,22 +2732,74 @@ function bindEvents() {
     const data = await api("/api/groups", { method: "POST", body: JSON.stringify(payload) });
     state.selectedGroupId = data.group.group_id;
     state.selectedTaskId = null;
+    state.selectedDmAgentId = null;
     localStorage.setItem("tendrilflow.groupId", state.selectedGroupId);
     event.currentTarget.reset();
+    state.newGroupDialogOpen = false;
     await loadState(false);
   });
+  qs("#openNewGroupFromDmDialog")?.addEventListener("click", () => {
+    state.newDmDialogOpen = false;
+    state.newGroupDialogOpen = true;
+    render();
+    setTimeout(() => qs('#newGroupForm input[name="name"]')?.focus(), 0);
+  });
 
-  qs("#groupList").addEventListener("click", async (event) => {
-    const card = event.target.closest("[data-group-id]");
-    if (!card) {
+  qs("#newDmAgentList").addEventListener("click", async (event) => {
+    const item = event.target.closest("[data-new-dm-agent]");
+    if (!item) {
       return;
     }
-    state.selectedGroupId = card.dataset.groupId;
-    state.selectedTaskId = null;
+    const agent = getAgent(item.dataset.newDmAgent);
+    if (!agent) {
+      return;
+    }
+    state.newDmDialogOpen = false;
+    selectConversation({
+      id: conversationId("dm", agent.id),
+      kind: "dm",
+      agent_id: agent.id,
+      group_id: agent.group_id
+    });
+    await loadDmTimeline();
+    render();
+  });
+
+  qs("#dmUpgradeButton").addEventListener("click", async () => {
+    const agent = getAgent(state.selectedDmAgentId);
+    if (!agent) {
+      return;
+    }
+    const title = state.lang === "zh" ? `与 ${agent.name} 的协作任务` : `Work with ${agent.name}`;
+    const data = await api("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: agent.workspace_id,
+        group_id: agent.group_id,
+        title,
+        owner_agent_id: agent.id,
+        description: state.lang === "zh"
+          ? "由单聊升级而来的群聊任务"
+          : "Group chat created from a direct message"
+      })
+    }).catch((error) => {
+      alert(error.message);
+      return null;
+    });
+    if (!data?.task) {
+      return;
+    }
+    state.selectedDmAgentId = null;
+    state.dmAgentDetail = null;
+    state.dmAgentLogs = [];
+    state.selectedTaskId = data.task.task_id;
+    state.selectedGroupId = data.task.group_id;
+    state.selectedConversationId = conversationId("task", data.task.task_id);
+    localStorage.setItem("tendrilflow.convId", state.selectedConversationId);
     state.shouldStickToBottom = true;
     state.userPinnedHistory = false;
-    localStorage.setItem("tendrilflow.groupId", state.selectedGroupId);
-    await loadState(false);
+    await loadState();
+    showToast(t("upgradeDmCreatedTask").replace("{name}", agent.name));
   });
 
   qs("#useRootButton").addEventListener("click", () => {
@@ -2076,6 +2856,7 @@ function bindEvents() {
     const start = event.target.closest("[data-agent-start]");
     const stop = event.target.closest("[data-agent-stop]");
     const remove = event.target.closest("[data-agent-delete]");
+    const console_ = event.target.closest("[data-agent-console]");
     if (start) {
       event.stopPropagation();
       await startAgent(start.dataset.agentStart);
@@ -2086,6 +2867,11 @@ function bindEvents() {
       await stopAgent(stop.dataset.agentStop);
       return;
     }
+    if (console_) {
+      event.stopPropagation();
+      openAgentConsole(console_.dataset.agentConsole);
+      return;
+    }
     if (remove) {
       event.stopPropagation();
       await deleteAgent(remove.dataset.agentDelete);
@@ -2093,7 +2879,20 @@ function bindEvents() {
     }
     const card = event.target.closest("[data-agent-open]");
     if (card) {
-      openAgentConsole(card.dataset.agentOpen);
+      const agent = getAgent(card.dataset.agentOpen);
+      if (!agent) {
+        return;
+      }
+      selectConversation({
+        id: conversationId("dm", agent.id),
+        kind: "dm",
+        agent_id: agent.id,
+        group_id: agent.group_id
+      });
+      state.inspectorOpen = false;
+      localStorage.setItem("tendrilflow.inspectorOpen", "false");
+      await loadDmTimeline();
+      render();
     }
   });
 
@@ -2134,6 +2933,11 @@ function bindEvents() {
       return;
     }
     state.selectedTaskId = card.dataset.taskId;
+    state.selectedDmAgentId = null;
+    state.dmAgentDetail = null;
+    state.dmAgentLogs = [];
+    state.selectedConversationId = conversationId("task", state.selectedTaskId);
+    localStorage.setItem("tendrilflow.convId", state.selectedConversationId);
     state.shouldStickToBottom = true;
     state.userPinnedHistory = false;
     await loadSelectedTask();

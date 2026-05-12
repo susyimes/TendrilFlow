@@ -4,6 +4,7 @@ const {
   DEFAULT_GROUP_ID,
   DEFAULT_WORKSPACE_ID,
   makeId,
+  normalizeIsolationMode,
   normalizeMode,
   normalizeRole,
   normalizeStatus,
@@ -18,6 +19,178 @@ const MEMORY_FILES = {
   "facts.md": "# Facts\n\n",
   "risks.md": "# Risks\n\n"
 };
+
+const DEFAULT_WORKSPACE_SKILLS = [
+  {
+    skill_id: "workspace.context",
+    scope: "workspace",
+    roles: ["*"],
+    title: "Workspace Context",
+    summary:
+      "Use the workspace root, repository instructions, and visible TendrilFlow room state as the shared execution context.",
+    body: [
+      "# Workspace Context",
+      "",
+      "Use this skill as the shared workspace contract for every agent in this TendrilFlow workspace.",
+      "",
+      "- Treat the workspace root as the default execution boundary.",
+      "- Prefer repo-local instructions such as AGENTS.md when the execution adapter supports them.",
+      "- Keep durable decisions, facts, risks, and preferences in the group memory files.",
+      "- Report evidence back to the Agent Room instead of relying on private side context."
+    ].join("\n")
+  }
+];
+
+const DEFAULT_GROUP_SKILLS = [
+  {
+    skill_id: "host.playbook",
+    scope: "group",
+    roles: ["host"],
+    title: "Host Playbook",
+    summary:
+      "Run the visible group playbook: plan, clarify, execute, verify, fix if needed, and finalize with evidence.",
+    body: [
+      "# Host Playbook",
+      "",
+      "Use this skill when the user asks the Host Agent to organize a task.",
+      "",
+      "1. Plan the work and state the current playbook stage.",
+      "2. Clarify missing acceptance criteria before execution if needed.",
+      "3. Assign or route to one execution owner at a time.",
+      "4. Ask review/debug/test agents for evidence when risk is visible.",
+      "5. Fix or reassign blocked work with a visible decision record.",
+      "6. Finalize with outcome, evidence, and remaining risk."
+    ].join("\n")
+  },
+  {
+    skill_id: "host.task_graph",
+    scope: "group",
+    roles: ["host"],
+    title: "Host Task Graph",
+    summary:
+      "Convert a task into visible subtasks with owners, dependencies, verification, and recovery steps.",
+    body: [
+      "# Host Task Graph",
+      "",
+      "Use this skill when a task should be decomposed into a reliable execution graph.",
+      "",
+      "- Keep graph nodes small enough for one agent to own.",
+      "- Make verification explicit instead of treating it as part of execution.",
+      "- Add recovery or fix nodes when failure modes are likely.",
+      "- Suggest reassignment when owner health is stale, detached, or failed.",
+      "- Do not create child tasks until the user accepts the graph."
+    ].join("\n")
+  },
+  {
+    skill_id: "host.route_to_agent",
+    scope: "group",
+    roles: ["host"],
+    title: "Host Route To Agent",
+    summary:
+      "Route visible task context to a named group member exactly once and ask that agent to reply in the room.",
+    body: [
+      "# Host Route To Agent",
+      "",
+      "Use this skill when the user asks the Host Agent to involve a specific group member.",
+      "",
+      "- Route only from explicit user or Host intent.",
+      "- Include current task context, recent room trace, and the exact request.",
+      "- Ask the target agent to answer in the shared Agent Room.",
+      "- Do not route based on another agent's natural-language output.",
+      "- Avoid repeated routes that could create loop storms."
+    ].join("\n")
+  },
+  {
+    skill_id: "host.control",
+    scope: "group",
+    roles: ["host"],
+    title: "Host Control",
+    summary:
+      "Use stop and broadcast as visible group safety primitives when execution needs to pause or align.",
+    body: [
+      "# Host Control",
+      "",
+      "Use this skill when the visible room intent requires a high-level control action.",
+      "",
+      "- Stop running agents when the user or Host needs to prevent unsafe or incorrect continuation.",
+      "- Broadcast high-priority constraints to running members when the group must align.",
+      "- Keep the action visible as a tool_call_summary.",
+      "- Control primitives do not replace each agent's own tools or skills."
+    ].join("\n")
+  },
+  {
+    skill_id: "host.handoff_policy",
+    scope: "group",
+    roles: ["host"],
+    title: "Host Handoff Policy",
+    summary:
+      "Own handoff decisions and maintain the group handoff rule state through host.update_handoff_rules.",
+    body: [
+      "# Host Handoff Policy",
+      "",
+      "Use this skill when responsibility should move from one agent to another.",
+      "",
+      "- A handoff should include goal, status, completed work, blockers, assumptions, evidence, risks, and next step.",
+      "- Prefer handoff when the current owner is blocked, unhealthy, or the task enters a different specialty.",
+      "- Keep custom handoff rules visible in the group handoff rule canvas.",
+      "- The receiving agent should confirm the handoff before continuing."
+    ].join("\n")
+  },
+  {
+    skill_id: "review.evidence_check",
+    scope: "group",
+    roles: ["review"],
+    title: "Review Evidence Check",
+    summary:
+      "Review observable artifacts, tests, diffs, room trace, and acceptance criteria with actionable findings.",
+    body: [
+      "# Review Evidence Check",
+      "",
+      "Use this skill when reviewing another agent's work.",
+      "",
+      "- Lead with bugs, regressions, missing evidence, and missing tests.",
+      "- Separate verified facts from assumptions.",
+      "- Cite files, commands, logs, or room events when possible.",
+      "- Keep comments actionable and scoped to the current task."
+    ].join("\n")
+  },
+  {
+    skill_id: "debug.recovery",
+    scope: "group",
+    roles: ["debug"],
+    title: "Debug Recovery",
+    summary:
+      "Diagnose blockers from logs, status changes, tool summaries, and visible outputs without relying on private thoughts.",
+    body: [
+      "# Debug Recovery",
+      "",
+      "Use this skill when a task is blocked, failed, stale, or ambiguous.",
+      "",
+      "- Inspect visible status changes, tool summaries, logs, and recent events.",
+      "- Identify the likely root cause and the smallest next recovery step.",
+      "- State what evidence is missing before making claims.",
+      "- Recommend whether to retry, fix, reassign, or ask the user."
+    ].join("\n")
+  },
+  {
+    skill_id: "work.execution_report",
+    scope: "group",
+    roles: ["work"],
+    title: "Execution Report",
+    summary:
+      "Execute with the agent's own tools and report changed artifacts, commands, verification, blockers, and next steps.",
+    body: [
+      "# Execution Report",
+      "",
+      "Use this skill when carrying out implementation or research work.",
+      "",
+      "- Use your own tools and adapter capabilities for the actual work.",
+      "- Report commands, files, outputs, and verification evidence.",
+      "- Ask Host for review, debug, testing, or handoff when the next step requires another member.",
+      "- Do not claim completion without visible evidence."
+    ].join("\n")
+  }
+];
 
 const LEGACY_DEFAULT_AGENT_IDS = new Set([
   "agent_codex_worker",
@@ -51,6 +224,116 @@ function transportFromMode(mode) {
   return mode === "acp" ? "acp" : "legacy_cli";
 }
 
+function normalizeIdList(value) {
+  return Array.from(new Set((Array.isArray(value) ? value : []).filter(Boolean).map(String)));
+}
+
+function normalizeSkillId(value, fallback = "custom.skill") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 96);
+  return normalized || fallback;
+}
+
+function skillFileName(skillId) {
+  return `${normalizeSkillId(skillId)}.md`;
+}
+
+function normalizeSkillRoles(value) {
+  const roles = Array.isArray(value)
+    ? value
+    : String(value || "")
+        .split(/[,;\s]+/)
+        .filter(Boolean);
+  return Array.from(
+    new Set(
+      roles
+        .map((role) => String(role || "").trim().toLowerCase())
+        .filter((role) => role === "*" || /^[a-z0-9_-]+$/.test(role))
+    )
+  );
+}
+
+function cleanFrontmatterValue(value) {
+  return String(value ?? "").replace(/\r?\n/g, " ").trim();
+}
+
+function skillMarkdown(skill) {
+  const roles = normalizeSkillRoles(skill.roles);
+  const body = String(skill.body || "").trim();
+  return [
+    "---",
+    `skill_id: ${normalizeSkillId(skill.skill_id)}`,
+    `scope: ${skill.scope === "workspace" ? "workspace" : "group"}`,
+    `roles: ${roles.join(", ") || "*"}`,
+    `title: ${cleanFrontmatterValue(skill.title || skill.skill_id)}`,
+    `summary: ${cleanFrontmatterValue(skill.summary || "")}`,
+    `updated_at: ${skill.updated_at || nowIso()}`,
+    "---",
+    "",
+    body,
+    ""
+  ].join("\n");
+}
+
+function parseSkillMarkdown(raw, metadata) {
+  const lines = String(raw || "").split(/\r?\n/);
+  const frontmatter = {};
+  let bodyStart = 0;
+  if (lines[0] === "---") {
+    for (let index = 1; index < lines.length; index += 1) {
+      if (lines[index] === "---") {
+        bodyStart = index + 1;
+        break;
+      }
+      const match = lines[index].match(/^([a-zA-Z0-9_-]+):\s*(.*)$/);
+      if (match) {
+        frontmatter[match[1]] = match[2];
+      }
+    }
+  }
+  const body = lines.slice(bodyStart).join("\n").trim();
+  const skillId = normalizeSkillId(frontmatter.skill_id || path.basename(metadata.file_name, ".md"));
+  const title = frontmatter.title || body.match(/^#\s+(.+)$/m)?.[1] || skillId;
+  const summary =
+    frontmatter.summary ||
+    body
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line && !line.startsWith("#") && !line.startsWith("-")) ||
+    "";
+  return {
+    skill_id: skillId,
+    scope: frontmatter.scope === "workspace" ? "workspace" : metadata.scope,
+    workspace_id: metadata.workspace_id,
+    group_id: metadata.scope === "group" ? metadata.group_id : null,
+    roles: normalizeSkillRoles(frontmatter.roles || "*"),
+    title,
+    summary,
+    body,
+    file_name: metadata.file_name,
+    path: metadata.relative_path,
+    updated_at: frontmatter.updated_at || null
+  };
+}
+
+function skillMatchesAgent(skill, agent = {}) {
+  const role = String(agent.role || "work").toLowerCase();
+  const agentId = String(agent.id || "").toLowerCase();
+  const agentName = String(agent.name || "").toLowerCase();
+  const roles = new Set(normalizeSkillRoles(skill.roles));
+  return (
+    roles.has("*") ||
+    roles.has(role) ||
+    roles.has(agentId) ||
+    roles.has(agentName) ||
+    String(skill.skill_id || "").startsWith(`${role}.`)
+  );
+}
+
 class FileStore {
   constructor(rootDir) {
     this.rootDir = path.resolve(rootDir);
@@ -67,8 +350,10 @@ class FileStore {
     await fs.mkdir(this.workspacesDir, { recursive: true });
     await this.clearLegacyFlatData();
     await this.ensureDefaultWorkspace();
+    await this.ensureWorkspaceSkills(DEFAULT_WORKSPACE_ID);
     await this.ensureDefaultGroup(DEFAULT_WORKSPACE_ID);
     await this.ensureGroupMemory(DEFAULT_WORKSPACE_ID, DEFAULT_GROUP_ID);
+    await this.ensureGroupSkills(DEFAULT_WORKSPACE_ID, DEFAULT_GROUP_ID);
     try {
       await fs.access(this.agentsPath(DEFAULT_WORKSPACE_ID, DEFAULT_GROUP_ID));
       await this.migrateLegacyHostNaming(DEFAULT_WORKSPACE_ID, DEFAULT_GROUP_ID);
@@ -83,6 +368,7 @@ class FileStore {
       );
     }
     await this.migrateMissingWorkspaceGroupIds();
+    await this.ensureAllSkills();
     await this.ensureAllHandoffPolicies();
     this.initialized = true;
   }
@@ -133,6 +419,9 @@ class FileStore {
       mode: "mock",
       provider: "mock",
       cwd: this.rootDir,
+      base_cwd: this.rootDir,
+      isolation_mode: "shared",
+      worktree: null,
       command: "node scripts/mock-agent.js --role host --name host-agent",
       env: {},
       status: "stopped",
@@ -169,6 +458,14 @@ class FileStore {
     return path.join(this.workspaceDir(workspaceId), "workspace.json");
   }
 
+  workspaceSkillsDir(workspaceId = DEFAULT_WORKSPACE_ID) {
+    return path.join(this.workspaceDir(workspaceId), "skills");
+  }
+
+  workspaceSkillPath(workspaceId = DEFAULT_WORKSPACE_ID, skillId = "workspace.context") {
+    return path.join(this.workspaceSkillsDir(workspaceId), skillFileName(skillId));
+  }
+
   groupsDir(workspaceId = DEFAULT_WORKSPACE_ID) {
     return path.join(this.workspaceDir(workspaceId), "groups");
   }
@@ -187,6 +484,14 @@ class FileStore {
 
   groupMemoryPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID, fileName = "MEMORY.md") {
     return path.join(this.groupMemoryDir(workspaceId, groupId), fileName);
+  }
+
+  groupSkillsDir(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
+    return path.join(this.groupDir(workspaceId, groupId), "skills");
+  }
+
+  groupSkillPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID, skillId = "host.playbook") {
+    return path.join(this.groupSkillsDir(workspaceId, groupId), skillFileName(skillId));
   }
 
   agentsPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
@@ -240,6 +545,7 @@ class FileStore {
       await this.writeJson(this.groupPath(workspaceId, DEFAULT_GROUP_ID), this.defaultGroup(workspaceId));
     }
     await fs.mkdir(this.tasksDir(workspaceId, DEFAULT_GROUP_ID), { recursive: true });
+    await this.ensureGroupSkills(workspaceId, DEFAULT_GROUP_ID);
   }
 
   async ensureGroupMemory(workspaceId, groupId) {
@@ -251,6 +557,39 @@ class FileStore {
       } catch {
         await fs.writeFile(filePath, contents, "utf8");
       }
+    }
+  }
+
+  async ensureWorkspaceSkills(workspaceId) {
+    await fs.mkdir(this.workspaceSkillsDir(workspaceId), { recursive: true });
+    for (const skill of DEFAULT_WORKSPACE_SKILLS) {
+      const filePath = this.workspaceSkillPath(workspaceId, skill.skill_id);
+      try {
+        await fs.access(filePath);
+      } catch {
+        await fs.writeFile(filePath, skillMarkdown({ ...skill, scope: "workspace" }), "utf8");
+      }
+    }
+  }
+
+  async ensureGroupSkills(workspaceId, groupId) {
+    await fs.mkdir(this.groupSkillsDir(workspaceId, groupId), { recursive: true });
+    for (const skill of DEFAULT_GROUP_SKILLS) {
+      const filePath = this.groupSkillPath(workspaceId, groupId, skill.skill_id);
+      try {
+        await fs.access(filePath);
+      } catch {
+        await fs.writeFile(filePath, skillMarkdown({ ...skill, scope: "group" }), "utf8");
+      }
+    }
+  }
+
+  async ensureAllSkills() {
+    for (const workspaceId of await this.listWorkspaceIds()) {
+      await this.ensureWorkspaceSkills(workspaceId);
+    }
+    for (const group of await this.listGroupsRaw()) {
+      await this.ensureGroupSkills(group.workspace_id, group.group_id);
     }
   }
 
@@ -274,7 +613,10 @@ class FileStore {
       const nextAgents = location.agents.map((agent) => ({
         ...agent,
         workspace_id: agent.workspace_id || location.workspace_id,
-        group_id: agent.group_id || location.group_id
+        group_id: agent.group_id || location.group_id,
+        base_cwd: agent.base_cwd || agent.cwd || this.rootDir,
+        isolation_mode: normalizeIsolationMode(agent.isolation_mode),
+        worktree: agent.worktree || null
       }));
       if (JSON.stringify(nextAgents) !== JSON.stringify(location.agents)) {
         await this.writeJson(this.agentsPath(location.workspace_id, location.group_id), nextAgents);
@@ -334,6 +676,9 @@ class FileStore {
         mode: agent.mode || hostDefault.mode,
         provider: agent.provider || hostDefault.provider,
         cwd: agent.cwd || hostDefault.cwd,
+        base_cwd: agent.base_cwd || agent.cwd || hostDefault.base_cwd,
+        isolation_mode: normalizeIsolationMode(agent.isolation_mode),
+        worktree: agent.worktree || null,
         command: legacyCommand ? hostDefault.command : agent.command || hostDefault.command,
         env: agent.env || hostDefault.env,
         updated_at: nowIso()
@@ -582,8 +927,10 @@ class FileStore {
       updated_at: timestamp
     };
     await this.writeJson(this.workspacePath(workspace.workspace_id), workspace);
+    await this.ensureWorkspaceSkills(workspace.workspace_id);
     await this.ensureDefaultGroup(workspace.workspace_id);
     await this.ensureGroupMemory(workspace.workspace_id, DEFAULT_GROUP_ID);
+    await this.ensureGroupSkills(workspace.workspace_id, DEFAULT_GROUP_ID);
     await this.ensureHandoffPolicy(workspace.workspace_id, DEFAULT_GROUP_ID);
     await this.writeJson(this.agentsPath(workspace.workspace_id, DEFAULT_GROUP_ID), [
       this.hostAgent(workspace.workspace_id, DEFAULT_GROUP_ID)
@@ -634,6 +981,7 @@ class FileStore {
     await this.writeJson(this.groupPath(workspaceId, group.group_id), group);
     await fs.mkdir(this.tasksDir(workspaceId, group.group_id), { recursive: true });
     await this.ensureGroupMemory(workspaceId, group.group_id);
+    await this.ensureGroupSkills(workspaceId, group.group_id);
     await this.ensureHandoffPolicy(workspaceId, group.group_id);
     await this.writeJson(this.agentsPath(workspaceId, group.group_id), [this.hostAgent(workspaceId, group.group_id)]);
     return group;
@@ -646,6 +994,125 @@ class FileStore {
       memory[fileName] = await fs.readFile(this.groupMemoryPath(workspaceId, groupId, fileName), "utf8");
     }
     return memory;
+  }
+
+  async readSkillsFromDir(dir, metadata) {
+    await fs.mkdir(dir, { recursive: true });
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    const skills = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) {
+        continue;
+      }
+      const filePath = path.join(dir, entry.name);
+      const raw = await fs.readFile(filePath, "utf8");
+      skills.push(
+        parseSkillMarkdown(raw, {
+          ...metadata,
+          file_name: entry.name,
+          relative_path: path.relative(this.rootDir, filePath).replaceAll("\\", "/")
+        })
+      );
+    }
+    return skills;
+  }
+
+  async listSkills(input = {}) {
+    const workspaceId = input.workspace_id || DEFAULT_WORKSPACE_ID;
+    const groupId = input.group_id || DEFAULT_GROUP_ID;
+    const scope = input.scope || "all";
+    const skills = [];
+    if (scope !== "group") {
+      await this.ensureWorkspaceSkills(workspaceId);
+      skills.push(
+        ...(await this.readSkillsFromDir(this.workspaceSkillsDir(workspaceId), {
+          scope: "workspace",
+          workspace_id: workspaceId,
+          group_id: null
+        }))
+      );
+    }
+    if (scope !== "workspace" && groupId) {
+      await this.ensureGroupSkills(workspaceId, groupId);
+      skills.push(
+        ...(await this.readSkillsFromDir(this.groupSkillsDir(workspaceId, groupId), {
+          scope: "group",
+          workspace_id: workspaceId,
+          group_id: groupId
+        }))
+      );
+    }
+    return skills.sort((a, b) => `${a.scope}:${a.skill_id}`.localeCompare(`${b.scope}:${b.skill_id}`));
+  }
+
+  async getSkill(input = {}) {
+    const workspaceId = input.workspace_id || DEFAULT_WORKSPACE_ID;
+    const groupId = input.group_id || DEFAULT_GROUP_ID;
+    const scope = input.scope === "workspace" ? "workspace" : "group";
+    const skillId = normalizeSkillId(input.skill_id || input.id);
+    const filePath =
+      scope === "workspace"
+        ? this.workspaceSkillPath(workspaceId, skillId)
+        : this.groupSkillPath(workspaceId, groupId, skillId);
+    const raw = await fs.readFile(filePath, "utf8").catch((error) => {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    });
+    if (raw === null) {
+      return null;
+    }
+    return parseSkillMarkdown(raw, {
+      scope,
+      workspace_id: workspaceId,
+      group_id: scope === "group" ? groupId : null,
+      file_name: path.basename(filePath),
+      relative_path: path.relative(this.rootDir, filePath).replaceAll("\\", "/")
+    });
+  }
+
+  async upsertSkill(input = {}) {
+    const workspaceId = input.workspace_id || DEFAULT_WORKSPACE_ID;
+    const groupId = input.group_id || DEFAULT_GROUP_ID;
+    const scope = input.scope === "workspace" ? "workspace" : "group";
+    const skillId = normalizeSkillId(input.skill_id || input.id || input.title);
+    const existing = await this.getSkill({
+      workspace_id: workspaceId,
+      group_id: groupId,
+      scope,
+      skill_id: skillId
+    });
+    const next = {
+      skill_id: skillId,
+      scope,
+      roles: normalizeSkillRoles(input.roles !== undefined ? input.roles : existing?.roles || "*"),
+      title: input.title !== undefined ? input.title : existing?.title || skillId,
+      summary: input.summary !== undefined ? input.summary : existing?.summary || "",
+      body: input.body !== undefined ? input.body : input.content !== undefined ? input.content : existing?.body || "",
+      updated_at: nowIso()
+    };
+    const filePath =
+      scope === "workspace"
+        ? this.workspaceSkillPath(workspaceId, skillId)
+        : this.groupSkillPath(workspaceId, groupId, skillId);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, skillMarkdown(next), "utf8");
+    return this.getSkill({ workspace_id: workspaceId, group_id: groupId, scope, skill_id: skillId });
+  }
+
+  async matchedSkillSummaries(workspaceId, groupId, agent = {}) {
+    const skills = await this.listSkills({ workspace_id: workspaceId, group_id: groupId });
+    return skills
+      .filter((skill) => skillMatchesAgent(skill, agent))
+      .map((skill) => ({
+        skill_id: skill.skill_id,
+        scope: skill.scope,
+        roles: skill.roles,
+        title: skill.title,
+        summary: skill.summary,
+        path: skill.path
+      }));
   }
 
   normalizeHandoffRule(rule) {
@@ -782,6 +1249,9 @@ class FileStore {
       mode: normalizeMode(input.mode || (input.transport === "acp" ? "acp" : "mock")),
       provider: input.provider?.trim() || input.transport || "local",
       cwd: path.resolve(input.cwd || this.rootDir),
+      base_cwd: path.resolve(input.base_cwd || existing?.base_cwd || input.cwd || this.rootDir),
+      isolation_mode: normalizeIsolationMode(input.isolation_mode || existing?.isolation_mode),
+      worktree: input.worktree !== undefined ? input.worktree : existing?.worktree || null,
       command: input.command?.trim() || "",
       env: normalizeEnv(input.env),
       status: existing?.status || "stopped",
@@ -931,6 +1401,12 @@ class FileStore {
       status: normalizeStatus(input.status || (input.owner_agent_id ? "in_progress" : "todo")),
       owner_agent_id: input.owner_agent_id || null,
       participant_agent_ids: participantIds,
+      parent_task_id: input.parent_task_id || null,
+      child_task_ids: normalizeIdList(input.child_task_ids),
+      depends_on: normalizeIdList(input.depends_on),
+      blocked_by: normalizeIdList(input.blocked_by),
+      claim: input.claim || null,
+      playbook_stage: input.playbook_stage || "intake",
       related_refs: Array.isArray(input.related_refs) ? input.related_refs : [],
       created_at: timestamp,
       updated_at: timestamp,

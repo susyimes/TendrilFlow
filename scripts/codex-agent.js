@@ -16,7 +16,7 @@ function hasFlag(name) {
 const name = arg("name", "codex-worker");
 const mode = arg("mode", process.env.TENDRILFLOW_CODEX_MODE || "mock");
 const codexCommand = arg("codex-command", process.env.TENDRILFLOW_CODEX_COMMAND || "codex");
-const cwd = arg("cwd", process.env.TENDRILFLOW_CODEX_CWD || process.cwd());
+const cwd = process.env.TENDRILFLOW_CODEX_CWD || arg("cwd", process.cwd());
 const sandbox = arg("sandbox", process.env.TENDRILFLOW_CODEX_SANDBOX || "workspace-write");
 const model = arg("model", process.env.TENDRILFLOW_CODEX_MODEL || "");
 const enableSearch = hasFlag("search") || process.env.TENDRILFLOW_CODEX_SEARCH === "1";

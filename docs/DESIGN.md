@@ -29,6 +29,7 @@ MVP 包含：
 - Agent Group
 - 本地 Task Board
 - Agent Launcher
+- Worker Isolation
 - Agent Room
 - Orchestrator
 - ACP Adapter
@@ -42,6 +43,8 @@ MVP 包含：
 - 文件存储 transcript
 - 默认可见的 agent 沟通
 - 结构化讨论、决策和交接记录
+- 可选 per-agent Git worktree 隔离
+- 任务级 replay analytics 和可靠性复盘
 
 MVP 不包含：
 
@@ -89,6 +92,7 @@ MVP 先提供一个默认群组，并支持创建更多本地群组。已有 age
 
 - 配置 agent 名称和角色
 - 配置工作目录
+- 配置隔离方式：共享工作目录或 per-agent Git worktree
 - 配置启动命令
 - 配置运行方式：`mock`、`exec` 或 `acp`
 - 记录运行状态
@@ -263,6 +267,7 @@ TendrilFlow 必须在发送给 agent 的任务上下文中注入沟通执行协�
 - workspace、group、task 基本信息。
 - 当前 agent 名称、id 和 role。
 - `tendrilflow.communication_execution.v1` 协议。
+- 匹配当前 role 的 workspace/group skill 摘要和文件路径。
 - 群组 memory 摘要。
 - 最近 room events。
 - 仓库级 `AGENTS.md` 指令提示。
@@ -270,7 +275,30 @@ TendrilFlow 必须在发送给 agent 的任务上下文中注入沟通执行协�
 
 这份协议应该保持短、稳定、可被任何 provider 理解。它不替 agent 做计划，也不规定具体能力调用方式；它只声明群组协作和执行回报规则，让 agent 在自己的 tool/skill 边界内发挥。
 
-## 6. 控制平面
+## 6. Skill Layer
+
+Skill Layer 是 TendrilFlow 把群组协作经验沉淀成可复用能力的文件层，不是通用低代码 agent builder。
+
+目录分为两层：
+
+- Workspace skills：`.tendrilflow/workspaces/{workspace_id}/skills/`
+- Group skills：`.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/skills/`
+
+默认 skill：
+
+- `workspace.context`：workspace 级执行边界、仓库指令和共享上下文约定。
+- `host.playbook`：Host 默认推进阶段。
+- `host.task_graph`：Host 将任务拆成可接受的依赖图。
+- `host.route_to_agent`：Host 对指定成员做一次可审计路由。
+- `host.control`：Host 停止和广播控制原语。
+- `host.handoff_policy`：Host 交接规则和 handoff skill 状态。
+- `review.evidence_check`：review agent 的证据检查方式。
+- `debug.recovery`：debug agent 的阻塞恢复方式。
+- `work.execution_report`：执行 agent 的进度和验证回报方式。
+
+发送任务给 agent 时，Orchestrator 会按 role 匹配 skill，注入 skill id、summary 和文件路径。Core 不执行这些 skill 的业务能力，只负责保存、展示和注入协作契约；真正能力仍由 agent 自己的 tools、skills、模型、adapter 和仓库指令承担。
+
+## 7. 控制平面
 
 TendrilFlow Core 不拥有业务能力，但必须拥有控制平面。
 
@@ -294,7 +322,7 @@ MVP 控制原语：
 - 停止必须记录影响范围，包括目标 agent ids。
 - 控制平面只负责通信安全，不替代 agent tools/skills 的业务能力。
 
-## 7. 安全底线
+## 8. 安全底线
 
 TendrilFlow MVP 的安全目标不是提供完整虚拟机沙箱，而是在 agent harness 层提供必要的可见性、刹车能力和信息保护。
 
@@ -304,6 +332,7 @@ Core 必须保证：
 - 用户和 Host Agent 的控制动作必须形成可审计 trace。
 - agent 输出不触发自动二次路由，避免自然语言循环风暴。
 - workspace/group/task/agent 记录按本地文件结构隔离。
+- dirty agent worktree 不会被自动删除。
 
 Agent 协议必须要求：
 
@@ -319,10 +348,42 @@ Agent 协议必须要求：
 - 对外部 CLI agent 做 OS 级沙箱。
 - 自动判断所有危险命令。
 - 自动证明 agent 没有读取敏感文件。
+- 自动合并多个 agent worktree 的变更。
 
 这些能力后续可以通过 provider adapter、权限代理、命令审批和隔离执行环境逐步增强。
 
-## 8. 角色模型
+## 9. Worker Isolation
+
+Worker Isolation 的目标是降低多个 coding agents 并行修改同一仓库时的互相污染风险。它不是 OS 级沙箱，而是 Git 工作目录级隔离。
+
+第一版模型：
+
+- `isolation_mode: "shared"`：默认模式，agent 使用配置的 `cwd`。
+- `isolation_mode: "worktree"`：启动前准备 per-agent Git worktree。
+- `base_cwd` 保存原始仓库根。
+- `cwd` 保存 agent 当前实际运行目录；worktree 模式下指向该 agent 的 worktree。
+- `worktree` 保存 path、branch、dirty、changed_files、status、last_checked_at 等状态。
+
+目录约定：
+
+```text
+.tendrilflow/
+  workspaces/
+    {workspace_id}/
+      worktrees/
+        {agent_id}/
+```
+
+安全规则：
+
+- worktree 创建要求 `base_cwd` 是 Git 仓库且存在已提交的 `HEAD`。
+- agent 启动前创建或复用自己的 worktree。
+- Agent context 必须注入 isolation mode、实际 cwd 和 worktree 状态。
+- 删除 agent 前检查 worktree dirty 状态。
+- dirty worktree 不能被自动删除，用户必须先 commit、stash 或清理。
+- TendrilFlow 不自动 merge worktree；Host Agent 后续只能给出合并建议，最终由用户确认。
+
+## 10. 角色模型
 
 ### Work Agent
 
@@ -390,7 +451,7 @@ Host Agent 进入 MVP，中文 UI 显示为“群主”。
 
 Host Agent 不是自动独裁调度器。MVP 中它应给出建议和组织流程，用户仍保留最终控制权。
 
-## 9. 数据和文件存储
+## 11. 数据和文件存储
 
 Transcript 使用文件存储。
 
@@ -401,6 +462,10 @@ Transcript 使用文件存储。
   workspaces/
     {workspace_id}/
       workspace.json
+      skills/
+        workspace.context.md
+      worktrees/
+        {agent_id}/
       groups/
         {group_id}/
           group.json
@@ -409,6 +474,15 @@ Transcript 使用文件存储。
             decisions.md
             facts.md
             risks.md
+          skills/
+            host.playbook.md
+            host.task_graph.md
+            host.route_to_agent.md
+            host.control.md
+            host.handoff_policy.md
+            review.evidence_check.md
+            debug.recovery.md
+            work.execution_report.md
           agents.json
           tasks/
             {task_id}/
@@ -469,7 +543,7 @@ ACP Adapter 应将协议事件转换为 TendrilFlow room events：
 
 映射目标不是完整复刻 ACP，而是生成用户可读、可追踪、可用于 handoff 和 review 的任务事件流。
 
-## 10. 协作流程
+## 12. 协作流程
 
 ### 基础任务流
 
@@ -477,11 +551,12 @@ ACP Adapter 应将协议事件转换为 TendrilFlow room events：
 2. 用户选择 workspace 内的群组。
 3. 用户在群组内创建任务，选择 agent，或让 Host Agent 给出分配建议。
 4. Orchestrator 创建 task room 和 transcript 文件。
-5. Work Agent 执行任务并持续写入事件。
-6. 用户在 Agent Room 观察过程。
-7. 用户或 Host Agent 触发 debug、review、讨论或交接。
-8. 任务完成后生成 final report。
-9. Task Board 状态变为 `done`。
+5. 如果 agent 使用 worktree 隔离，Orchestrator 先准备 per-agent Git worktree。
+6. Work Agent 执行任务并持续写入事件。
+7. 用户在 Agent Room 观察过程。
+8. 用户或 Host Agent 触发 debug、review、讨论或交接。
+9. 任务完成后生成 final report。
+10. Task Board 状态变为 `done`。
 
 ### 讨论机制
 
@@ -535,7 +610,7 @@ Handoff card 内容：
 
 接手 agent 必须先确认理解交接内容，再继续执行。
 
-## 11. Trace 策略
+## 13. Trace 策略
 
 TendrilFlow 不暴露原始 chain-of-thought。
 
@@ -554,7 +629,39 @@ TendrilFlow 不暴露原始 chain-of-thought。
 
 这能提供足够透明度，同时避免依赖私有推理过程。
 
-## 12. 与 Coze Studio 的区别
+## 14. Replay And Reliability Analytics
+
+Replay Analytics 的目标是把已有 trace 转成任务复盘和可靠性改进建议，而不是引入第二套状态系统。
+
+输入来源：
+
+- 当前任务的 `events.jsonl`
+- 当前群组内相关 agent 的 session logs
+- task metadata、agent health、final report、handoff 和 review 记录
+
+第一版输出：
+
+- `task_summary`：任务标题、状态、owner、阶段、耗时、事件数和最终报告摘要。
+- `agent_contributions`：按 actor 汇总消息、工具调用、决策、review、handoff、日志和错误数量。
+- `decision_risk_summary`：汇总决策、风险、证据线索和阻塞线索。
+- `timeline`：按时间合并 room events 和 agent logs，形成可读 replay。
+- `metrics`：event/log/tool/review/handoff/final_report/process_error/retry/agent health 等计数。
+- `host_replay_suggestions`：根据缺少 final report、缺少 review、证据不足、进程错误、agent unhealthy、缺少决策记录等信号给出 Host 改进建议。
+
+API：
+
+```text
+GET /api/tasks/{task_id}/replay
+```
+
+产品边界：
+
+- Replay 从文件 trace 派生，不写入新的数据库状态。
+- Replay 不暴露原始 chain-of-thought。
+- Replay 不自动判定任务真实正确性，只帮助用户、Host Agent 和 review agent 更快发现风险。
+- Replay 的建议是组织改进建议，不替代真实测试、代码审查或用户确认。
+
+## 15. 与 Coze Studio 的区别
 
 Coze Studio 是通用 AI Agent 应用开发平台，重点是创建 agent、配置资源、编排 workflow，并发布应用。
 
@@ -568,7 +675,7 @@ TendrilFlow 的重点不是创建通用 AI 应用，而是管理本地 coding ag
 - Coze Studio 的 agent 多运行在平台抽象中，TendrilFlow 管理外部 CLI/SDK agent 进程。
 - ACP 解决的是 TendrilFlow 到 coding agent 的通信标准化；Coze 解决的是 agent app 构建和发布。
 
-## 13. 验收场景
+## 16. 验收场景
 
 - 用户能启动 local web app。
 - 用户能从最左侧选择 workspace，再选择群组，并在群组内创建任务和 agent。
@@ -584,3 +691,5 @@ TendrilFlow 的重点不是创建通用 AI 应用，而是管理本地 coding ag
 - 任务交接时系统能生成 handoff card。
 - 接手 agent 能基于 handoff card 继续执行。
 - 任务完成后能生成 final report。
+- 用户能打开任务复盘，看到任务摘要、贡献、风险、timeline、指标和 Host 建议。
+- Replay 不展示原始 chain-of-thought。

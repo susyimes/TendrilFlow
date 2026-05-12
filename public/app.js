@@ -2,6 +2,10 @@ const i18n = {
   zh: {
     language: "语言",
     refresh: "刷新",
+    workbench: "工作台",
+    taskTab: "任务",
+    launcherTab: "创建",
+    agentsTab: "成员",
     workspaces: "Workspace",
     workspacesHint: "长期记忆和群组容器",
     workspaceName: "Workspace 名称",
@@ -62,6 +66,29 @@ const i18n = {
     status: "状态",
     deleteTask: "删除任务",
     finalReport: "最终报告",
+    replay: "任务复盘",
+    taskReplay: "任务复盘",
+    replaySummary: "复盘摘要",
+    reliabilityMetrics: "可靠性指标",
+    agentContributions: "成员贡献",
+    decisionRiskSummary: "决策与风险",
+    replayTimeline: "Replay 时间线",
+    hostSuggestions: "群主建议",
+    generatedAt: "生成时间",
+    eventCount: "事件",
+    logCount: "日志",
+    duration: "耗时",
+    playbookStage: "阶段",
+    toolCalls: "工具摘要",
+    decisions: "决策",
+    reviews: "审查",
+    handoffs: "交接",
+    processErrors: "进程错误",
+    retries: "重试",
+    noReplay: "还没有复盘数据",
+    risks: "风险",
+    evidence: "证据",
+    blockers: "阻塞",
     messagePlaceholder: "@codex-worker 继续执行",
     send: "发送",
     launcher: "Agent Launcher",
@@ -71,6 +98,13 @@ const i18n = {
     workingDir: "工作目录",
     useWorkspaceRoot: "使用项目根目录",
     runMode: "运行方式",
+    isolation: "隔离方式",
+    isolation_shared: "共享工作目录",
+    isolation_worktree: "独立 Git worktree",
+    baseDir: "基础目录",
+    worktree: "Worktree",
+    worktreeDirty: "有未提交变更",
+    worktreeClean: "干净",
     advancedConfig: "高级配置",
     provider: "Provider",
     provider_codex: "Codex",
@@ -116,9 +150,26 @@ const i18n = {
     taskId: "任务 ID",
     currentTask: "当前任务",
     noCurrentTask: "未绑定任务",
+    health: "健康",
+    health_idle: "空闲",
+    health_active: "执行中",
+    health_stale: "疑似卡住",
+    health_detached: "会话丢失",
+    health_stopped: "已停止",
+    health_failed: "失败",
+    taskGraph: "任务图",
+    applyTaskGraph: "接受任务图",
+    dependencies: "依赖",
+    blockedBy: "阻塞",
+    subtasks: "子任务",
+    parentTask: "父任务",
     you: "你",
     system: "系统",
     primaryAction: "当前动作",
+    processTrace: "执行过程",
+    agentReply: "回复",
+    expandTrace: "展开",
+    collapseTrace: "收起",
     startOwner: "启动负责人",
     continueOwner: "继续执行",
     actionPlan: "拆分计划",
@@ -134,6 +185,10 @@ const i18n = {
   en: {
     language: "Language",
     refresh: "Refresh",
+    workbench: "Workbench",
+    taskTab: "Tasks",
+    launcherTab: "Create",
+    agentsTab: "Agents",
     workspaces: "Workspaces",
     workspacesHint: "Long-term memory and group containers",
     workspaceName: "Workspace Name",
@@ -194,6 +249,29 @@ const i18n = {
     status: "Status",
     deleteTask: "Delete Task",
     finalReport: "Final Report",
+    replay: "Replay",
+    taskReplay: "Task Replay",
+    replaySummary: "Replay Summary",
+    reliabilityMetrics: "Reliability Metrics",
+    agentContributions: "Agent Contributions",
+    decisionRiskSummary: "Decisions & Risks",
+    replayTimeline: "Replay Timeline",
+    hostSuggestions: "Host Suggestions",
+    generatedAt: "Generated",
+    eventCount: "Events",
+    logCount: "Logs",
+    duration: "Duration",
+    playbookStage: "Stage",
+    toolCalls: "Tool calls",
+    decisions: "Decisions",
+    reviews: "Reviews",
+    handoffs: "Handoffs",
+    processErrors: "Process errors",
+    retries: "Retries",
+    noReplay: "No replay data yet",
+    risks: "Risks",
+    evidence: "Evidence",
+    blockers: "Blockers",
     messagePlaceholder: "@codex-worker continue",
     send: "Send",
     launcher: "Agent Launcher",
@@ -203,6 +281,13 @@ const i18n = {
     workingDir: "Working Dir",
     useWorkspaceRoot: "Use Workspace Root",
     runMode: "Run Mode",
+    isolation: "Isolation",
+    isolation_shared: "Shared working dir",
+    isolation_worktree: "Isolated Git worktree",
+    baseDir: "Base Dir",
+    worktree: "Worktree",
+    worktreeDirty: "Dirty",
+    worktreeClean: "Clean",
     advancedConfig: "Advanced Config",
     provider: "Provider",
     provider_codex: "Codex",
@@ -248,9 +333,26 @@ const i18n = {
     taskId: "Task ID",
     currentTask: "Current task",
     noCurrentTask: "No current task",
+    health: "Health",
+    health_idle: "Idle",
+    health_active: "Active",
+    health_stale: "Stale",
+    health_detached: "Detached",
+    health_stopped: "Stopped",
+    health_failed: "Failed",
+    taskGraph: "Task Graph",
+    applyTaskGraph: "Accept Graph",
+    dependencies: "Depends",
+    blockedBy: "Blocked by",
+    subtasks: "Subtasks",
+    parentTask: "Parent",
     you: "You",
     system: "System",
     primaryAction: "Current action",
+    processTrace: "Process",
+    agentReply: "Reply",
+    expandTrace: "Expand",
+    collapseTrace: "Collapse",
     startOwner: "Start owner",
     continueOwner: "Continue",
     actionPlan: "Plan",
@@ -278,6 +380,8 @@ const state = {
   events: [],
   handoffRulesOpen: false,
   handoffPolicy: null,
+  replayOpen: false,
+  replayData: null,
   agentConsoleId: null,
   agentDetail: null,
   agentLogs: [],
@@ -289,6 +393,9 @@ const state = {
   userPinnedHistory: false,
   consoleShouldStickToBottom: true,
   consoleUserPinnedHistory: false,
+  inspectorOpen: localStorage.getItem("tendrilflow.inspectorOpen") !== "false",
+  activeInspectorTab: localStorage.getItem("tendrilflow.inspectorTab") || "tasks",
+  expandedProcessBundles: new Set(),
   mention: {
     active: false,
     query: "",
@@ -305,16 +412,19 @@ const qsa = (selector, root = document) => Array.from(root.querySelectorAll(sele
 const t = (key) => i18n[state.lang]?.[key] || i18n.en[key] || key;
 const PROVIDERS = ["codex", "gemini", "kimi", "mock", "custom"];
 const HANDOFF_TRIGGERS = ["manual", "blocked", "ready_for_review", "owner_change", "done"];
+const PROCESS_BUNDLE_TYPES = new Set(["tool_call_summary", "decision_record", "handoff_note", "system_event", "status_change"]);
 
 function syncRouteFromHash() {
   const agentMatch = window.location.hash.match(/^#\/agents\/([^/?#]+)/);
   state.handoffRulesOpen = /^#\/handoff-rules/.test(window.location.hash);
-  state.agentConsoleId = state.handoffRulesOpen || !agentMatch ? null : decodeURIComponent(agentMatch[1]);
+  state.replayOpen = /^#\/replay/.test(window.location.hash);
+  state.agentConsoleId = state.handoffRulesOpen || state.replayOpen || !agentMatch ? null : decodeURIComponent(agentMatch[1]);
 }
 
 function openAgentConsole(agentId) {
   state.agentConsoleId = agentId;
   state.handoffRulesOpen = false;
+  state.replayOpen = false;
   state.consoleShouldStickToBottom = true;
   state.consoleUserPinnedHistory = false;
   window.location.hash = `/agents/${encodeURIComponent(agentId)}`;
@@ -323,7 +433,18 @@ function openAgentConsole(agentId) {
 function openHandoffRules() {
   state.agentConsoleId = null;
   state.handoffRulesOpen = true;
+  state.replayOpen = false;
   window.location.hash = "/handoff-rules";
+}
+
+function openReplay() {
+  if (!state.selectedTaskId) {
+    return;
+  }
+  state.agentConsoleId = null;
+  state.handoffRulesOpen = false;
+  state.replayOpen = true;
+  window.location.hash = "/replay";
 }
 
 function closeAgentConsole() {
@@ -331,6 +452,8 @@ function closeAgentConsole() {
   state.agentDetail = null;
   state.agentLogs = [];
   state.handoffRulesOpen = false;
+  state.replayOpen = false;
+  state.replayData = null;
   history.pushState("", document.title, window.location.pathname + window.location.search);
   render();
 }
@@ -415,6 +538,19 @@ function statusClass(status) {
   return `status-${String(status || "").replaceAll(" ", "_")}`;
 }
 
+function healthClass(status) {
+  return `health-${String(status || "stopped").replaceAll(" ", "_")}`;
+}
+
+function renderWorktreeBadge(agent) {
+  if (agent.isolation_mode !== "worktree") {
+    return "";
+  }
+  const status = agent.worktree?.dirty ? t("worktreeDirty") : agent.worktree?.status || t("worktreeClean");
+  const className = agent.worktree?.dirty ? "worktree-dirty" : "worktree-clean";
+  return ` <span class="worktree-pill ${className}">${escapeHtml(status)}</span>`;
+}
+
 async function loadMeta() {
   state.meta = await api("/api/meta");
   qs("#workspacePath").textContent = state.meta.root;
@@ -427,6 +563,10 @@ async function loadMeta() {
     (state.meta.modes || ["mock", "exec", "acp"]).map((mode) => [mode, labelFor("mode", mode)])
   );
   fillSelect(
+    qs('#agentForm select[name="isolation_mode"]'),
+    (state.meta.isolationModes || ["shared", "worktree"]).map((mode) => [mode, labelFor("isolation", mode)])
+  );
+  fillSelect(
     qs("#taskStatusSelect"),
     state.meta.statuses.map((status) => [status, labelFor("status", status)])
   );
@@ -437,6 +577,7 @@ async function loadMeta() {
   const form = qs("#agentForm");
   form.elements.cwd.value = state.meta.root;
   form.elements.mode.value = "mock";
+  form.elements.isolation_mode.value = "shared";
   form.elements.provider.value = "mock";
   form.elements.command.value = recommendedCommand();
 }
@@ -468,6 +609,7 @@ async function loadState(keepTask = true) {
   await loadSelectedTask();
   await loadAgentDetail();
   await loadHandoffPolicy();
+  await loadReplay();
   render();
 }
 
@@ -504,6 +646,14 @@ async function loadHandoffPolicy() {
   state.handoffPolicy = data?.policy || null;
 }
 
+async function loadReplay() {
+  if (!state.replayOpen || !state.selectedTaskId) {
+    state.replayData = null;
+    return;
+  }
+  state.replayData = await api(`/api/tasks/${encodeURIComponent(state.selectedTaskId)}/replay`).catch(() => null);
+}
+
 function fillSelect(select, entries, selected) {
   select.innerHTML = entries
     .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
@@ -515,6 +665,7 @@ function fillSelect(select, entries, selected) {
 
 function render() {
   applyI18n();
+  renderInspectorShell();
   renderMetaSelects();
   renderGroups();
   renderAgentOptions();
@@ -523,16 +674,36 @@ function render() {
   renderAgents();
 }
 
+function renderInspectorShell() {
+  if (!["tasks", "launcher", "agents"].includes(state.activeInspectorTab)) {
+    state.activeInspectorTab = "tasks";
+  }
+  document.body.classList.toggle("inspector-collapsed", !state.inspectorOpen);
+  qs("#inspectorToggleButton").classList.toggle("active", state.inspectorOpen);
+  qsa("#inspectorTabs [data-inspector-tab]").forEach((button) => {
+    const active = button.dataset.inspectorTab === state.activeInspectorTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  qsa("[data-inspector-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.inspectorPanel === state.activeInspectorTab);
+  });
+}
+
 function renderMainPanel() {
   const showRules = Boolean(state.handoffRulesOpen);
-  const showConsole = !showRules && Boolean(state.agentConsoleId);
-  qs("#taskRoomView").classList.toggle("hidden", showConsole || showRules);
+  const showReplay = !showRules && Boolean(state.replayOpen);
+  const showConsole = !showRules && !showReplay && Boolean(state.agentConsoleId);
+  qs("#taskRoomView").classList.toggle("hidden", showConsole || showRules || showReplay);
   qs("#agentConsoleView").classList.toggle("hidden", !showConsole);
   qs("#handoffRulesView").classList.toggle("hidden", !showRules);
+  qs("#replayView").classList.toggle("hidden", !showReplay);
   if (showConsole) {
     renderAgentConsole();
   } else if (showRules) {
     renderHandoffRules();
+  } else if (showReplay) {
+    renderReplay();
   } else {
     renderRoom();
   }
@@ -545,6 +716,7 @@ function renderMetaSelects() {
   const form = qs("#agentForm");
   const role = form.elements.role.value || "work";
   const mode = form.elements.mode.value || "mock";
+  const isolationMode = form.elements.isolation_mode.value || "shared";
   const provider = form.elements.provider.value || "mock";
   const status = qs("#taskStatusSelect").value || state.selectedTask?.status || "todo";
   fillSelect(
@@ -556,6 +728,11 @@ function renderMetaSelects() {
     form.elements.mode,
     (state.meta.modes || ["mock", "exec", "acp"]).map((item) => [item, labelFor("mode", item)]),
     mode
+  );
+  fillSelect(
+    form.elements.isolation_mode,
+    (state.meta.isolationModes || ["shared", "worktree"]).map((item) => [item, labelFor("isolation", item)]),
+    isolationMode
   );
   fillSelect(
     form.elements.provider,
@@ -623,7 +800,7 @@ function renderTasks() {
         <article class="task-item ${task.task_id === state.selectedTaskId ? "active" : ""}" data-task-id="${escapeHtml(task.task_id)}">
           <div class="task-main">
             <div class="task-title">${escapeHtml(task.title)}</div>
-            <div class="task-meta">${escapeHtml(agentName(task.owner_agent_id))}</div>
+            <div class="task-meta">${renderTaskMeta(task)}</div>
           </div>
           <div class="task-side">
             <span class="status-pill"><span class="status-dot ${statusClass(task.status)}"></span>${escapeHtml(labelFor("status", task.status))}</span>
@@ -632,6 +809,17 @@ function renderTasks() {
         </article>`
     )
     .join("");
+}
+
+function renderTaskMeta(task) {
+  const details = [
+    `${t("owner")}: ${agentName(task.owner_agent_id)}`,
+    task.parent_task_id ? `${t("parentTask")}: ${task.parent_task_id}` : "",
+    (task.depends_on || []).length ? `${t("dependencies")}: ${task.depends_on.length}` : "",
+    (task.blocked_by || []).length ? `${t("blockedBy")}: ${task.blocked_by.length}` : "",
+    (task.child_task_ids || []).length ? `${t("subtasks")}: ${task.child_task_ids.length}` : ""
+  ].filter(Boolean);
+  return details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("");
 }
 
 function renderRoom() {
@@ -643,6 +831,7 @@ function renderRoom() {
   qs("#taskStatusSelect").disabled = !task;
   qs("#taskOwnerSelect").disabled = !task;
   qs("#finalReportButton").disabled = !task;
+  qs("#replayButton").disabled = !task;
   qs("#deleteTaskButton").disabled = !task;
   qs("#startOwnerButton").disabled = !task || !task.owner_agent_id;
   qs("#ownerContinueButton").disabled = !task || !task.owner_agent_id;
@@ -679,7 +868,7 @@ function renderRoom() {
     state.lastRenderedEventId = null;
     return;
   }
-  stream.innerHTML = state.events.map(renderEvent).join("");
+  stream.innerHTML = roomTimelineItems(state.events).map(renderRoomItem).join("");
   if (taskChanged || state.shouldStickToBottom || (eventChanged && !state.userPinnedHistory)) {
     stream.scrollTop = stream.scrollHeight;
   } else {
@@ -688,6 +877,65 @@ function renderRoom() {
   state.shouldStickToBottom = false;
   state.lastRenderedTaskId = task.task_id;
   state.lastRenderedEventId = nextEventId;
+}
+
+function roomTimelineItems(events) {
+  const items = [];
+  let turn = 0;
+  for (const event of events) {
+    if (event.type === "user_message" || event.actor?.kind === "user") {
+      turn += 1;
+      items.push(event);
+      continue;
+    }
+
+    const bucket = eventBundleBucket(event);
+    if (!bucket) {
+      items.push(event);
+      continue;
+    }
+
+    const actorKey = eventActorKey(event);
+    const previous = items.at(-1);
+    if (
+      previous?.kind === "event_bundle" &&
+      previous.turn === turn &&
+      previous.bucket === bucket &&
+      previous.actorKey === actorKey
+    ) {
+      previous.events.push(event);
+    } else {
+      items.push({
+        kind: "event_bundle",
+        bundleId: bundleIdForEvent(event, bucket, actorKey, turn),
+        bucket,
+        actorKey,
+        turn,
+        events: [event]
+      });
+    }
+  }
+  return items;
+}
+
+function bundleIdForEvent(event, bucket, actorKey, turn) {
+  return [event.task_id || state.selectedTaskId || "task", turn, bucket, actorKey, event.event_id || event.timestamp]
+    .join(":")
+    .replace(/\s+/g, "_");
+}
+
+function eventBundleBucket(event) {
+  if (event.type === "agent_message") {
+    return "response";
+  }
+  if (PROCESS_BUNDLE_TYPES.has(event.type)) {
+    return "process";
+  }
+  return null;
+}
+
+function eventActorKey(event) {
+  return `${event.actor?.kind || "unknown"}:${event.actor?.id || ""}`;
 }
 
 function isNearBottom(element) {
@@ -711,6 +959,8 @@ function renderAgents() {
           <div class="agent-summary">
             <div class="agent-name"><span class="status-dot ${statusClass(agent.status)}"></span>${escapeHtml(agent.name)}</div>
             <div class="agent-meta">${escapeHtml(labelFor("role", agent.role))} · ${escapeHtml(labelFor("mode", agent.mode || "mock"))}</div>
+            <div class="agent-meta">${escapeHtml(t("isolation"))}: ${escapeHtml(labelFor("isolation", agent.isolation_mode || "shared"))}${renderWorktreeBadge(agent)}</div>
+            <div class="agent-meta">${escapeHtml(t("health"))}: <span class="health-pill ${healthClass(agent.health?.status)}">${escapeHtml(labelFor("health", agent.health?.status || "stopped"))}</span></div>
             <div class="agent-meta">${escapeHtml(t("currentTask"))}: ${escapeHtml(agent.current_task_id || t("noCurrentTask"))}</div>
             <div class="agent-cwd">${escapeHtml(agent.cwd || "")}</div>
           </div>
@@ -849,6 +1099,151 @@ function renderHandoffRuleList(rules) {
     .join("");
 }
 
+function renderReplay() {
+  const replay = state.replayData;
+  const task = replay?.task_summary || state.selectedTask;
+  qs("#replayTitle").textContent = task?.title || t("taskReplay");
+  qs("#replayMeta").textContent = replay
+    ? `${t("generatedAt")}: ${formatDateTime(replay.generated_at)} · ${t("eventCount")}: ${replay.metrics?.event_count || 0}`
+    : t("noReplay");
+  qs("#replayContent").innerHTML = replay ? renderReplayContent(replay) : `<div class="empty-state">${escapeHtml(t("noReplay"))}</div>`;
+}
+
+function renderReplayContent(replay) {
+  return `
+    <section class="replay-section">
+      <h3>${escapeHtml(t("replaySummary"))}</h3>
+      <div class="replay-summary-grid">
+        ${renderReplayField(t("status"), labelFor("status", replay.task_summary.status))}
+        ${renderReplayField(t("owner"), agentName(replay.task_summary.owner_agent_id))}
+        ${renderReplayField(t("duration"), formatDuration(replay.task_summary.duration_ms))}
+        ${renderReplayField(t("playbookStage"), replay.task_summary.playbook_stage || "")}
+      </div>
+    </section>
+    <section class="replay-section">
+      <h3>${escapeHtml(t("reliabilityMetrics"))}</h3>
+      <div class="replay-metrics">
+        ${renderReplayMetric(t("eventCount"), replay.metrics.event_count)}
+        ${renderReplayMetric(t("logCount"), replay.metrics.log_count)}
+        ${renderReplayMetric(t("toolCalls"), replay.metrics.tool_call_count)}
+        ${renderReplayMetric(t("decisions"), replay.metrics.decision_count)}
+        ${renderReplayMetric(t("reviews"), replay.metrics.review_count)}
+        ${renderReplayMetric(t("handoffs"), replay.metrics.handoff_count)}
+        ${renderReplayMetric(t("processErrors"), replay.metrics.process_error_count)}
+        ${renderReplayMetric(t("retries"), replay.metrics.retry_count)}
+      </div>
+    </section>
+    <section class="replay-section">
+      <h3>${escapeHtml(t("hostSuggestions"))}</h3>
+      <div class="replay-list">${renderReplaySuggestions(replay.host_replay_suggestions || [])}</div>
+    </section>
+    <section class="replay-section">
+      <h3>${escapeHtml(t("agentContributions"))}</h3>
+      <div class="replay-list">${renderReplayContributions(replay.agent_contributions || [])}</div>
+    </section>
+    <section class="replay-section">
+      <h3>${escapeHtml(t("decisionRiskSummary"))}</h3>
+      <div class="replay-columns">
+        ${renderReplayList(t("decisions"), (replay.decision_risk_summary?.decisions || []).map((item) => item.selected_approach || item.reason))}
+        ${renderReplayList(t("risks"), replay.decision_risk_summary?.risks || [])}
+        ${renderReplayList(t("evidence"), replay.decision_risk_summary?.evidence || [])}
+        ${renderReplayList(t("blockers"), replay.decision_risk_summary?.blockers || [])}
+      </div>
+    </section>
+    <section class="replay-section">
+      <h3>${escapeHtml(t("replayTimeline"))}</h3>
+      <div class="replay-timeline">${renderReplayTimeline(replay.timeline || [])}</div>
+    </section>`;
+}
+
+function renderReplayField(label, value) {
+  return `
+    <div class="replay-field">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value || "-")}</strong>
+    </div>`;
+}
+
+function renderReplayMetric(label, value) {
+  return `
+    <div class="replay-metric">
+      <strong>${escapeHtml(value ?? 0)}</strong>
+      <span>${escapeHtml(label)}</span>
+    </div>`;
+}
+
+function renderReplaySuggestions(suggestions) {
+  if (!suggestions.length) {
+    return `<div class="empty-state">${escapeHtml(t("noReplay"))}</div>`;
+  }
+  return suggestions
+    .map(
+      (item) => `
+        <article class="replay-card replay-${escapeHtml(item.severity || "low")}">
+          <strong>${escapeHtml(item.title || "")}</strong>
+          <p>${escapeHtml(item.text || "")}</p>
+        </article>`
+    )
+    .join("");
+}
+
+function renderReplayContributions(contributions) {
+  if (!contributions.length) {
+    return `<div class="empty-state">${escapeHtml(t("noAgents"))}</div>`;
+  }
+  return contributions
+    .map(
+      (entry) => `
+        <article class="replay-card">
+          <strong>${escapeHtml(entry.agent_name || entry.actor_id)}</strong>
+          <p>${escapeHtml(entry.actor_id)}${entry.health ? ` · ${escapeHtml(labelFor("health", entry.health))}` : ""}</p>
+          <div class="replay-card-metrics">
+            <span>${escapeHtml(t("eventCount"))}: ${escapeHtml(entry.event_count)}</span>
+            <span>${escapeHtml(t("logCount"))}: ${escapeHtml(entry.log_count)}</span>
+            <span>${escapeHtml(t("toolCalls"))}: ${escapeHtml(entry.tool_calls)}</span>
+            <span>${escapeHtml(t("decisions"))}: ${escapeHtml(entry.decisions)}</span>
+            <span>${escapeHtml(t("reviews"))}: ${escapeHtml(entry.reviews)}</span>
+            <span>${escapeHtml(t("processErrors"))}: ${escapeHtml(entry.errors)}</span>
+          </div>
+        </article>`
+    )
+    .join("");
+}
+
+function renderReplayList(title, values) {
+  const items = (values || []).filter(Boolean);
+  return `
+    <div class="replay-list-column">
+      <h4>${escapeHtml(title)}</h4>
+      ${
+        items.length
+          ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+          : `<p class="muted-value">-</p>`
+      }
+    </div>`;
+}
+
+function renderReplayTimeline(items) {
+  if (!items.length) {
+    return `<div class="empty-state">${escapeHtml(t("noReplay"))}</div>`;
+  }
+  return items
+    .slice(-80)
+    .map(
+      (item) => `
+        <article class="replay-timeline-item">
+          <div>
+            <span class="event-type">${escapeHtml(item.type)}</span>
+            <span>${escapeHtml(item.source)}</span>
+            <span>${escapeHtml(agentName(item.actor_id))}</span>
+            <span>${escapeHtml(formatTime(item.timestamp))}</span>
+          </div>
+          <p>${escapeHtml(item.text || "")}</p>
+        </article>`
+    )
+    .join("");
+}
+
 function renderAgentConsole() {
   const detail = state.agentDetail;
   const agent = detail?.agent || getAgent(state.agentConsoleId);
@@ -893,8 +1288,11 @@ function renderConsoleSummary(detail, agent) {
     : `<span class="muted-value">${escapeHtml(t("noCurrentTask"))}</span>`;
   const fields = [
     [t("status"), labelFor("status", agent.status || "stopped")],
+    [t("health"), labelFor("health", agent.health?.status || "stopped")],
     [t("role"), labelFor("role", agent.role)],
     [t("runMode"), labelFor("mode", agent.mode || "mock")],
+    [t("isolation"), labelFor("isolation", agent.isolation_mode || "shared")],
+    [t("worktree"), agent.worktree?.path ? `${agent.worktree.status || "ready"}${agent.worktree.dirty ? ` · ${t("worktreeDirty")}` : ""}` : ""],
     [t("provider"), agent.provider || ""],
     [t("currentTask"), currentTask?.title || agent.current_task_id || t("noCurrentTask")],
     [t("launchDetail"), detail?.session?.last_launch_detail || ""],
@@ -917,6 +1315,10 @@ function renderConsoleSummary(detail, agent) {
         <span>${escapeHtml(t("workingDir"))}</span>
         <strong>${escapeHtml(agent.cwd || "-")}</strong>
       </div>
+      <div class="console-field console-path">
+        <span>${escapeHtml(t("baseDir"))}</span>
+        <strong>${escapeHtml(agent.base_cwd || "-")}</strong>
+      </div>
     </div>
     <div class="console-task-action">${taskAction}</div>`;
 }
@@ -933,6 +1335,110 @@ function renderAgentLog(log) {
       </div>
       <div class="log-body">${renderEventContent(log.content)}</div>
     </article>`;
+}
+
+function renderRoomItem(item) {
+  return item.kind === "event_bundle" ? renderEventBundle(item) : renderEvent(item);
+}
+
+function renderEventBundle(bundle) {
+  if (bundle.bucket === "response") {
+    return renderResponseBundle(bundle);
+  }
+  return renderProcessBundle(bundle);
+}
+
+function renderResponseBundle(bundle) {
+  const first = bundle.events[0];
+  const actor = actorLabel(first);
+  const initials = actorInitials(actor);
+  return `
+    <article class="chat-row from-agent event-bundle response-bundle">
+      <div class="chat-avatar">${escapeHtml(initials)}</div>
+      <div class="chat-message">
+        <div class="chat-meta">
+          <span class="chat-author">${escapeHtml(actor)}</span>
+          <span>${escapeHtml(timeRangeLabel(bundle.events))}</span>
+          <span class="event-type">${escapeHtml(t("agentReply"))}</span>
+          ${bundle.events.length > 1 ? `<span class="bundle-count">${escapeHtml(bundleCountLabel(bundle.events.length))}</span>` : ""}
+        </div>
+        <div class="chat-bubble">
+          <div class="event-content">${renderResponseBundleContent(bundle.events)}</div>
+        </div>
+      </div>
+    </article>`;
+}
+
+function renderProcessBundle(bundle) {
+  const first = bundle.events[0];
+  const actor = actorLabel(first);
+  const isOpen = state.expandedProcessBundles.has(bundle.bundleId);
+  return `
+    <article class="chat-row event-wide event-bundle process-bundle">
+      <details class="event-panel process-details" data-process-bundle-id="${escapeHtml(bundle.bundleId)}" ${isOpen ? "open" : ""}>
+        <summary class="event-panel-header process-summary">
+          <span class="event-type">${escapeHtml(t("processTrace"))}</span>
+          <span class="chat-author">${escapeHtml(actor)}</span>
+          <span>${escapeHtml(timeRangeLabel(bundle.events))}</span>
+          <span class="bundle-count">${escapeHtml(bundleCountLabel(bundle.events.length))}</span>
+          <span class="expand-label">
+            <span class="closed-label">${escapeHtml(t("expandTrace"))}</span>
+            <span class="open-label">${escapeHtml(t("collapseTrace"))}</span>
+          </span>
+        </summary>
+        <div class="bundle-event-list">${renderProcessBundleContent(bundle.events)}</div>
+      </details>
+    </article>`;
+}
+
+function renderResponseBundleContent(events) {
+  const simpleText = events.every((event) => isSimpleTextContent(event.content));
+  if (simpleText) {
+    return escapeHtml(events.map((event) => event.content.text).filter(Boolean).join("\n"));
+  }
+  return events
+    .map((event) => `<div class="message-chunk">${renderEventContent(event.content)}</div>`)
+    .join("");
+}
+
+function renderProcessBundleContent(events) {
+  return events
+    .map(
+      (event) => `
+        <div class="bundle-event">
+          <div class="bundle-event-meta">
+            <span class="event-type">${escapeHtml(event.type)}</span>
+            <span>${escapeHtml(formatTime(event.timestamp))}</span>
+            ${event.content?.title ? `<span>${escapeHtml(event.content.title)}</span>` : ""}
+          </div>
+          <div class="event-content">${renderEventContent(contentWithoutKeys(event.content, ["title"]), event)}</div>
+        </div>`
+    )
+    .join("");
+}
+
+function isSimpleTextContent(content) {
+  if (!content || typeof content !== "object" || !content.text) {
+    return false;
+  }
+  return Object.keys(content).every((key) => ["text", "source"].includes(key));
+}
+
+function contentWithoutKeys(content, keys) {
+  if (!content || typeof content !== "object") {
+    return content;
+  }
+  return Object.fromEntries(Object.entries(content).filter(([key]) => !keys.includes(key)));
+}
+
+function timeRangeLabel(events) {
+  const first = formatTime(events[0]?.timestamp);
+  const last = formatTime(events.at(-1)?.timestamp);
+  return !last || first === last ? first : `${first}-${last}`;
+}
+
+function bundleCountLabel(count) {
+  return state.lang === "zh" ? `${count} 条` : `${count} events`;
 }
 
 function renderEvent(event) {
@@ -967,7 +1473,7 @@ function renderEvent(event) {
             <span class="chat-author">${escapeHtml(actor)}</span>
             <span>${escapeHtml(time)}</span>
           </div>
-          <div class="event-content">${renderEventContent(event.content)}</div>
+          <div class="event-content">${renderEventContent(event.content, event)}</div>
         </div>
       </article>`;
   }
@@ -981,7 +1487,7 @@ function renderEvent(event) {
           <span class="event-type">${escapeHtml(event.type)}</span>
         </div>
         <div class="chat-bubble">
-          <div class="event-content">${renderEventContent(event.content)}</div>
+          <div class="event-content">${renderEventContent(event.content, event)}</div>
         </div>
       </div>
       ${rowClass.includes("from-user") ? `<div class="chat-avatar user-avatar">${escapeHtml(initials)}</div>` : ""}
@@ -1005,7 +1511,7 @@ function systemEventDetails(content) {
 
 function eventRowClass(event) {
   const actorKind = event.actor?.kind;
-  const wideTypes = ["tool_call_summary", "decision_record", "handoff_note", "review_comment", "final_report"];
+  const wideTypes = ["tool_call_summary", "decision_record", "task_graph", "handoff_note", "review_comment", "final_report"];
   const classes = ["chat-row", event.type];
   if (event.type === "system_event" || event.type === "status_change") {
     classes.push("from-system");
@@ -1061,9 +1567,45 @@ function formatTime(timestamp) {
   });
 }
 
-function renderEventContent(content) {
+function formatDateTime(timestamp) {
+  if (!timestamp) {
+    return "";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+  return date.toLocaleString(state.lang === "zh" ? "zh-CN" : "en", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function formatDuration(durationMs) {
+  if (!Number.isFinite(durationMs)) {
+    return "-";
+  }
+  const seconds = Math.round(durationMs / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  if (minutes < 60) {
+    return `${minutes}m ${restSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function renderEventContent(content, event = null) {
   if (!content) {
     return "";
+  }
+  if (event?.type === "task_graph") {
+    return renderTaskGraphContent(content, event);
   }
   if (typeof content === "string") {
     return escapeHtml(content);
@@ -1079,6 +1621,37 @@ function renderEventContent(content) {
     return `${escapeHtml(content.text)}${renderDefinitionList(extra)}`;
   }
   return renderDefinitionList(Object.entries(content));
+}
+
+function renderTaskGraphContent(content, event) {
+  const nodes = Array.isArray(content.nodes) ? content.nodes : [];
+  const suggestions = Array.isArray(content.reassign_suggestions) ? content.reassign_suggestions : [];
+  return `
+    <div class="task-graph-card">
+      ${content.text ? `<p>${escapeHtml(content.text)}</p>` : ""}
+      <ol class="task-graph-nodes">
+        ${nodes
+          .map(
+            (node) => `
+              <li>
+                <strong>${escapeHtml(node.title || node.id)}</strong>
+                <span>${escapeHtml(labelFor("role", node.role || "work"))}${node.depends_on?.length ? ` · ${escapeHtml(t("dependencies"))}: ${escapeHtml(node.depends_on.join(", "))}` : ""}</span>
+              </li>`
+          )
+          .join("")}
+      </ol>
+      ${
+        suggestions.length
+          ? `<div class="task-graph-suggestions">
+              <strong>${escapeHtml(t("blockedBy"))}</strong>
+              ${suggestions
+                .map((item) => `<span>${escapeHtml(item.title || item.task_id)} -> ${escapeHtml(agentName(item.suggested_to_agent_id))}</span>`)
+                .join("")}
+            </div>`
+          : ""
+      }
+      <button type="button" class="ghost-button" data-task-graph-apply="${escapeHtml(event.event_id)}">${escapeHtml(t("applyTaskGraph"))}</button>
+    </div>`;
 }
 
 function renderDefinitionList(entries) {
@@ -1194,6 +1767,7 @@ function syncCommandPreset() {
 
 function resetLauncherDefaults(form) {
   form.elements.name.value = "new-agent";
+  form.elements.isolation_mode.value = "shared";
   if (form.elements.provider.value === "custom") {
     return;
   }
@@ -1210,7 +1784,11 @@ function resetLauncherDefaults(form) {
 }
 
 async function startAgent(agentId) {
-  await api(`/api/agents/${agentId}/start`, { method: "POST", body: "{}" });
+  try {
+    await api(`/api/agents/${agentId}/start`, { method: "POST", body: "{}" });
+  } catch (error) {
+    alert(error.message);
+  }
   await loadState();
 }
 
@@ -1355,10 +1933,17 @@ function insertMention(textarea, candidate) {
 
 async function deleteAgent(agentId) {
   if (!confirm(t("confirmDeleteAgent"))) {
-    return;
+    return false;
   }
-  await api(`/api/agents/${agentId}`, { method: "DELETE" });
+  let deleted = false;
+  try {
+    await api(`/api/agents/${agentId}`, { method: "DELETE" });
+    deleted = true;
+  } catch (error) {
+    alert(error.message);
+  }
   await loadState();
+  return deleted;
 }
 
 async function deleteTask(taskId) {
@@ -1389,6 +1974,22 @@ async function saveHandoffRules(rules) {
 
 function bindEvents() {
   qs("#refreshButton").addEventListener("click", () => loadState());
+  qs("#inspectorToggleButton").addEventListener("click", () => {
+    state.inspectorOpen = !state.inspectorOpen;
+    localStorage.setItem("tendrilflow.inspectorOpen", String(state.inspectorOpen));
+    render();
+  });
+  qs("#inspectorTabs").addEventListener("click", (event) => {
+    const tab = event.target.closest("[data-inspector-tab]");
+    if (!tab) {
+      return;
+    }
+    state.activeInspectorTab = tab.dataset.inspectorTab;
+    state.inspectorOpen = true;
+    localStorage.setItem("tendrilflow.inspectorTab", state.activeInspectorTab);
+    localStorage.setItem("tendrilflow.inspectorOpen", "true");
+    render();
+  });
   qs("#languageSelect").addEventListener("change", (event) => {
     state.lang = event.target.value;
     localStorage.setItem("tendrilflow.lang", state.lang);
@@ -1428,7 +2029,7 @@ function bindEvents() {
   qs("#commandPresetButton").addEventListener("click", () => {
     syncCommandPreset();
   });
-  qsa('#agentForm select[name="role"], #agentForm select[name="mode"]').forEach((node) => {
+  qsa('#agentForm select[name="role"], #agentForm select[name="mode"], #agentForm select[name="isolation_mode"]').forEach((node) => {
     node.addEventListener("change", () => {
       syncProviderDefaults();
       syncCommandPreset();
@@ -1536,6 +2137,7 @@ function bindEvents() {
     state.shouldStickToBottom = true;
     state.userPinnedHistory = false;
     await loadSelectedTask();
+    await loadReplay();
     render();
   });
 
@@ -1644,14 +2246,47 @@ function bindEvents() {
     state.userPinnedHistory = false;
     await loadState();
   });
+  qs("#replayButton").addEventListener("click", async () => {
+    openReplay();
+    await loadReplay();
+    render();
+  });
 
   qs("#eventStream").addEventListener("scroll", (event) => {
     state.userPinnedHistory = !isNearBottom(event.currentTarget);
+  });
+  qs("#eventStream").addEventListener("click", (event) => {
+    const graphButton = event.target.closest("[data-task-graph-apply]");
+    if (graphButton) {
+      const graphEvent = state.events.find((candidate) => candidate.event_id === graphButton.dataset.taskGraphApply);
+      if (state.selectedTaskId && graphEvent) {
+        api(`/api/tasks/${state.selectedTaskId}/task-graph/apply`, {
+          method: "POST",
+          body: JSON.stringify({ graph_event_id: graphEvent.event_id, graph: graphEvent.content })
+        })
+          .then(() => loadState())
+          .catch((error) => alert(error.message));
+      }
+      return;
+    }
+    const summary = event.target.closest(".process-summary");
+    if (!summary) {
+      return;
+    }
+    const details = summary.closest("[data-process-bundle-id]");
+    setTimeout(() => {
+      if (details.open) {
+        state.expandedProcessBundles.add(details.dataset.processBundleId);
+      } else {
+        state.expandedProcessBundles.delete(details.dataset.processBundleId);
+      }
+    }, 0);
   });
   qs("#agentLogStream").addEventListener("scroll", (event) => {
     state.consoleUserPinnedHistory = !isNearBottom(event.currentTarget);
   });
   qs("#backToRoomButton").addEventListener("click", () => closeAgentConsole());
+  qs("#backFromReplayButton").addEventListener("click", () => closeAgentConsole());
   qs("#consoleStartButton").addEventListener("click", async () => {
     if (state.agentConsoleId) {
       await startAgent(state.agentConsoleId);
@@ -1667,8 +2302,8 @@ function bindEvents() {
       return;
     }
     const agentId = state.agentConsoleId;
-    await deleteAgent(agentId);
-    if (state.agentConsoleId === agentId) {
+    const deleted = await deleteAgent(agentId);
+    if (deleted && state.agentConsoleId === agentId) {
       closeAgentConsole();
     }
   });
@@ -1688,6 +2323,7 @@ function bindEvents() {
     syncRouteFromHash();
     await loadAgentDetail();
     await loadHandoffPolicy();
+    await loadReplay();
     render();
   });
 }

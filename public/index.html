@@ -17,6 +17,7 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <button id="inspectorToggleButton" class="ghost-button" type="button" data-i18n="workbench">工作台</button>
           <label class="language-control">
             <span data-i18n="language">语言</span>
             <select id="languageSelect" aria-label="Language">
@@ -87,6 +88,7 @@
               <button type="button" data-room-action="plan" data-i18n="actionPlan">拆分计划</button>
               <button type="button" data-room-action="review" data-i18n="actionReview">请求审查</button>
               <button type="button" data-room-action="debug" data-i18n="actionDebug">排查阻塞</button>
+              <button id="replayButton" class="ghost-button" type="button" data-i18n="replay">任务复盘</button>
               <button id="finalReportButton" type="button" data-i18n="finalReport">最终报告</button>
             </div>
 
@@ -97,6 +99,20 @@
               <textarea name="text" rows="3" data-i18n-placeholder="messagePlaceholder" placeholder="@codex-worker 继续执行"></textarea>
               <button type="submit" data-i18n="send">发送</button>
             </form>
+          </div>
+
+          <div id="replayView" class="replay-view hidden">
+            <div class="room-header">
+              <div class="room-title-block">
+                <span class="eyebrow" data-i18n="taskReplay">Task Replay</span>
+                <h2 id="replayTitle">Task Replay</h2>
+                <p id="replayMeta"></p>
+              </div>
+              <div class="console-actions">
+                <button id="backFromReplayButton" class="ghost-button" type="button" data-i18n="backToRoom">返回群组</button>
+              </div>
+            </div>
+            <div id="replayContent" class="replay-content"></div>
           </div>
 
           <div id="agentConsoleView" class="agent-console hidden">
@@ -164,8 +180,14 @@
           </div>
         </section>
 
-        <aside class="inspector">
-          <section class="inspector-section">
+        <aside id="inspectorPanel" class="inspector">
+          <nav id="inspectorTabs" class="inspector-tabs" aria-label="Workbench">
+            <button type="button" data-inspector-tab="tasks" data-i18n="taskTab">任务</button>
+            <button type="button" data-inspector-tab="agents" data-i18n="agentsTab">成员</button>
+            <button type="button" data-inspector-tab="launcher" data-i18n="launcherTab">创建</button>
+          </nav>
+
+          <section class="inspector-section inspector-panel" data-inspector-panel="tasks">
             <div class="section-heading">
               <div>
                 <h2 data-i18n="groupTasks">群组任务</h2>
@@ -197,7 +219,18 @@
             <div id="taskBoard" class="task-list"></div>
           </section>
 
-          <section class="inspector-section">
+          <section class="inspector-section inspector-panel agents-section" data-inspector-panel="agents">
+            <div class="section-heading compact-heading">
+              <div>
+                <h2 data-i18n="groupAgents">群组 Agents</h2>
+                <p data-i18n="agentsHint">启动、停止、删除</p>
+              </div>
+              <button id="handoffRulesButton" class="ghost-button" type="button" data-i18n="handoffRules">交接规则</button>
+            </div>
+            <div id="agentList" class="agent-list"></div>
+          </section>
+
+          <section class="inspector-section inspector-panel launcher-panel" data-inspector-panel="launcher">
             <div class="section-heading">
               <div>
                 <h2 data-i18n="launcher">Agent Launcher</h2>
@@ -228,6 +261,10 @@
                   <span data-i18n="runMode">运行方式</span>
                   <select name="mode"></select>
                 </label>
+                <label>
+                  <span data-i18n="isolation">隔离方式</span>
+                  <select name="isolation_mode"></select>
+                </label>
                 <label class="prominent-field">
                   <span data-i18n="workingDir">工作目录</span>
                   <input name="cwd" />
@@ -241,17 +278,6 @@
               </details>
               <button type="submit" data-i18n="createAgent">创建 Agent</button>
             </form>
-          </section>
-
-          <section class="inspector-section agents-section">
-            <div class="section-heading compact-heading">
-              <div>
-                <h2 data-i18n="groupAgents">群组 Agents</h2>
-                <p data-i18n="agentsHint">启动、停止、删除</p>
-              </div>
-              <button id="handoffRulesButton" class="ghost-button" type="button" data-i18n="handoffRules">交接规则</button>
-            </div>
-            <div id="agentList" class="agent-list"></div>
           </section>
         </aside>
       </main>

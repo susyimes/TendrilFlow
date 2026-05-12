@@ -1,12 +1,48 @@
 const path = require("node:path");
+const fs = require("node:fs/promises");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const { createAdapterSession } = require("./adapters");
 const { mapAcpUpdateToEvent } = require("./acpMapping");
 const { FileStore } = require("./storage");
-const { makeId, normalizeStatus, nowIso } = require("./model");
-const { buildCommunicationExecutionProtocol } = require("./protocol");
+const { makeId, normalizeStatus, nowIso, slugify } = require("./model");
+const { HOST_DEFAULT_PLAYBOOK, buildCommunicationExecutionProtocol } = require("./protocol");
+
+const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000;
+const AGENT_STALE_AFTER_MS = 5 * 60 * 1000;
+const execFileAsync = promisify(execFile);
 
 function quoteShell(value) {
   return `"${String(value || "").replaceAll('"', '\\"')}"`;
+}
+
+function eventText(event) {
+  const content = event?.content;
+  if (!content) {
+    return event?.type || "";
+  }
+  if (typeof content === "string") {
+    return content;
+  }
+  return (
+    content.text ||
+    content.summary ||
+    content.title ||
+    content.selected_approach ||
+    content.verdict ||
+    content.outcome ||
+    content.reason ||
+    event?.type ||
+    ""
+  );
+}
+
+function increment(map, key, amount = 1) {
+  map[key] = (map[key] || 0) + amount;
+}
+
+function compactList(values, limit = 12) {
+  return Array.from(new Set((values || []).filter(Boolean).map(String))).slice(0, limit);
 }
 
 class Orchestrator {
@@ -48,11 +84,55 @@ class Orchestrator {
 
   async state() {
     await this.init();
+    const agents = await this.store.listAgents();
     return {
       workspaces: await this.store.listWorkspaces(),
       groups: await this.store.listGroups(),
-      agents: await this.store.listAgents(),
+      agents: await this.agentsWithHealth(agents),
       tasks: await this.store.listTasks()
+    };
+  }
+
+  async agentsWithHealth(agents) {
+    return Promise.all(
+      agents.map(async (agent) => ({
+        ...agent,
+        health: await this.agentHealth(agent)
+      }))
+    );
+  }
+
+  async agentHealth(agent) {
+    const logs = await this.store.readAgentLogs(agent.id, { limit: 50 }).catch(() => []);
+    const lastLog = logs.at(-1) || null;
+    const relevantLog =
+      (agent.current_task_id ? [...logs].reverse().find((event) => event.task_id === agent.current_task_id) : null) ||
+      lastLog;
+    const hasSession = this.sessions.has(agent.id);
+    const lastSeenAt = relevantLog?.timestamp || lastLog?.timestamp || agent.updated_at || agent.created_at || null;
+    const lastSeenMs = lastSeenAt ? Date.parse(lastSeenAt) : NaN;
+    const ageMs = Number.isFinite(lastSeenMs) ? Date.now() - lastSeenMs : null;
+
+    let status = "stopped";
+    if (agent.status === "failed") {
+      status = "failed";
+    } else if (agent.status === "running" && !hasSession) {
+      status = "detached";
+    } else if (agent.status === "running" && agent.current_task_id && ageMs !== null && ageMs > AGENT_STALE_AFTER_MS) {
+      status = "stale";
+    } else if (agent.status === "running" && agent.current_task_id) {
+      status = "active";
+    } else if (agent.status === "running") {
+      status = "idle";
+    }
+
+    return {
+      status,
+      has_session: hasSession,
+      current_task_id: agent.current_task_id || null,
+      last_seen_at: lastSeenAt,
+      age_ms: ageMs,
+      stale_after_ms: AGENT_STALE_AFTER_MS
     };
   }
 
@@ -92,13 +172,71 @@ class Orchestrator {
     return this.store.updateHandoffPolicy(workspaceId, groupId, nextInput);
   }
 
+  async listSkills(input = {}) {
+    await this.init();
+    const workspaceId = input.workspace_id || "workspace_main";
+    const groupId = input.group_id || "group_main";
+    const workspace = await this.store.getWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error(`Workspace not found: ${workspaceId}`);
+    }
+    if (input.scope !== "workspace") {
+      const group = await this.store.getGroup(workspaceId, groupId);
+      if (!group) {
+        throw new Error(`Group not found: ${groupId}`);
+      }
+    }
+    return this.store.listSkills({
+      workspace_id: workspaceId,
+      group_id: groupId,
+      scope: input.scope
+    });
+  }
+
+  async getSkill(input = {}) {
+    const scope = input.scope === "workspace" ? "workspace" : "group";
+    const skills = await this.listSkills({
+      workspace_id: input.workspace_id,
+      group_id: input.group_id,
+      scope
+    });
+    const skill = skills.find((candidate) => candidate.skill_id === input.skill_id && candidate.scope === scope);
+    if (!skill) {
+      throw new Error(`Skill not found: ${input.skill_id}`);
+    }
+    return this.store.getSkill({ ...input, scope });
+  }
+
+  async upsertSkill(input = {}) {
+    await this.init();
+    const workspaceId = input.workspace_id || "workspace_main";
+    const groupId = input.group_id || "group_main";
+    const workspace = await this.store.getWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error(`Workspace not found: ${workspaceId}`);
+    }
+    if (input.scope !== "workspace") {
+      const group = await this.store.getGroup(workspaceId, groupId);
+      if (!group) {
+        throw new Error(`Group not found: ${groupId}`);
+      }
+    }
+    return this.store.upsertSkill({
+      ...input,
+      workspace_id: workspaceId,
+      group_id: groupId
+    });
+  }
+
   async createAgent(input) {
     await this.init();
     return this.store.upsertAgent(input);
   }
 
   async deleteAgent(agentId) {
+    const agent = await this.requireAgent(agentId);
     await this.stopAgent(agentId);
+    await this.removeAgentWorktreeIfClean(agent);
     const deleted = await this.store.deleteAgent(agentId);
     if (!deleted) {
       throw new Error(`Agent not found: ${agentId}`);
@@ -125,16 +263,23 @@ class Orchestrator {
   }
 
   async agentDetail(agentId, limit = 200) {
-    const agent = await this.requireAgent(agentId);
+    let agent = await this.requireAgent(agentId);
+    if (agent.isolation_mode === "worktree") {
+      agent = await this.refreshAgentWorktreeStatus(agent).catch(() => agent);
+    }
     const tasks = await this.store.listTasks();
     const currentTask = agent.current_task_id
       ? tasks.find((task) => task.task_id === agent.current_task_id) || null
       : null;
     return {
-      agent,
+      agent: {
+        ...agent,
+        health: await this.agentHealth(agent)
+      },
       session: {
         running: this.sessions.has(agentId),
         status: agent.status,
+        health: await this.agentHealth(agent),
         current_task_id: agent.current_task_id || null,
         last_launch_detail: agent.last_launch_detail || null,
         last_exit_code: agent.last_exit_code ?? null,
@@ -150,8 +295,266 @@ class Orchestrator {
     return this.store.readAgentLogs(agentId, { limit });
   }
 
-  async startAgent(agentId) {
+  async prepareAgentWorktree(agentId) {
     const agent = await this.requireAgent(agentId);
+    if (agent.isolation_mode !== "worktree") {
+      throw new Error(`Agent ${agentId} is not configured for worktree isolation.`);
+    }
+    return this.ensureAgentWorktree(agent);
+  }
+
+  async agentWorktreeStatus(agentId) {
+    const agent = await this.requireAgent(agentId);
+    if (agent.isolation_mode !== "worktree") {
+      return {
+        isolation_mode: "shared",
+        worktree: null
+      };
+    }
+    const next = await this.refreshAgentWorktreeStatus(agent);
+    return {
+      isolation_mode: next.isolation_mode,
+      cwd: next.cwd,
+      base_cwd: next.base_cwd,
+      worktree: next.worktree
+    };
+  }
+
+  async runGit(args, options = {}) {
+    try {
+      const result = await execFileAsync("git", args, {
+        cwd: options.cwd || this.rootDir,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024
+      });
+      return {
+        stdout: result.stdout.trim(),
+        stderr: result.stderr.trim()
+      };
+    } catch (error) {
+      const stderr = String(error.stderr || error.stdout || error.message || "").trim();
+      throw new Error(stderr || `git ${args.join(" ")} failed`);
+    }
+  }
+
+  async gitRootFor(cwd) {
+    const result = await this.runGit(["-C", path.resolve(cwd), "rev-parse", "--show-toplevel"]);
+    return path.resolve(result.stdout);
+  }
+
+  async hasGitHead(repoRoot) {
+    await this.runGit(["-C", repoRoot, "rev-parse", "--verify", "HEAD"]);
+  }
+
+  agentWorktreePath(agent) {
+    const existingPath = agent.worktree?.path;
+    if (existingPath) {
+      return path.resolve(existingPath);
+    }
+    return path.join(this.store.workspaceDir(agent.workspace_id), "worktrees", slugify(agent.id, "agent"));
+  }
+
+  agentWorktreeBranch(agent) {
+    return agent.worktree?.branch || `tendrilflow/${slugify(agent.id, "agent")}`;
+  }
+
+  async ensureAgentWorktree(agent) {
+    if (agent.isolation_mode !== "worktree") {
+      return agent;
+    }
+
+    const workspace = await this.store.getWorkspace(agent.workspace_id);
+    const baseCwd = path.resolve(agent.base_cwd || workspace?.root_dir || agent.cwd || this.rootDir);
+    const repoRoot = await this.gitRootFor(baseCwd).catch(async (error) => {
+      await this.store.patchAgent(agent.id, {
+        status: "failed",
+        last_error: `Worktree isolation requires a git repository: ${error.message}`,
+        worktree: {
+          ...(agent.worktree || {}),
+          enabled: true,
+          status: "unavailable",
+          dirty: false,
+          last_error: error.message,
+          last_checked_at: nowIso()
+        }
+      });
+      throw new Error(`Worktree isolation requires a git repository: ${error.message}`);
+    });
+    await this.hasGitHead(repoRoot).catch(async (error) => {
+      await this.store.patchAgent(agent.id, {
+        status: "failed",
+        last_error: `Worktree isolation requires a committed HEAD: ${error.message}`,
+        base_cwd: repoRoot
+      });
+      throw new Error(`Worktree isolation requires a committed HEAD: ${error.message}`);
+    });
+
+    const worktreePath = this.agentWorktreePath({ ...agent, base_cwd: repoRoot });
+    const branch = this.agentWorktreeBranch(agent);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    if (!(await this.isGitWorktree(worktreePath))) {
+      await this.assertWorktreePathIsAvailable(worktreePath);
+      try {
+        await this.runGit(["-C", repoRoot, "worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+      } catch (error) {
+        if (!/already exists/i.test(error.message)) {
+          throw error;
+        }
+        await this.runGit(["-C", repoRoot, "worktree", "add", worktreePath, branch]);
+      }
+    }
+
+    const inspected = await this.inspectWorktree(worktreePath, repoRoot, branch);
+    const env = {
+      ...(agent.env || {}),
+      TENDRILFLOW_AGENT_CWD: worktreePath,
+      TENDRILFLOW_WORKTREE_PATH: worktreePath,
+      TENDRILFLOW_CODEX_CWD: worktreePath
+    };
+    const next = await this.store.patchAgent(agent.id, {
+      cwd: worktreePath,
+      base_cwd: repoRoot,
+      env,
+      worktree: {
+        ...(agent.worktree || {}),
+        ...inspected,
+        enabled: true,
+        path: worktreePath,
+        branch,
+        base_cwd: repoRoot,
+        created_at: agent.worktree?.created_at || nowIso(),
+        updated_at: nowIso()
+      }
+    });
+    await this.store.appendAgentLog(next, {
+      type: "worktree_prepared",
+      content: {
+        text: `Prepared isolated worktree at ${worktreePath}.`,
+        path: worktreePath,
+        branch,
+        dirty: inspected.dirty
+      }
+    });
+    return next;
+  }
+
+  async assertWorktreePathIsAvailable(worktreePath) {
+    const entries = await fs.readdir(worktreePath).catch((error) => {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    });
+    if (entries && entries.length > 0) {
+      throw new Error(`Worktree path is not empty and is not a git worktree: ${worktreePath}`);
+    }
+  }
+
+  async isGitWorktree(worktreePath) {
+    return this.runGit(["-C", worktreePath, "rev-parse", "--is-inside-work-tree"])
+      .then((result) => result.stdout === "true")
+      .catch(() => false);
+  }
+
+  async inspectWorktree(worktreePath, repoRoot = null, branch = null) {
+    const exists = await fs
+      .stat(worktreePath)
+      .then((stat) => stat.isDirectory())
+      .catch(() => false);
+    if (!exists) {
+      return {
+        enabled: true,
+        path: worktreePath,
+        branch,
+        base_cwd: repoRoot,
+        status: "missing",
+        dirty: false,
+        changed_files: [],
+        last_checked_at: nowIso()
+      };
+    }
+    if (!(await this.isGitWorktree(worktreePath))) {
+      return {
+        enabled: true,
+        path: worktreePath,
+        branch,
+        base_cwd: repoRoot,
+        status: "invalid",
+        dirty: true,
+        changed_files: [],
+        last_error: "Path exists but is not a git worktree.",
+        last_checked_at: nowIso()
+      };
+    }
+    const status = await this.runGit(["-C", worktreePath, "status", "--porcelain"]);
+    const currentBranch = await this.runGit(["-C", worktreePath, "branch", "--show-current"]).catch(() => ({
+      stdout: branch || ""
+    }));
+    const changedFiles = status.stdout
+      ? status.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(0, 100)
+      : [];
+    return {
+      enabled: true,
+      path: worktreePath,
+      branch: currentBranch.stdout || branch,
+      base_cwd: repoRoot,
+      status: "ready",
+      dirty: changedFiles.length > 0,
+      changed_files: changedFiles,
+      last_checked_at: nowIso()
+    };
+  }
+
+  async refreshAgentWorktreeStatus(agent) {
+    const worktreePath = this.agentWorktreePath(agent);
+    const repoRoot = agent.base_cwd || agent.worktree?.base_cwd || null;
+    const inspected = await this.inspectWorktree(worktreePath, repoRoot, this.agentWorktreeBranch(agent));
+    return this.store.patchAgent(agent.id, {
+      worktree: {
+        ...(agent.worktree || {}),
+        ...inspected,
+        updated_at: nowIso()
+      }
+    });
+  }
+
+  async removeAgentWorktreeIfClean(agent) {
+    if (agent.isolation_mode !== "worktree" || !agent.worktree?.path) {
+      return;
+    }
+    const inspected = await this.inspectWorktree(
+      agent.worktree.path,
+      agent.base_cwd || agent.worktree.base_cwd,
+      agent.worktree.branch
+    );
+    if (inspected.status === "missing") {
+      return;
+    }
+    if (inspected.status !== "ready") {
+      throw new Error(`Agent worktree is not removable because it is ${inspected.status}: ${agent.worktree.path}`);
+    }
+    if (inspected.dirty) {
+      throw new Error(
+        `Agent worktree has uncommitted changes and was not removed: ${agent.worktree.path}. Commit, stash, or clean it before deleting the agent.`
+      );
+    }
+    const repoRoot = agent.base_cwd || agent.worktree.base_cwd || this.rootDir;
+    await this.runGit(["-C", repoRoot, "worktree", "remove", agent.worktree.path]);
+    await this.store.appendAgentLog(agent, {
+      type: "worktree_removed",
+      content: {
+        text: `Removed clean worktree ${agent.worktree.path}.`,
+        path: agent.worktree.path
+      }
+    });
+  }
+
+  async startAgent(agentId) {
+    let agent = await this.requireAgent(agentId);
     const existing = this.sessions.get(agentId);
     if (existing) {
       await this.store.appendAgentLog(agent, {
@@ -159,6 +562,9 @@ class Orchestrator {
         content: { text: "Agent is already running." }
       });
       return this.store.patchAgent(agentId, { status: "running" });
+    }
+    if (agent.isolation_mode === "worktree") {
+      agent = await this.ensureAgentWorktree(agent);
     }
 
     const logAgentEvent = async (event) => {
@@ -244,7 +650,7 @@ class Orchestrator {
 
   async createTask(input) {
     await this.init();
-    const scopedInput = await this.scopeTaskAgentReferences(input);
+    const scopedInput = await this.scopeTaskInput(input);
     const task = await this.store.createTask(scopedInput);
     await this.store.appendEvent(task.task_id, {
       type: "system_event",
@@ -297,6 +703,39 @@ class Orchestrator {
         new Set([nextPatch.owner_agent_id, ...(task.participant_agent_ids || [])].filter(Boolean))
       );
     }
+    if (Array.isArray(patch.depends_on)) {
+      nextPatch.depends_on = await this.validTaskIdsForGroup(
+        task.workspace_id,
+        task.group_id,
+        patch.depends_on,
+        task.task_id
+      );
+    }
+    if (Array.isArray(patch.blocked_by)) {
+      nextPatch.blocked_by = await this.validTaskIdsForGroup(
+        task.workspace_id,
+        task.group_id,
+        patch.blocked_by,
+        task.task_id
+      );
+    }
+    if (patch.parent_task_id !== undefined) {
+      const [parentTaskId] = await this.validTaskIdsForGroup(
+        task.workspace_id,
+        task.group_id,
+        patch.parent_task_id ? [patch.parent_task_id] : [],
+        task.task_id
+      );
+      nextPatch.parent_task_id = parentTaskId || null;
+    }
+    if (Array.isArray(patch.child_task_ids)) {
+      nextPatch.child_task_ids = await this.validTaskIdsForGroup(
+        task.workspace_id,
+        task.group_id,
+        patch.child_task_ids,
+        task.task_id
+      );
+    }
     const next = await this.store.patchTask(taskId, nextPatch);
     if (patch.status && patch.status !== task.status) {
       await this.store.appendEvent(taskId, {
@@ -325,7 +764,7 @@ class Orchestrator {
     return next;
   }
 
-  async scopeTaskAgentReferences(input) {
+  async scopeTaskInput(input) {
     const workspaceId = input.workspace_id || "workspace_main";
     const groupId = input.group_id || "group_main";
     const agents = (await this.store.listAgents()).filter(
@@ -341,7 +780,11 @@ class Orchestrator {
       workspace_id: workspaceId,
       group_id: groupId,
       owner_agent_id: ownerAgentId,
-      participant_agent_ids: participantIds
+      participant_agent_ids: participantIds,
+      parent_task_id: (await this.validTaskIdsForGroup(workspaceId, groupId, input.parent_task_id ? [input.parent_task_id] : []))[0] || null,
+      child_task_ids: await this.validTaskIdsForGroup(workspaceId, groupId, input.child_task_ids || []),
+      depends_on: await this.validTaskIdsForGroup(workspaceId, groupId, input.depends_on || []),
+      blocked_by: await this.validTaskIdsForGroup(workspaceId, groupId, input.blocked_by || [])
     };
   }
 
@@ -364,12 +807,280 @@ class Orchestrator {
     return Array.from(new Set(valid));
   }
 
+  async validTaskIdsForGroup(workspaceId, groupId, taskIds, excludeTaskId = null) {
+    const validTasks = (await this.store.listTasks()).filter(
+      (task) => task.workspace_id === workspaceId && task.group_id === groupId && task.task_id !== excludeTaskId
+    );
+    const validIds = new Set(validTasks.map((task) => task.task_id));
+    return Array.from(new Set((taskIds || []).filter((taskId) => validIds.has(taskId))));
+  }
+
   async taskWithEvents(taskId) {
     const task = await this.requireTask(taskId);
     return {
       task,
       events: await this.store.readEvents(taskId)
     };
+  }
+
+  async taskReplay(taskId) {
+    const task = await this.requireTask(taskId);
+    const events = await this.store.readEvents(taskId);
+    const groupAgents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === task.workspace_id && agent.group_id === task.group_id
+    );
+    const agentLogs = (
+      await Promise.all(
+        groupAgents.map(async (agent) =>
+          (await this.store.readAgentLogs(agent.id).catch(() => []))
+            .filter((log) => !log.task_id || log.task_id === task.task_id || agent.current_task_id === task.task_id)
+            .map((log) => ({ ...log, agent }))
+        )
+      )
+    ).flat();
+    const healthEntries = await Promise.all(groupAgents.map(async (agent) => [agent.id, await this.agentHealth(agent)]));
+    const healthByAgentId = new Map(healthEntries);
+    const eventCounts = {};
+    const contributions = new Map();
+    const decisions = [];
+    const risks = [];
+    const blockers = [];
+    const evidence = [];
+    const finalReports = [];
+    const firstTimestamp = events[0]?.timestamp || task.created_at;
+    const lastTimestamp = events.at(-1)?.timestamp || task.updated_at;
+
+    for (const event of events) {
+      increment(eventCounts, event.type || "unknown");
+      const actorId = event.actor?.id || event.actor?.kind || "unknown";
+      const entry = this.replayContribution(contributions, actorId, event.actor?.kind || "agent");
+      entry.event_count += 1;
+      entry.first_seen_at = entry.first_seen_at || event.timestamp;
+      entry.last_seen_at = event.timestamp || entry.last_seen_at;
+      if (event.type === "agent_message") {
+        entry.messages += 1;
+      } else if (event.type === "tool_call_summary") {
+        entry.tool_calls += 1;
+        evidence.push(event.content?.text || event.content?.title || eventText(event));
+      } else if (event.type === "decision_record") {
+        entry.decisions += 1;
+        decisions.push({
+          event_id: event.event_id,
+          timestamp: event.timestamp,
+          actor_id: actorId,
+          selected_approach: event.content?.selected_approach || event.content?.text || "",
+          reason: event.content?.reason || "",
+          next_owner: event.content?.next_owner || null,
+          tool: event.content?.tool || null
+        });
+      } else if (event.type === "review_comment") {
+        entry.reviews += 1;
+        risks.push(...compactList(event.content?.risks || []));
+      } else if (event.type === "handoff_note") {
+        entry.handoffs += 1;
+        if (event.content?.risks) {
+          risks.push(event.content.risks);
+        }
+      } else if (event.type === "final_report") {
+        entry.final_reports += 1;
+        finalReports.push(event.content);
+      } else if (event.type === "status_change") {
+        entry.status_changes += 1;
+        if (event.content?.to === "blocked" || event.content?.to === "failed") {
+          blockers.push(event.content.text || `${event.content.field || "status"} -> ${event.content.to}`);
+        }
+      }
+      if (/block|blocked|阻塞|失败|failed|error/i.test(eventText(event))) {
+        blockers.push(eventText(event));
+      }
+    }
+
+    for (const log of agentLogs) {
+      const entry = this.replayContribution(contributions, log.agent_id || log.agent?.id || "unknown", "agent");
+      entry.log_count += 1;
+      entry.first_seen_at = entry.first_seen_at || log.timestamp;
+      entry.last_seen_at = log.timestamp || entry.last_seen_at;
+      if (log.type === "stderr" || log.type === "error") {
+        entry.errors += 1;
+      }
+      if (log.type === "process_started") {
+        entry.process_starts += 1;
+      }
+    }
+
+    const timeline = [
+      ...events.map((event) => ({
+        id: event.event_id,
+        timestamp: event.timestamp,
+        source: "room",
+        type: event.type,
+        actor_id: event.actor?.id || event.actor?.kind || "unknown",
+        text: String(eventText(event)).slice(0, 420)
+      })),
+      ...agentLogs.map((log) => ({
+        id: log.event_id,
+        timestamp: log.timestamp,
+        source: "agent_log",
+        type: log.type,
+        actor_id: log.agent_id,
+        text: String(eventText(log)).slice(0, 420)
+      }))
+    ]
+      .filter((item) => item.timestamp)
+      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)))
+      .slice(-240);
+
+    const healthCounts = {};
+    for (const [, health] of healthEntries) {
+      increment(healthCounts, health.status || "unknown");
+    }
+    const processErrors = agentLogs.filter((log) => log.type === "stderr" || log.type === "error").length;
+    const processStarts = agentLogs.filter((log) => log.type === "process_started").length;
+    const metrics = {
+      duration_ms: this.durationMs(firstTimestamp, lastTimestamp),
+      event_count: events.length,
+      log_count: agentLogs.length,
+      tool_call_count: eventCounts.tool_call_summary || 0,
+      decision_count: eventCounts.decision_record || 0,
+      review_count: eventCounts.review_comment || 0,
+      handoff_count: eventCounts.handoff_note || 0,
+      final_report_count: eventCounts.final_report || 0,
+      process_error_count: processErrors,
+      retry_count: Math.max(0, processStarts - new Set(agentLogs.map((log) => log.agent_id)).size),
+      health_counts: healthCounts
+    };
+    const suggestions = this.hostReplaySuggestions(task, metrics, {
+      decisions,
+      risks,
+      blockers,
+      finalReports,
+      healthByAgentId
+    });
+
+    return {
+      generated_at: nowIso(),
+      task_summary: {
+        task_id: task.task_id,
+        title: task.title,
+        status: task.status,
+        owner_agent_id: task.owner_agent_id,
+        participant_agent_ids: task.participant_agent_ids || [],
+        playbook_stage: task.playbook_stage || "intake",
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        duration_ms: metrics.duration_ms,
+        event_count: events.length,
+        final_report: finalReports.at(-1) || null
+      },
+      event_counts: eventCounts,
+      agent_contributions: [...contributions.values()].map((entry) => ({
+        ...entry,
+        agent_name: groupAgents.find((agent) => agent.id === entry.actor_id)?.name || entry.actor_id,
+        health: healthByAgentId.get(entry.actor_id)?.status || null
+      })),
+      decision_risk_summary: {
+        decisions,
+        risks: compactList(risks, 16),
+        blockers: compactList(blockers, 16),
+        evidence: compactList(evidence, 16)
+      },
+      metrics,
+      timeline,
+      host_replay_suggestions: suggestions
+    };
+  }
+
+  replayContribution(contributions, actorId, kind) {
+    if (!contributions.has(actorId)) {
+      contributions.set(actorId, {
+        actor_id: actorId,
+        kind,
+        event_count: 0,
+        log_count: 0,
+        messages: 0,
+        tool_calls: 0,
+        decisions: 0,
+        reviews: 0,
+        handoffs: 0,
+        final_reports: 0,
+        status_changes: 0,
+        process_starts: 0,
+        errors: 0,
+        first_seen_at: null,
+        last_seen_at: null
+      });
+    }
+    return contributions.get(actorId);
+  }
+
+  durationMs(start, end) {
+    const startMs = Date.parse(start || "");
+    const endMs = Date.parse(end || "");
+    return Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(0, endMs - startMs) : null;
+  }
+
+  hostReplaySuggestions(task, metrics, context) {
+    const suggestions = [];
+    if (!metrics.final_report_count && !["todo", "in_progress"].includes(task.status)) {
+      suggestions.push({
+        severity: "high",
+        title: "Missing final report",
+        text: "Task has progressed beyond active work but no final_report is recorded. Ask Host to finalize outcome, evidence, and residual risk."
+      });
+    }
+    if (!metrics.review_count && ["review", "done"].includes(task.status)) {
+      suggestions.push({
+        severity: "medium",
+        title: "No visible review",
+        text: "No review_comment exists in the room. Add a review pass before trusting the result."
+      });
+    }
+    if (!metrics.tool_call_count) {
+      suggestions.push({
+        severity: "medium",
+        title: "Weak evidence trail",
+        text: "No tool_call_summary is recorded. Ask agents to summarize commands, checks, or artifacts used as evidence."
+      });
+    }
+    if (metrics.process_error_count) {
+      suggestions.push({
+        severity: "high",
+        title: "Process errors present",
+        text: `${metrics.process_error_count} stderr/error log entries were observed. Ask debug to inspect failures before finalizing.`
+      });
+    }
+    const unhealthy = Object.entries(metrics.health_counts || {}).filter(([status]) =>
+      ["stale", "detached", "failed"].includes(status)
+    );
+    if (unhealthy.length) {
+      suggestions.push({
+        severity: "high",
+        title: "Unhealthy agents",
+        text: `Some agents are ${unhealthy.map(([status, count]) => `${status}:${count}`).join(", ")}. Host should recover, stop, or reassign before continuing.`
+      });
+    }
+    if (!context.decisions.length) {
+      suggestions.push({
+        severity: "low",
+        title: "No decision record",
+        text: "No decision_record is present. Capture the selected approach and rejected alternatives for auditability."
+      });
+    }
+    if (context.risks.length && !metrics.final_report_count) {
+      suggestions.push({
+        severity: "medium",
+        title: "Risks need closure",
+        text: "Risks were mentioned but no final report closes them. Host should summarize which risks remain."
+      });
+    }
+    if (!suggestions.length) {
+      suggestions.push({
+        severity: "low",
+        title: "Replay looks consistent",
+        text: "Trace contains decisions, evidence, and closure signals. Use this replay as the task audit summary."
+      });
+    }
+    return suggestions;
   }
 
   async postRoomMessage(taskId, text, actor = { kind: "user", id: "local_user" }) {
@@ -493,7 +1204,7 @@ class Orchestrator {
       actor: command.actor,
       content: {
         tool: command.authority === "host" ? "host.stop_agents" : "user.stop_agents",
-        skill: command.authority === "host" ? "host_control" : "user_control",
+        skill: command.authority === "host" ? "host.control" : "user.control",
         text: `${command.authority === "host" ? "Host Agent" : "User"} requested a group control stop.`,
         target_agent_ids: targetIds
       }
@@ -518,7 +1229,7 @@ class Orchestrator {
       actor: command.actor,
       content: {
         tool: command.authority === "host" ? "host.broadcast_instruction" : "user.broadcast_instruction",
-        skill: command.authority === "host" ? "host_control" : "user_control",
+        skill: command.authority === "host" ? "host.control" : "user.control",
         text: `${command.authority === "host" ? "Host Agent" : "User"} broadcast a high-priority group instruction.`,
         instruction: command.instruction,
         target_agent_ids: targetIds
@@ -660,7 +1371,7 @@ class Orchestrator {
       actor: { kind: "agent", id: hostAgent.id },
       content: {
         tool: "host.route_to_agent",
-        skill: "host_orchestration",
+        skill: "host.route_to_agent",
         text: `Host Agent called host.route_to_agent to ask ${delegation.target.name} to respond in the group.`,
         target_agent_id: delegation.target.id,
         target_agent_name: delegation.target.name,
@@ -702,15 +1413,16 @@ class Orchestrator {
     const participants = Array.from(new Set([...(task.participant_agent_ids || []), agent.id]));
     await this.store.patchTask(task.task_id, { participant_agent_ids: participants });
     await this.store.patchAgent(agent.id, { current_task_id: task.task_id });
+    const claimedTask = await this.claimTaskForAgent(task, agent);
 
-    if (agent.role === "host" && (await this.maybeCreateAgentFromHostCommand(task, agent, message))) {
+    if (agent.role === "host" && (await this.maybeCreateAgentFromHostCommand(claimedTask, agent, message))) {
       return;
     }
 
     const session = this.sessions.get(agent.id);
     let sent = false;
     if (session) {
-      sent = await session.sendMessage(task, await this.buildAgentContextMessage(task, message, agent));
+      sent = await session.sendMessage(claimedTask, await this.buildAgentContextMessage(claimedTask, message, agent));
     }
     if (!sent) {
       const latestAgent = await this.store.getAgent(agent.id);
@@ -730,14 +1442,41 @@ class Orchestrator {
             : "No running CLI session; using internal role responder."
         }
       });
-      await this.emitRoleResponse(task, agent, message);
+      await this.emitRoleResponse(claimedTask, agent, message);
     }
+  }
+
+  async claimTaskForAgent(task, agent) {
+    const latestTask = (await this.store.getTask(task.task_id)) || task;
+    const claimedAt = nowIso();
+    const claim = {
+      agent_id: agent.id,
+      agent_name: agent.name,
+      claimed_at: claimedAt,
+      lease_until: new Date(Date.now() + TASK_CLAIM_LEASE_MS).toISOString()
+    };
+    const nextTask = await this.store.patchTask(task.task_id, { claim });
+    if (latestTask.claim?.agent_id !== agent.id) {
+      await this.store.appendEvent(task.task_id, {
+        type: "status_change",
+        actor: { kind: "system", id: "orchestrator" },
+        content: {
+          field: "claim.agent_id",
+          from: latestTask.claim?.agent_id || null,
+          to: agent.id,
+          lease_until: claim.lease_until,
+          text: `${agent.name} claimed the task execution lease.`
+        }
+      });
+    }
+    return nextTask || { ...latestTask, claim };
   }
 
   async buildAgentContextMessage(task, message, agent = null) {
     const workspace = await this.store.getWorkspace(task.workspace_id);
     const group = await this.store.getGroup(task.workspace_id, task.group_id);
     const memory = await this.store.readGroupMemory(task.workspace_id, task.group_id);
+    const matchedSkills = await this.store.matchedSkillSummaries(task.workspace_id, task.group_id, agent || {});
     const events = await this.store.readEvents(task.task_id).catch(() => []);
     const recentEvents = events.slice(-8).map((event) => {
       const actor = event.actor?.id || event.actor?.kind || "unknown";
@@ -747,6 +1486,14 @@ class Orchestrator {
     const memorySections = Object.entries(memory)
       .map(([fileName, contents]) => `### ${fileName}\n${String(contents).trim().slice(0, 1200) || "(empty)"}`)
       .join("\n\n");
+    const skillSections = matchedSkills.length
+      ? matchedSkills
+          .map((skill) => {
+            const roles = (skill.roles || []).join(", ") || "*";
+            return `- ${skill.skill_id} (${skill.scope}, roles: ${roles})\n  ${skill.summary || "(no summary)"}\n  Source: ${skill.path}`;
+          })
+          .join("\n")
+      : "(none)";
 
     return [
       "TendrilFlow task context",
@@ -757,8 +1504,20 @@ class Orchestrator {
       `Task: ${task.title}`,
       `Task status: ${task.status}`,
       `Task description: ${task.description || "(none)"}`,
+      `Task playbook stage: ${task.playbook_stage || "intake"}`,
+      `Task dependencies: ${(task.depends_on || []).join(", ") || "(none)"}`,
+      `Task blocked by: ${(task.blocked_by || []).join(", ") || "(none)"}`,
+      `Task claim: ${task.claim?.agent_id ? `${task.claim.agent_id} until ${task.claim.lease_until}` : "(none)"}`,
+      `Agent isolation: ${agent?.isolation_mode || "shared"}`,
+      `Agent working directory: ${agent?.cwd || workspace?.root_dir || this.rootDir}`,
+      agent?.worktree?.path
+        ? `Agent worktree: ${agent.worktree.path} (${agent.worktree.dirty ? "dirty" : "clean"})`
+        : "Agent worktree: (none)",
       "",
       buildCommunicationExecutionProtocol(agent || {}),
+      "",
+      "Matched skills:",
+      skillSections,
       "",
       "Group memory:",
       memorySections,
@@ -776,11 +1535,14 @@ class Orchestrator {
 
   async emitRoleResponse(task, agent, message) {
     if (agent.role === "host") {
+      await this.store.patchTask(task.task_id, { playbook_stage: "plan" });
       await this.store.appendEvent(task.task_id, {
         type: "agent_message",
         actor: { kind: "agent", id: agent.id },
         content: {
-          text: `I split "${task.title}" into: clarify acceptance criteria, choose owner, execute implementation, request review, then finalize the report.`,
+          text: `Host playbook for "${task.title}": plan, clarify, execute, verify, fix if needed, then finalize the report.`,
+          playbook: HOST_DEFAULT_PLAYBOOK,
+          playbook_stage: "plan",
           source: "role_profile"
         }
       });
@@ -788,7 +1550,9 @@ class Orchestrator {
         type: "decision_record",
         actor: { kind: "agent", id: agent.id },
         content: {
-          selected_approach: "Keep the task in one visible room and route specialized requests with @mentions.",
+          selected_approach: "Run the default Host playbook in the visible Agent Room.",
+          playbook: HOST_DEFAULT_PLAYBOOK,
+          playbook_stage: "plan",
           rejected_alternatives: [
             "Create private agent scratchpads",
             "Move the task into an external issue tracker"
@@ -797,6 +1561,9 @@ class Orchestrator {
           next_owner: task.owner_agent_id || agent.id
         }
       });
+      if (this.shouldGenerateTaskGraph(message)) {
+        await this.emitHostTaskGraph(task, agent);
+      }
       return;
     }
 
@@ -865,6 +1632,182 @@ class Orchestrator {
     }
   }
 
+  shouldGenerateTaskGraph(message) {
+    return /(拆分|分解|计划|执行顺序|安排执行|任务图|task graph|decompose|plan|break down|breakdown)/iu.test(message);
+  }
+
+  async emitHostTaskGraph(task, hostAgent) {
+    const graph = await this.buildHostTaskGraph(task, hostAgent);
+    await this.store.appendEvent(task.task_id, {
+      type: "task_graph",
+      actor: { kind: "agent", id: hostAgent.id },
+      content: graph
+    });
+    return graph;
+  }
+
+  async buildHostTaskGraph(task, hostAgent) {
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === task.workspace_id && agent.group_id === task.group_id
+    );
+    const roleOwner = (role) => this.pickAgentForRole(agents, role)?.id || null;
+    const reassignSuggestions = await this.staleAgentReassignSuggestions(task, agents);
+    return {
+      tool: "host.task_graph",
+      skill: "host.task_graph",
+      parent_task_id: task.task_id,
+      playbook: HOST_DEFAULT_PLAYBOOK,
+      playbook_stage: "plan",
+      text: `Host proposed a task graph for "${task.title}". Review it, then accept to create child tasks.`,
+      nodes: [
+        {
+          id: "clarify",
+          title: `Clarify acceptance criteria for ${task.title}`,
+          role: "host",
+          owner_agent_id: hostAgent.id,
+          depends_on: []
+        },
+        {
+          id: "execute",
+          title: `Execute core work for ${task.title}`,
+          role: "work",
+          owner_agent_id: roleOwner("work"),
+          depends_on: ["clarify"]
+        },
+        {
+          id: "verify",
+          title: `Verify evidence and regressions for ${task.title}`,
+          role: "review",
+          owner_agent_id: roleOwner("review"),
+          depends_on: ["execute"]
+        },
+        {
+          id: "fix",
+          title: `Fix defects found during verification for ${task.title}`,
+          role: "debug",
+          owner_agent_id: roleOwner("debug") || roleOwner("work"),
+          depends_on: ["verify"]
+        },
+        {
+          id: "finalize",
+          title: `Finalize report for ${task.title}`,
+          role: "host",
+          owner_agent_id: hostAgent.id,
+          depends_on: ["verify", "fix"]
+        }
+      ],
+      edges: [
+        { from: "clarify", to: "execute" },
+        { from: "execute", to: "verify" },
+        { from: "verify", to: "fix" },
+        { from: "verify", to: "finalize" },
+        { from: "fix", to: "finalize" }
+      ],
+      reassign_suggestions: reassignSuggestions
+    };
+  }
+
+  pickAgentForRole(agents, role) {
+    if (role === "work") {
+      return agents.find((agent) => agent.role === "work") || agents.find((agent) => agent.role !== "host") || null;
+    }
+    return agents.find((agent) => agent.role === role) || null;
+  }
+
+  async staleAgentReassignSuggestions(task, agents) {
+    const healthEntries = await Promise.all(agents.map(async (agent) => [agent.id, await this.agentHealth(agent)]));
+    const healthById = new Map(healthEntries);
+    const unhealthyIds = new Set(
+      healthEntries
+        .filter(([, health]) => ["stale", "detached", "failed"].includes(health.status))
+        .map(([agentId]) => agentId)
+    );
+    if (!unhealthyIds.size) {
+      return [];
+    }
+    const groupTasks = (await this.store.listTasks()).filter(
+      (candidate) =>
+        candidate.workspace_id === task.workspace_id &&
+        candidate.group_id === task.group_id &&
+        !["done", "failed"].includes(candidate.status)
+    );
+    const fallback = agents.find(
+      (agent) => agent.role !== "host" && !["stale", "detached", "failed"].includes(healthById.get(agent.id)?.status)
+    );
+    return groupTasks
+      .filter((candidate) => unhealthyIds.has(candidate.owner_agent_id) || unhealthyIds.has(candidate.claim?.agent_id))
+      .map((candidate) => ({
+        task_id: candidate.task_id,
+        title: candidate.title,
+        from_agent_id: candidate.claim?.agent_id || candidate.owner_agent_id,
+        suggested_to_agent_id: fallback?.id || null,
+        reason: "The current owner or claim holder is unhealthy; Host should reassign or ask for recovery evidence."
+      }));
+  }
+
+  async applyTaskGraph(taskId, input = {}) {
+    const parent = await this.requireTask(taskId);
+    const graph = input.graph || (await this.latestTaskGraph(parent.task_id));
+    if (!graph?.nodes?.length) {
+      throw new Error("No task graph is available to apply.");
+    }
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === parent.workspace_id && agent.group_id === parent.group_id
+    );
+    const tempToTaskId = new Map();
+    const createdTasks = [];
+    for (const node of graph.nodes) {
+      const owner =
+        node.owner_agent_id ||
+        this.pickAgentForRole(agents, node.role || "work")?.id ||
+        null;
+      const child = await this.createTask({
+        title: node.title || node.id || "Task graph item",
+        description: node.description || `Generated from task graph node ${node.id || "unknown"}.`,
+        workspace_id: parent.workspace_id,
+        group_id: parent.group_id,
+        owner_agent_id: owner,
+        status: "todo",
+        parent_task_id: parent.task_id,
+        playbook_stage: node.id || node.role || "execute"
+      });
+      tempToTaskId.set(node.id, child.task_id);
+      createdTasks.push(child);
+    }
+    for (const [index, node] of graph.nodes.entries()) {
+      const dependsOn = (node.depends_on || []).map((id) => tempToTaskId.get(id)).filter(Boolean);
+      if (dependsOn.length) {
+        createdTasks[index] = await this.updateTask(createdTasks[index].task_id, { depends_on: dependsOn });
+      }
+    }
+    const nextChildTaskIds = Array.from(
+      new Set([...(parent.child_task_ids || []), ...createdTasks.map((task) => task.task_id)])
+    );
+    const updatedParent = await this.updateTask(parent.task_id, {
+      child_task_ids: nextChildTaskIds,
+      playbook_stage: "execute"
+    });
+    await this.store.appendEvent(parent.task_id, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        text: `Applied Host task graph and created ${createdTasks.length} child task(s).`,
+        child_task_ids: createdTasks.map((task) => task.task_id),
+        graph_event_id: input.graph_event_id || graph.graph_event_id || null
+      }
+    });
+    return {
+      parent_task: updatedParent,
+      tasks: createdTasks
+    };
+  }
+
+  async latestTaskGraph(taskId) {
+    const events = await this.store.readEvents(taskId);
+    const graphEvent = [...events].reverse().find((event) => event.type === "task_graph");
+    return graphEvent ? { ...graphEvent.content, graph_event_id: graphEvent.event_id } : null;
+  }
+
   parseHostAgentRequest(message) {
     const lower = message.toLowerCase();
     const wantsAgent =
@@ -899,7 +1842,8 @@ class Orchestrator {
 
     const nameMatch = message.match(/(?:名称|名字|叫|名为|name|named)\s*[:：]?\s*([a-zA-Z0-9_-]+)/iu);
     const name = nameMatch?.[1] || (role === "work" ? `${provider}-worker` : `${provider}-${role}-agent`);
-    return { name, role, provider, mode };
+    const isolation_mode = /(worktree|隔离|独立工作区|独立目录)/iu.test(message) ? "worktree" : "shared";
+    return { name, role, provider, mode, isolation_mode };
   }
 
   commandForAgentSpec(spec, cwd) {
@@ -933,6 +1877,8 @@ class Orchestrator {
       mode: spec.mode,
       provider: spec.provider,
       cwd,
+      base_cwd: cwd,
+      isolation_mode: spec.isolation_mode,
       command: this.commandForAgentSpec(spec, cwd)
     });
     await this.store.patchTask(task.task_id, {
@@ -944,7 +1890,10 @@ class Orchestrator {
       content: {
         selected_approach: `Create ${agent.name} as a ${agent.role} agent in this group.`,
         rejected_alternatives: ["Use global default agents", "Create the agent outside the current group"],
-        reason: "The group workflow keeps membership explicit and scoped to the current task room.",
+        reason:
+          agent.isolation_mode === "worktree"
+            ? "The group workflow keeps membership explicit and gives this agent its own git worktree for code changes."
+            : "The group workflow keeps membership explicit and scoped to the current task room.",
         next_owner: agent.id
       }
     });
@@ -956,6 +1905,7 @@ class Orchestrator {
         agent_id: agent.id,
         provider: agent.provider,
         mode: agent.mode,
+        isolation_mode: agent.isolation_mode,
         command: agent.command
       }
     });
@@ -1029,7 +1979,7 @@ class Orchestrator {
       actor: { kind: "system", id: "orchestrator" },
       content: report
     });
-    await this.updateTask(taskId, { status: "done" });
+    await this.updateTask(taskId, { status: "done", playbook_stage: "finalize", claim: null });
     return report;
   }
 

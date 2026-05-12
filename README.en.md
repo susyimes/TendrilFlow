@@ -18,7 +18,7 @@ Run checks:
 npm test
 ```
 
-The MVP uses file storage. Workspaces, groups, agent configuration, and task room transcripts are written under `.tendrilflow/workspaces/`, with the main room event stream at `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/tasks/{task_id}/events.jsonl`.
+The MVP uses file storage. Workspaces, groups, agent configuration, skills, and task room transcripts are written under `.tendrilflow/workspaces/`, with the main room event stream at `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/tasks/{task_id}/events.jsonl`.
 
 Default groups only create `host-agent` automatically. Other members can be created manually in Agent Launcher or requested from the Host Agent in the Agent Room. Codex CLI agents can use `scripts/codex-agent.js`; start with mock mode, then switch to `codex exec` or ACP when the setup is confirmed.
 
@@ -41,11 +41,17 @@ TendrilFlow Core stays narrow: it provides the communication layer, control plan
 - Default members: each new group only creates `host-agent`; other agents are created by the user or Host Agent.
 - External task boards: not included in v1. Tasks come from the local Task Board or direct user dispatch.
 - Agent run mode: choose Mock, Codex exec, or ACP; the adapter transport is derived automatically.
+- Skill Layer: workspace skills live at `.tendrilflow/workspaces/{workspace_id}/skills/`, and group skills live at `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/skills/`.
+- Worker Isolation: agents can use the shared working directory or an isolated Git worktree. Dirty worktrees are never auto-deleted.
+- Replay Analytics: task replay is generated from file-backed traces without adding a database.
 
 ## Core Modules
 
 - Workspaces: the first persistence layer for groups, memory, and task history.
 - Agent Groups: the workspace-scoped organization layer for tasks and agents.
+- Skill Layer: file-backed workspace/group skills whose summaries are injected into matching agents.
+- Worker Isolation: optional per-agent Git worktrees for concurrent coding work.
+- Replay Analytics: task summaries, contribution summaries, timelines, reliability metrics, and Host suggestions.
 - Agent Launcher: starts and manages agent processes inside the current group.
 - Task Board: creates, assigns, and tracks tasks inside the current group.
 - Agent Room: shows group-style task collaboration.
@@ -53,6 +59,24 @@ TendrilFlow Core stays narrow: it provides the communication layer, control plan
 - Control Plane: lets the user or Host Agent stop agents and broadcast high-priority instructions.
 - Safety Baseline: redacts common secrets before room events, agent logs, handoffs, and final reports are stored.
 - Agent Adapter: isolates provider-specific behavior through an ACP Adapter and a legacy CLI fallback.
+
+## Skill Layer
+
+The first skill layer is file-first, not a full low-code agent builder. TendrilFlow creates editable workspace and group skill files such as `workspace.context`, `host.playbook`, `host.task_graph`, `host.route_to_agent`, `host.control`, `host.handoff_policy`, `review.evidence_check`, `debug.recovery`, and `work.execution_report`.
+
+When a task is sent to an agent, TendrilFlow injects matching skill summaries and file paths based on the agent role. The actual capability still belongs to each agent's own tools, skills, model, adapter, and repository instructions.
+
+## Worker Isolation
+
+Agents use the shared working directory by default. When `worktree` isolation is selected, TendrilFlow prepares an agent-specific Git worktree before launch, switches the agent `cwd` to that directory, and keeps the original repository root as `base_cwd`.
+
+Deleting an isolated agent will not remove a dirty worktree. The user must commit, stash, or clean changes first. TendrilFlow does not auto-merge agent worktrees in v1.
+
+## Replay Analytics
+
+Task replay is generated from the task `events.jsonl` and related agent session logs. It includes a task summary, agent contribution summary, decision/risk summary, merged replay timeline, reliability metrics, and Host replay suggestions.
+
+Replay is for audit and improvement. It does not replace real tests, code review, or user confirmation.
 
 ## Agent Roles
 

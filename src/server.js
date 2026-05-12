@@ -2,7 +2,14 @@ const fs = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
 const { Orchestrator } = require("./orchestrator");
-const { AGENT_MODES, AGENT_ROLES, DEFAULT_GROUP_ID, DEFAULT_WORKSPACE_ID, TASK_STATUSES } = require("./model");
+const {
+  AGENT_ISOLATION_MODES,
+  AGENT_MODES,
+  AGENT_ROLES,
+  DEFAULT_GROUP_ID,
+  DEFAULT_WORKSPACE_ID,
+  TASK_STATUSES
+} = require("./model");
 
 const ROOT_DIR = process.env.TENDRILFLOW_ROOT || path.resolve(__dirname, "..");
 const PUBLIC_DIR = path.join(ROOT_DIR, "public");
@@ -77,6 +84,7 @@ function createHttpServer(orchestrator) {
         sendJson(res, 200, {
           roles: AGENT_ROLES,
           modes: AGENT_MODES,
+          isolationModes: AGENT_ISOLATION_MODES,
           statuses: TASK_STATUSES,
           defaultWorkspaceId: DEFAULT_WORKSPACE_ID,
           defaultGroupId: DEFAULT_GROUP_ID,
@@ -127,6 +135,44 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      if (pathname === "/api/skills" && req.method === "GET") {
+        sendJson(res, 200, {
+          skills: await orchestrator.listSkills({
+            workspace_id: url.searchParams.get("workspace_id") || undefined,
+            group_id: url.searchParams.get("group_id") || undefined,
+            scope: url.searchParams.get("scope") || undefined
+          })
+        });
+        return;
+      }
+
+      const skillRoute = pathname.match(/^\/api\/skills\/(workspace|group)\/([^/]+)$/);
+      if (skillRoute && req.method === "GET") {
+        const [, scope, skillId] = skillRoute.map(decodeURIComponent);
+        sendJson(res, 200, {
+          skill: await orchestrator.getSkill({
+            workspace_id: url.searchParams.get("workspace_id") || undefined,
+            group_id: url.searchParams.get("group_id") || undefined,
+            scope,
+            skill_id: skillId
+          })
+        });
+        return;
+      }
+      if (skillRoute && req.method === "PUT") {
+        const [, scope, skillId] = skillRoute.map(decodeURIComponent);
+        sendJson(res, 200, {
+          skill: await orchestrator.upsertSkill({
+            ...(await readJson(req)),
+            workspace_id: url.searchParams.get("workspace_id") || undefined,
+            group_id: url.searchParams.get("group_id") || undefined,
+            scope,
+            skill_id: skillId
+          })
+        });
+        return;
+      }
+
       if (pathname === "/api/agents" && req.method === "POST") {
         sendJson(res, 201, { agent: await orchestrator.createAgent(await readJson(req)) });
         return;
@@ -137,6 +183,16 @@ function createHttpServer(orchestrator) {
         const [, agentId, action] = agentAction;
         const agent = action === "start" ? await orchestrator.startAgent(agentId) : await orchestrator.stopAgent(agentId);
         sendJson(res, 200, { agent });
+        return;
+      }
+
+      const agentWorktreeRoute = pathname.match(/^\/api\/agents\/([^/]+)\/worktree$/);
+      if (agentWorktreeRoute && req.method === "GET") {
+        sendJson(res, 200, await orchestrator.agentWorktreeStatus(agentWorktreeRoute[1]));
+        return;
+      }
+      if (agentWorktreeRoute && req.method === "POST") {
+        sendJson(res, 200, { agent: await orchestrator.prepareAgentWorktree(agentWorktreeRoute[1]) });
         return;
       }
 
@@ -186,6 +242,12 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const replayRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/replay$/);
+      if (replayRoute && req.method === "GET") {
+        sendJson(res, 200, await orchestrator.taskReplay(replayRoute[1]));
+        return;
+      }
+
       const messageRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageRoute && req.method === "POST") {
         const body = await readJson(req);
@@ -202,6 +264,12 @@ function createHttpServer(orchestrator) {
       const finalRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/final-report$/);
       if (finalRoute && req.method === "POST") {
         sendJson(res, 201, { report: await orchestrator.finalizeTask(finalRoute[1], await readJson(req)) });
+        return;
+      }
+
+      const taskGraphApplyRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/task-graph\/apply$/);
+      if (taskGraphApplyRoute && req.method === "POST") {
+        sendJson(res, 201, await orchestrator.applyTaskGraph(taskGraphApplyRoute[1], await readJson(req)));
         return;
       }
 

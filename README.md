@@ -1,6 +1,6 @@
 # TendrilFlow
 
-[English README](./README.en.md) | [总设计](./docs/DESIGN.md)
+[English README](./README.en.md) | [总设计](./docs/DESIGN.md) | [AgentChat UI 改造计划](./docs/AGENTCHAT_UI_REDESIGN_PLAN.md) | [OMC Research 执行计划](./docs/OMC_RESEARCH_EXECUTION_PLAN.md)
 
 TendrilFlow 是一个面向本地编码 Agent 的任务协作工作台。
 
@@ -18,7 +18,7 @@ npm start
 npm test
 ```
 
-MVP 使用文件存储，workspace、group、agent 配置和 task room transcript 会写入 `.tendrilflow/workspaces/`。主事件流路径为 `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/tasks/{task_id}/events.jsonl`。
+MVP 使用文件存储，workspace、group、agent 配置、skills 和 task room transcript 会写入 `.tendrilflow/workspaces/`。主事件流路径为 `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/tasks/{task_id}/events.jsonl`。
 
 默认群组只自动创建 `host-agent`。其他成员可以由用户在 Agent Launcher 中创建，也可以在 Agent Room 里 `@群主` 请求群主创建。Codex CLI agent 可以使用 `scripts/codex-agent.js` 包装；初始建议使用安全的 mock 模式，确认配置后再切到 `codex exec` 或 ACP。
 
@@ -57,6 +57,7 @@ TendrilFlow Core 的边界很窄：它只提供交流层、控制平面、状态
 - 通过本地 Web App 启动和配置 agents
 - 以 workspace 保存长期记忆和多个群组
 - 以群组为中心组织 agents 和任务
+- 以 workspace/group skill 文件沉淀可复用协作能力
 - 在群组内创建、分配和推进任务
 - 每个群组默认附带一个 Host Agent，也就是“群主”
 - 直接 `@agent` 或选中 agent 下发任务
@@ -64,11 +65,13 @@ TendrilFlow Core 的边界很窄：它只提供交流层、控制平面、状态
 - 支持 agent 间结构化讨论和交接
 - 内置 work、observe、debug、review、host 等角色
 - 优先通过 ACP 连接 coding agents
+- 支持可选 per-agent Git worktree 隔离，降低并行改代码时互相污染的风险
 - 使用文件保存 task room transcript
 - 向 agent 注入沟通执行协议，让 agent 理解协作、trace、安全和控制边界
 - 提供用户/群主可用的控制平面，包括停止和广播
 - 写入 transcript 和 agent logs 前做常见 secret 脱敏
 - 展示可审计工作轨迹，包括计划、决策、工具调用、状态变化、讨论、review 和交接记录
+- 从 room transcript 和 agent logs 生成任务复盘、贡献摘要、可靠性指标和 Host 改进建议
 
 ## MVP 已确认决策
 
@@ -79,6 +82,9 @@ TendrilFlow Core 的边界很窄：它只提供交流层、控制平面、状态
 - 默认成员：新群组只自动创建 `host-agent`，其他 agent 由用户或群主创建。
 - 外部任务板：v1 不接入 GitHub Issues、Linear、Jira 等系统，任务只来自本地 Task Board 或用户直接下发。
 - Agent 运行方式：统一选择模拟、Codex exec 或 ACP；底层 adapter 自动推导。
+- Skill Layer：第一版采用文件优先模型，workspace skills 存在 `.tendrilflow/workspaces/{workspace_id}/skills/`，group skills 存在 `.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/skills/`。
+- Worker Isolation：Agent Launcher 可选择共享工作目录或独立 Git worktree。独立 worktree 会在 agent 启动前准备，dirty worktree 不会被自动删除。
+- Replay Analytics：从文件 trace 生成任务级复盘，不引入数据库。
 
 ## 核心体验
 
@@ -209,6 +215,47 @@ Orchestrator 不应拥有“审核、调试、测试、交接、创建成员”�
 - 交接方式是 Host Agent 的 skill/tool 状态，不是隐藏系统 workflow。
 
 这让系统回到最纯粹的 agent 组织形式：TendrilFlow 负责让 agent 能可靠沟通、被观察、可恢复；agent 自己负责调用能力并发挥潜力。
+
+### Skill Layer
+
+Skill Layer 的目的不是把 TendrilFlow 做成低代码 agent builder，而是把群组协作经验沉淀成 agent 可理解、可编辑、可复用的本地文件。
+
+第一版落地为两层目录：
+
+- Workspace skills：`.tendrilflow/workspaces/{workspace_id}/skills/`
+- Group skills：`.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/skills/`
+
+默认会创建 `workspace.context`、`host.playbook`、`host.task_graph`、`host.route_to_agent`、`host.control`、`host.handoff_policy`、`review.evidence_check`、`debug.recovery` 和 `work.execution_report` 等 skill 文件。
+
+当 TendrilFlow 把任务发送给 agent 时，会根据当前 agent 的 role 匹配 skill 摘要，并把 skill id、摘要和文件路径注入任务上下文。实际执行能力仍然属于 agent 自己的 tools、skills、模型和 adapter；TendrilFlow Core 只负责保存、暴露和注入这些协作契约。
+
+### Worker Isolation
+
+Phase 4 引入可选的 per-agent Git worktree 隔离，用来支持多个 agent 并行修改代码而不直接写在同一个工作目录里。
+
+第一版规则：
+
+- Agent 默认使用共享工作目录，保持轻量。
+- 在 Agent Launcher 高级配置中选择“独立 Git worktree”后，agent 启动前会创建或复用自己的 worktree。
+- Agent 的实际 `cwd` 会切到该 worktree，原始仓库根保存在 `base_cwd`。
+- 任务上下文会告诉 agent 当前 isolation mode、工作目录和 worktree 状态。
+- 删除 agent 时，如果 worktree 有未提交或未跟踪变更，TendrilFlow 会拒绝自动删除，要求用户先 commit、stash 或清理。
+- Host 可以创建带 worktree 隔离的成员，但合并仍由用户确认；TendrilFlow 不自动 merge。
+
+### Replay Analytics
+
+Phase 5 引入任务级 replay analytics。它不改变事件写入方式，也不引入数据库，而是从当前任务的 `events.jsonl` 和相关 agent session logs 生成一次可读复盘。
+
+第一版复盘内容包括：
+
+- 任务摘要：状态、owner、playbook stage、耗时、事件数量和最终报告。
+- Agent contribution summary：每个成员的消息、工具摘要、决策、review、交接、日志和错误数量。
+- Decision/risk summary：汇总 `decision_record`、review risks、阻塞线索和证据摘要。
+- Agent replay timeline：按时间合并 room events 和 agent logs，方便复盘执行过程。
+- Reliability metrics：工具调用数、review 数、handoff 数、进程错误、重试、健康状态分布。
+- Host replay suggestions：根据缺失 final report、缺少 review、证据不足、进程错误、agent unhealthy 等信号给出改进建议。
+
+Replay 的定位是审计和改进，不替代真实测试、代码审查或用户确认。
 
 ### 控制平面
 
@@ -466,13 +513,16 @@ Local Web App
 4. 用户可以 `@群主` 请求拆分任务、创建成员或建议执行顺序。
 5. 群主可以调用 `host.create_agent`、`host.route_to_agent`、`host.broadcast_instruction` 等工具组织成员。
 6. TendrilFlow 创建任务房间和本地 transcript 文件。
-7. 被路由的 agent 执行任务，并持续发出进度事件。
-8. 用户可以在房间里观察 transcript。
-9. 用户可以在需要时停止 agent、广播新约束，或 `@debug-agent`、`@review-agent`、`@host`。
-10. Agents 在任务房间里讨论阻塞、方案或 review 结果。
-11. 如果任务 owner 变化，当前 agent 创建交接卡片。
-12. 接手 agent 确认交接并继续执行。
-13. 任务完成后，房间生成最终报告，任务进入 `done`。
+7. TendrilFlow 根据 agent role 注入 workspace/group skill 摘要。
+8. 如果 agent 使用 worktree 隔离，启动前准备独立 Git worktree。
+9. 被路由的 agent 执行任务，并持续发出进度事件。
+10. 用户可以在房间里观察 transcript。
+11. 用户可以在需要时停止 agent、广播新约束，或 `@debug-agent`、`@review-agent`、`@host`。
+12. Agents 在任务房间里讨论阻塞、方案或 review 结果。
+13. 如果任务 owner 变化，当前 agent 创建交接卡片。
+14. 接手 agent 确认交接并继续执行。
+15. 任务完成后，房间生成最终报告，任务进入 `done`。
+16. 用户打开任务复盘，查看 trace、贡献、风险、指标和 Host 改进建议。
 
 ## 第一版范围
 
@@ -496,6 +546,9 @@ Local Web App
 - 任务房间 transcript
 - 结构化交接卡片
 - review 和 debug 作为可配置 agent profiles
+- workspace/group skill 文件和匹配摘要注入
+- 可选 per-agent Git worktree 隔离
+- 任务级 replay analytics
 
 第一版不做：
 
@@ -507,6 +560,9 @@ Local Web App
 - 自定义或扩展 ACP 协议本身
 - OS 级 agent 沙箱
 - 自动证明 agent 没有读取敏感文件
+- 自动合并 agent worktree 变更
+- 跨 workspace 全局分析看板
+- 自动判定任务真实正确性
 
 ## 测试场景
 

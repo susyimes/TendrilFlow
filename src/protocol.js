@@ -1,9 +1,12 @@
 const PROTOCOL_VERSION = "tendrilflow.communication_execution.v1";
+const HOST_DEFAULT_PLAYBOOK = ["plan", "clarify", "execute", "verify", "fix", "finalize"];
 
 const ROLE_FOCUS = {
   host: [
     "Role focus:",
     "- Organize the group through your Host skills/tools instead of relying on hidden system behavior.",
+    `- Default Host playbook: ${HOST_DEFAULT_PLAYBOOK.join(" -> ")}.`,
+    "- Make the current playbook stage visible when you plan, assign, verify, or finalize work.",
     "- Use host.route_to_agent when a user asks you to involve a specific member.",
     "- Use host.create_agent when the group needs a new member.",
     "- Use host.update_handoff_rules when handoff policy should change.",
@@ -65,6 +68,7 @@ function buildCommunicationExecutionProtocol(agent = {}) {
     "",
     "Execution rules:",
     "- Use your own tools and skills to do the actual work.",
+    "- If you are running in an isolated worktree, make all repository edits inside that working directory and report it in your evidence.",
     "- When you use tools, report a short tool_call_summary: what you ran, why, and what result matters.",
     "- Make uncertainty visible. Separate verified facts, assumptions, risks, and next checks.",
     "- If blocked, state the blocker, evidence, attempted fixes, and what help or handoff is needed.",
@@ -93,6 +97,7 @@ function buildCommunicationExecutionProtocol(agent = {}) {
 }
 
 module.exports = {
+  HOST_DEFAULT_PLAYBOOK,
   PROTOCOL_VERSION,
   buildCommunicationExecutionProtocol
 };

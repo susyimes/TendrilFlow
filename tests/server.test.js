@@ -33,6 +33,8 @@ test("HTTP API supports the core task room flow", async (t) => {
   assert.ok(state.groups.some((group) => group.group_id === "group_main"));
   assert.ok(state.agents.some((agent) => agent.id === "agent_host" && agent.name === "host-agent"));
   assert.equal(state.agents.length, 1);
+  const meta = await fetch(`${baseUrl}/api/meta`).then((response) => response.json());
+  assert.ok(meta.isolationModes.includes("worktree"));
 
   const created = await fetch(`${baseUrl}/api/tasks`, {
     method: "POST",
@@ -54,6 +56,16 @@ test("HTTP API supports the core task room flow", async (t) => {
   );
   assert.equal(room.task.task_id, created.task.task_id);
   assert.ok(room.events.some((event) => event.type === "decision_record"));
+  const graphEvent = room.events.find((event) => event.type === "task_graph");
+  assert.ok(graphEvent);
+
+  const applied = await fetch(`${baseUrl}/api/tasks/${created.task.task_id}/task-graph/apply`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ graph_event_id: graphEvent.event_id, graph: graphEvent.content })
+  }).then((response) => response.json());
+  assert.ok(applied.tasks.length > 0);
+  assert.equal(applied.parent_task.child_task_ids.length, applied.tasks.length);
 });
 
 test("static file serving blocks encoded path traversal", async (t) => {
@@ -180,6 +192,82 @@ test("HTTP API supports group handoff rule canvas data", async (t) => {
 
   assert.equal(saved.policy.rules.length, 1);
   assert.equal(saved.policy.rules[0].to_agent_id, "agent_host");
+});
+
+test("HTTP API exposes editable workspace and group skills", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const list = await fetch(`${baseUrl}/api/skills?workspace_id=workspace_main&group_id=group_main`).then((response) =>
+    response.json()
+  );
+  assert.ok(list.skills.some((skill) => skill.skill_id === "workspace.context" && skill.scope === "workspace"));
+  assert.ok(list.skills.some((skill) => skill.skill_id === "host.playbook" && skill.scope === "group"));
+
+  const read = await fetch(
+    `${baseUrl}/api/skills/group/host.playbook?workspace_id=workspace_main&group_id=group_main`
+  ).then((response) => response.json());
+  assert.match(read.skill.body, /Host Playbook/);
+
+  const saved = await fetch(
+    `${baseUrl}/api/skills/group/review.evidence_check?workspace_id=workspace_main&group_id=group_main`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        roles: ["review"],
+        summary: "Review API skill summary.",
+        body: "# Review Evidence Check\n\nAPI-edited skill body."
+      })
+    }
+  ).then((response) => response.json());
+
+  assert.equal(saved.skill.skill_id, "review.evidence_check");
+  assert.equal(saved.skill.summary, "Review API skill summary.");
+  assert.match(saved.skill.body, /API-edited skill body/);
+});
+
+test("HTTP API exposes task replay analytics", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const agentResponse = await fetch(`${baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "api-replay-worker",
+      role: "work",
+      mode: "mock",
+      provider: "mock",
+      command: "",
+      cwd: process.cwd()
+    })
+  }).then((response) => response.json());
+
+  const taskResponse = await fetch(`${baseUrl}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "Replay API",
+      owner_agent_id: agentResponse.agent.id
+    })
+  }).then((response) => response.json());
+
+  await fetch(`${baseUrl}/api/tasks/${taskResponse.task.task_id}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: `@${agentResponse.agent.name} record replay evidence` })
+  });
+
+  const replay = await fetch(`${baseUrl}/api/tasks/${taskResponse.task.task_id}/replay`).then((response) =>
+    response.json()
+  );
+
+  assert.equal(replay.task_summary.task_id, taskResponse.task.task_id);
+  assert.ok(replay.metrics.event_count > 0);
+  assert.ok(Array.isArray(replay.agent_contributions));
+  assert.ok(Array.isArray(replay.timeline));
+  assert.ok(Array.isArray(replay.host_replay_suggestions));
 });
 
 test("HTTP API exposes agent detail and session logs", async (t) => {

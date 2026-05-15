@@ -99,5 +99,6 @@ function buildCommunicationExecutionProtocol(agent = {}) {
 module.exports = {
   HOST_DEFAULT_PLAYBOOK,
   PROTOCOL_VERSION,
-  buildCommunicationExecutionProtocol
+  buildCommunicationExecutionProtocol,
+  roleFocusFor
 };

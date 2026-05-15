@@ -164,6 +164,39 @@ test("keeps internal adapter command name aligned with the agent name", async ()
   assert.doesNotMatch(agent.command, /--name "new-agent"/);
 });
 
+test("prepares a TendrilFlow initialization prompt for new Codex sessions", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Android Workspace", root_dir: root });
+  const group = await orchestrator.createGroup({ name: "Mobile Crew", workspace_id: workspace.workspace_id });
+  const agent = await orchestrator.createAgent({
+    name: "unicorn",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    mode: "exec",
+    provider: "codex",
+    cwd: root,
+    command: `node scripts/codex-agent.js --name "unicorn" --mode exec --cwd "${root}" --sandbox read-only`
+  });
+
+  const init = await orchestrator.initializeAgentSession(agent.id, { dry_run: true });
+
+  assert.equal(init.dry_run, true);
+  assert.match(init.command, /^codex exec -C /);
+  assert.match(init.command, /--sandbox read-only/);
+  assert.equal(init.agent.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.match(init.prompt, new RegExp(`Agent: unicorn \\(${agent.id}\\)`));
+  assert.match(init.prompt, /Runtime Envelope:/);
+  assert.match(init.prompt, /Task transcript pattern: \.tendrilflow\/workspaces\//);
+  assert.match(init.prompt, /TendrilFlow Architecture:/);
+  assert.match(init.prompt, /TendrilFlow Core is the local orchestration layer/);
+  assert.match(init.prompt, /Communication Protocol:/);
+  assert.match(init.prompt, /Role contract:/);
+  assert.match(init.prompt, /Safety & Boundaries:/);
+  assert.match(init.prompt, /Startup Acknowledgement:/);
+  assert.match(init.prompt, /During this initialization, do not edit files, run shell commands, create commits/);
+});
+
 test("records per-agent session logs for console inspection", async () => {
   const { orchestrator } = await makeOrchestrator();
   const review = await createTestAgent(orchestrator, {
@@ -240,7 +273,7 @@ test("starts internal agent scripts from TendrilFlow root when agent cwd is exte
   assert.equal(startedLog.content.cwd, externalCwd);
 });
 
-test("opens Codex agents through codex resume instead of the adapter wrapper", async () => {
+test("opens new Codex interactive CLIs without the resume picker when no session exists", async () => {
   const { root, orchestrator } = await makeOrchestrator();
   const worker = await createTestAgent(orchestrator, {
     name: "codex-worker",
@@ -251,10 +284,11 @@ test("opens Codex agents through codex resume instead of the adapter wrapper", a
 
   const launch = await orchestrator.openAgentCli(worker.id, { dry_run: true, platform: "win32" });
 
-  assert.match(launch.command, /^codex resume --include-non-interactive/);
+  assert.match(launch.command, /^codex -C /);
   assert.match(launch.command, /-C '.*tendrilflow-/i);
   assert.match(launch.command, /--sandbox 'workspace-write'/);
   assert.match(launch.command, /--search/);
+  assert.doesNotMatch(launch.command, /\bresume\b/);
   assert.doesNotMatch(launch.command, /codex-agent\.js/);
 });
 
@@ -276,8 +310,71 @@ test("opens ACP provider CLIs without protocol adapter arguments", async () => {
   const geminiLaunch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
   const kimiLaunch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
 
-  assert.equal(geminiLaunch.command, "gemini");
-  assert.equal(kimiLaunch.command, "kimi");
+  assert.match(geminiLaunch.command, /^gemini\b/);
+  assert.doesNotMatch(geminiLaunch.command, /--acp/);
+  assert.match(geminiLaunch.command, /--session-id '[0-9a-f-]{36}'/i);
+  assert.match(geminiLaunch.command, /--prompt-interactive/);
+  assert.equal(geminiLaunch.init_prompt_included, true);
+  assert.match(kimiLaunch.command, /^kimi\b/);
+  assert.doesNotMatch(kimiLaunch.command.split(" --prompt ")[0], /\bacp\b/);
+  assert.match(kimiLaunch.command, /--work-dir /);
+  assert.match(kimiLaunch.command, /--prompt /);
+  assert.doesNotMatch(kimiLaunch.command, /--print/);
+  assert.equal(kimiLaunch.init_prompt_included, true);
+});
+
+test("opens Claude Code as an interactive CLI with a stable session identity", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const claude = await createTestAgent(orchestrator, {
+    name: "claude-scout",
+    provider: "claude",
+    mode: "exec",
+    command: `claude --name "new-agent" --model "sonnet" --permission-mode "default"`
+  });
+
+  const launch = await orchestrator.openAgentCli(claude.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(claude.id);
+
+  assert.equal(saved.claude_session_name, "claude-scout");
+  assert.match(saved.claude_session_id, /^[0-9a-f-]{36}$/i);
+  assert.match(saved.command, /--name "claude-scout"/);
+  assert.doesNotMatch(saved.command, /--name "new-agent"/);
+  assert.match(
+    launch.command,
+    new RegExp(`^claude --session-id '${saved.claude_session_id}' --name 'claude-scout' --model 'sonnet' --permission-mode 'default' `)
+  );
+  assert.match(launch.command, /TendrilFlow Agent Initialization/);
+  assert.equal(launch.init_prompt_included, true);
+  assert.doesNotMatch(launch.command, /\s-p(?:\s|$)/);
+  assert.doesNotMatch(launch.command, /dangerously-skip-permissions/);
+});
+
+test("prepares provider-neutral TendrilFlow context for non-Codex CLIs", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Polyglot Workspace", root_dir: root });
+  const group = await orchestrator.createGroup({ name: "Provider Crew", workspace_id: workspace.workspace_id });
+  const gemini = await orchestrator.createAgent({
+    name: "gemini-planner",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    provider: "gemini",
+    cwd: root
+  });
+
+  const init = await orchestrator.initializeAgentSession(gemini.id);
+  const saved = await orchestrator.store.getAgent(gemini.id);
+
+  assert.equal(init.prepared, true);
+  assert.equal(init.init_delivery, "interactive_prompt");
+  assert.equal(saved.init_status, "prepared");
+  assert.equal(saved.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.match(saved.provider_session_id, /^[0-9a-f-]{36}$/i);
+  assert.match(saved.init_prompt, /Provider: gemini/);
+  assert.match(saved.init_prompt, /Runtime Envelope:/);
+  assert.match(saved.init_prompt, /Role contract:/);
+  assert.match(saved.init_prompt, /Safety & Boundaries:/);
+  assert.match(saved.init_prompt, /Task-specific context is injected later/);
 });
 
 test("opens separate Codex resume sessions for agents sharing one workspace", async () => {
@@ -875,6 +972,24 @@ test("host can create group agents from visible room commands", async () => {
   assert.equal(created.isolation_mode, "worktree");
   assert.equal(created.command, "gemini --acp");
   assert.ok(events.some((event) => event.type === "system_event" && event.content.agent_id === created.id));
+});
+
+test("host can create Claude Code agents from visible room commands", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const task = await orchestrator.createTask({
+    title: "Add Claude member",
+    owner_agent_id: "agent_host"
+  });
+
+  await orchestrator.postRoomMessage(task.task_id, "@群主 新增一个 Claude Code agent 名称 claude-scout");
+
+  const agents = await orchestrator.store.listAgents();
+  const created = agents.find((agent) => agent.name === "claude-scout");
+  assert.ok(created);
+  assert.equal(created.provider, "claude");
+  assert.equal(created.mode, "exec");
+  assert.equal(created.command, 'claude --name "claude-scout"');
+  assert.match(created.claude_session_id, /^[0-9a-f-]{36}$/i);
 });
 
 test("user-to-host delegation routes one review request to the named agent", async () => {

@@ -109,6 +109,7 @@ const i18n = {
     advancedConfig: "高级配置",
     provider: "Provider",
     provider_codex: "Codex",
+    provider_claude: "Claude Code",
     provider_gemini: "Gemini",
     provider_kimi: "Kimi",
     provider_mock: "Mock 测试",
@@ -118,6 +119,9 @@ const i18n = {
     usePresetCommand: "套用推荐命令",
     createAgent: "创建 Agent",
     agentCreated: "Agent 创建成功",
+    agentInitializing: "正在准备 Agent 上下文",
+    agentInitialized: "Agent 上下文已准备",
+    agentInitFailed: "Agent 上下文准备失败",
     agents: "Agents",
     agentsHint: "当前群组内启动、停止、删除",
     unassigned: "未分配",
@@ -297,6 +301,7 @@ const i18n = {
     advancedConfig: "Advanced Config",
     provider: "Provider",
     provider_codex: "Codex",
+    provider_claude: "Claude Code",
     provider_gemini: "Gemini",
     provider_kimi: "Kimi",
     provider_mock: "Mock/Test",
@@ -306,6 +311,9 @@ const i18n = {
     usePresetCommand: "Use Preset Command",
     createAgent: "Create Agent",
     agentCreated: "Agent created",
+    agentInitializing: "Preparing agent context",
+    agentInitialized: "Agent context ready",
+    agentInitFailed: "Agent context preparation failed",
     agents: "Agents",
     agentsHint: "Start, stop, and delete inside this group",
     unassigned: "Unassigned",
@@ -420,7 +428,7 @@ const state = {
 const qs = (selector, root = document) => root.querySelector(selector);
 const qsa = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 const t = (key) => i18n[state.lang]?.[key] || i18n.en[key] || key;
-const PROVIDERS = ["codex", "gemini", "kimi", "mock", "custom"];
+const PROVIDERS = ["codex", "claude", "gemini", "kimi", "mock", "custom"];
 const HANDOFF_TRIGGERS = ["manual", "blocked", "ready_for_review", "owner_change", "done"];
 const PROCESS_BUNDLE_TYPES = new Set(["tool_call_summary", "decision_record", "handoff_note", "system_event", "status_change"]);
 let toastTimer = null;
@@ -573,7 +581,7 @@ function renderWorktreeBadge(agent) {
 }
 
 function canOpenAgentCli(agent) {
-  return Boolean(agent?.command || ["codex", "gemini", "kimi"].includes(agent?.provider));
+  return Boolean(agent?.command || ["codex", "claude", "gemini", "kimi"].includes(agent?.provider));
 }
 
 async function loadMeta() {
@@ -1770,6 +1778,9 @@ function recommendedCommand() {
         `--name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`
       );
     }
+    if (provider === "claude") {
+      return `claude --name ${quoteShell(name)}`;
+    }
     return internalNodeCommand(
       "codex-agent.js",
       `--name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`
@@ -1789,7 +1800,7 @@ function syncProviderDefaults() {
       form.elements.provider.value = "gemini";
     }
   } else if (form.elements.mode.value === "exec") {
-    if (provider !== "codex") {
+    if (!["codex", "claude"].includes(provider)) {
       form.elements.provider.value = "codex";
     }
   } else if (provider !== "mock") {
@@ -1802,7 +1813,7 @@ function syncModeForProvider() {
   const provider = form.elements.provider.value;
   if (provider === "gemini" || provider === "kimi") {
     form.elements.mode.value = "acp";
-  } else if (provider === "codex") {
+  } else if (provider === "codex" || provider === "claude") {
     form.elements.mode.value = "exec";
   } else if (provider === "mock") {
     form.elements.mode.value = "mock";
@@ -2210,7 +2221,19 @@ function bindEvents() {
     payload.workspace_id = state.selectedWorkspaceId;
     payload.group_id = state.selectedGroupId;
     const data = await api("/api/agents", { method: "POST", body: JSON.stringify(payload) });
-    showToast(`${t("agentCreated")}: ${data.agent?.name || payload.name}`);
+    const createdName = data.agent?.name || payload.name;
+    const providerNeedsInit = ["codex", "claude", "gemini", "kimi"].includes(data.agent?.provider);
+    if (providerNeedsInit) {
+      showToast(`${t("agentInitializing")}: ${createdName}`);
+      try {
+        await api(`/api/agents/${encodeURIComponent(data.agent.id)}/init-session`, { method: "POST", body: "{}" });
+        showToast(`${t("agentCreated")}: ${createdName} · ${t("agentInitialized")}`);
+      } catch (error) {
+        showToast(`${t("agentCreated")}: ${createdName} · ${t("agentInitFailed")}: ${error.message}`);
+      }
+    } else {
+      showToast(`${t("agentCreated")}: ${createdName}`);
+    }
     resetLauncherDefaults(event.currentTarget);
     await loadState();
   });

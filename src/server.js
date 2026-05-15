@@ -193,6 +193,12 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const agentInitRoute = pathname.match(/^\/api\/agents\/([^/]+)\/init-session$/);
+      if (agentInitRoute && req.method === "POST") {
+        sendJson(res, 200, await orchestrator.initializeAgentSession(agentInitRoute[1], await readJson(req)));
+        return;
+      }
+
       const agentWorktreeRoute = pathname.match(/^\/api\/agents\/([^/]+)\/worktree$/);
       if (agentWorktreeRoute && req.method === "GET") {
         sendJson(res, 200, await orchestrator.agentWorktreeStatus(agentWorktreeRoute[1]));

@@ -128,6 +128,15 @@ test("HTTP API supports launcher mode and delete actions", async (t) => {
   assert.equal(agentResponse.agent.group_id, groupResponse.group.group_id);
   assert.equal(agentResponse.agent.transport, "legacy_cli");
 
+  const initLaunch = await fetch(`${baseUrl}/api/agents/${agentResponse.agent.id}/init-session`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ dry_run: true })
+  }).then((response) => response.json());
+
+  assert.match(initLaunch.command, /^codex exec -C /);
+  assert.match(initLaunch.prompt, /Agent: api-worker/);
+
   const cliLaunch = await fetch(`${baseUrl}/api/agents/${agentResponse.agent.id}/cli`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -135,8 +144,9 @@ test("HTTP API supports launcher mode and delete actions", async (t) => {
   }).then((response) => response.json());
 
   assert.equal(cliLaunch.agent_id, agentResponse.agent.id);
-  assert.match(cliLaunch.command, /^codex resume --include-non-interactive/);
+  assert.match(cliLaunch.command, /^codex -C /);
   assert.match(cliLaunch.command, /-C '/);
+  assert.doesNotMatch(cliLaunch.command, /\bresume\b/);
   assert.equal(cliLaunch.dry_run, true);
   assert.equal(cliLaunch.launcher.file, "cmd.exe");
   assert.match(cliLaunch.launcher.args.join(" "), /start powershell\.exe/);

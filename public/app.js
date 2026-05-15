@@ -18,6 +18,7 @@ const i18n = {
     groupName: "群组名称",
     groupNamePlaceholder: "功能开发群",
     createGroup: "创建群组",
+    deleteGroup: "删除群组",
     groupTasks: "群组任务",
     groupAgents: "群组成员",
     selectedGroup: "当前群组",
@@ -116,6 +117,7 @@ const i18n = {
     commandPlaceholder: "gemini --acp",
     usePresetCommand: "套用推荐命令",
     createAgent: "创建 Agent",
+    agentCreated: "Agent 创建成功",
     agents: "Agents",
     agentsHint: "当前群组内启动、停止、删除",
     unassigned: "未分配",
@@ -124,11 +126,14 @@ const i18n = {
     noEvents: "还没有房间事件",
     selectTask: "选择或创建一个任务",
     start: "启动",
+    openCli: "打开 CLI",
     stop: "停止",
     delete: "删除",
     idle: "空闲",
     confirmDeleteAgent: "确定删除这个 agent 吗？",
     confirmDeleteTask: "确定删除这个任务和 transcript 吗？",
+    confirmDeleteGroup: "确定删除这个群组、其中的任务和 agent 吗？",
+    defaultGroupProtected: "默认群组不能删除",
     role_work: "执行",
     role_observe: "观察",
     role_debug: "调试",
@@ -201,6 +206,7 @@ const i18n = {
     groupName: "Group Name",
     groupNamePlaceholder: "Feature crew",
     createGroup: "Create Group",
+    deleteGroup: "Delete Group",
     groupTasks: "Group Tasks",
     groupAgents: "Group Agents",
     selectedGroup: "Current Group",
@@ -299,6 +305,7 @@ const i18n = {
     commandPlaceholder: "gemini --acp",
     usePresetCommand: "Use Preset Command",
     createAgent: "Create Agent",
+    agentCreated: "Agent created",
     agents: "Agents",
     agentsHint: "Start, stop, and delete inside this group",
     unassigned: "Unassigned",
@@ -307,11 +314,14 @@ const i18n = {
     noEvents: "No room events yet",
     selectTask: "Select or create a task",
     start: "Start",
+    openCli: "Open CLI",
     stop: "Stop",
     delete: "Delete",
     idle: "Idle",
     confirmDeleteAgent: "Delete this agent?",
     confirmDeleteTask: "Delete this task and transcript?",
+    confirmDeleteGroup: "Delete this group, including its tasks and agents?",
+    defaultGroupProtected: "The default group cannot be deleted",
     role_work: "Work",
     role_observe: "Observe",
     role_debug: "Debug",
@@ -413,6 +423,7 @@ const t = (key) => i18n[state.lang]?.[key] || i18n.en[key] || key;
 const PROVIDERS = ["codex", "gemini", "kimi", "mock", "custom"];
 const HANDOFF_TRIGGERS = ["manual", "blocked", "ready_for_review", "owner_change", "done"];
 const PROCESS_BUNDLE_TYPES = new Set(["tool_call_summary", "decision_record", "handoff_note", "system_event", "status_change"]);
+let toastTimer = null;
 
 function syncRouteFromHash() {
   const agentMatch = window.location.hash.match(/^#\/agents\/([^/?#]+)/);
@@ -456,6 +467,16 @@ function closeAgentConsole() {
   state.replayData = null;
   history.pushState("", document.title, window.location.pathname + window.location.search);
   render();
+}
+
+function showToast(message) {
+  const toast = qs("#toast");
+  toast.textContent = message;
+  toast.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.classList.add("hidden");
+  }, 5000);
 }
 
 async function api(path, options = {}) {
@@ -551,6 +572,10 @@ function renderWorktreeBadge(agent) {
   return ` <span class="worktree-pill ${className}">${escapeHtml(status)}</span>`;
 }
 
+function canOpenAgentCli(agent) {
+  return Boolean(agent?.command || ["codex", "gemini", "kimi"].includes(agent?.provider));
+}
+
 async function loadMeta() {
   state.meta = await api("/api/meta");
   qs("#workspacePath").textContent = state.meta.root;
@@ -576,9 +601,9 @@ async function loadMeta() {
   );
   const form = qs("#agentForm");
   form.elements.cwd.value = state.meta.root;
-  form.elements.mode.value = "mock";
+  form.elements.mode.value = "exec";
   form.elements.isolation_mode.value = "shared";
-  form.elements.provider.value = "mock";
+  form.elements.provider.value = "codex";
   form.elements.command.value = recommendedCommand();
 }
 
@@ -715,9 +740,9 @@ function renderMetaSelects() {
   }
   const form = qs("#agentForm");
   const role = form.elements.role.value || "work";
-  const mode = form.elements.mode.value || "mock";
+  const mode = form.elements.mode.value || "exec";
   const isolationMode = form.elements.isolation_mode.value || "shared";
-  const provider = form.elements.provider.value || "mock";
+  const provider = form.elements.provider.value || "codex";
   const status = qs("#taskStatusSelect").value || state.selectedTask?.status || "todo";
   fillSelect(
     form.elements.role,
@@ -761,13 +786,20 @@ function renderGroups() {
       const agents = state.agents.filter(
         (agent) => agent.workspace_id === group.workspace_id && agent.group_id === group.group_id
       );
+      const isDefaultGroup = group.group_id === state.meta?.defaultGroupId;
+      const activeTaskCount = tasks.filter((task) => task.status !== "done").length;
       return `
         <article class="group-item ${group.group_id === state.selectedGroupId ? "active" : ""}" data-group-id="${escapeHtml(group.group_id)}">
           <div class="group-main">
             <div class="group-title">${escapeHtml(group.name)}</div>
             <div class="group-meta">${escapeHtml(agents.length)} ${escapeHtml(t("agentsUnit"))} · ${escapeHtml(tasks.length)} ${escapeHtml(t("tasksUnit"))}</div>
           </div>
-          <span class="group-badge">${escapeHtml(tasks.filter((task) => task.status !== "done").length)}</span>
+          <div class="group-side">
+            <span class="group-badge">${escapeHtml(activeTaskCount)}</span>
+            <button class="icon-text danger-text" type="button" data-group-delete="${escapeHtml(group.group_id)}" ${
+              isDefaultGroup ? "disabled" : ""
+            } title="${escapeHtml(isDefaultGroup ? t("defaultGroupProtected") : t("deleteGroup"))}">${escapeHtml(t("delete"))}</button>
+          </div>
         </article>`;
     })
     .join("");
@@ -958,7 +990,7 @@ function renderAgents() {
         <article class="agent-row ${agent.id === state.agentConsoleId ? "active" : ""}" data-agent-open="${escapeHtml(agent.id)}">
           <div class="agent-summary">
             <div class="agent-name"><span class="status-dot ${statusClass(agent.status)}"></span>${escapeHtml(agent.name)}</div>
-            <div class="agent-meta">${escapeHtml(labelFor("role", agent.role))} · ${escapeHtml(labelFor("mode", agent.mode || "mock"))}</div>
+            <div class="agent-meta">${escapeHtml(labelFor("role", agent.role))} · ${escapeHtml(labelFor("provider", agent.provider || "custom"))} · ${escapeHtml(labelFor("mode", agent.mode || "mock"))}</div>
             <div class="agent-meta">${escapeHtml(t("isolation"))}: ${escapeHtml(labelFor("isolation", agent.isolation_mode || "shared"))}${renderWorktreeBadge(agent)}</div>
             <div class="agent-meta">${escapeHtml(t("health"))}: <span class="health-pill ${healthClass(agent.health?.status)}">${escapeHtml(labelFor("health", agent.health?.status || "stopped"))}</span></div>
             <div class="agent-meta">${escapeHtml(t("currentTask"))}: ${escapeHtml(agent.current_task_id || t("noCurrentTask"))}</div>
@@ -966,6 +998,7 @@ function renderAgents() {
           </div>
           <div class="agent-actions">
             <button type="button" data-agent-start="${escapeHtml(agent.id)}">${escapeHtml(t("start"))}</button>
+            <button type="button" class="ghost-button" data-agent-cli="${escapeHtml(agent.id)}" ${canOpenAgentCli(agent) ? "" : "disabled"}>${escapeHtml(t("openCli"))}</button>
             <button type="button" class="ghost-button" data-agent-stop="${escapeHtml(agent.id)}">${escapeHtml(t("stop"))}</button>
             <button type="button" class="danger-button" data-agent-delete="${escapeHtml(agent.id)}">${escapeHtml(t("delete"))}</button>
           </div>
@@ -1253,6 +1286,7 @@ function renderAgentConsole() {
     ? `${labelFor("role", agent.role)} · ${labelFor("mode", agent.mode || "mock")} · ${agent.id}`
     : t("noAgentSelected");
   qs("#consoleStartButton").disabled = !agent;
+  qs("#consoleCliButton").disabled = !agent || !canOpenAgentCli(agent);
   qs("#consoleStopButton").disabled = !agent;
   qs("#consoleDeleteButton").disabled = !agent;
   qs("#consoleSummary").innerHTML = agent ? renderConsoleSummary(detail, agent) : `<div class="empty-state">${escapeHtml(t("noAgentSelected"))}</div>`;
@@ -1295,6 +1329,7 @@ function renderConsoleSummary(detail, agent) {
     [t("worktree"), agent.worktree?.path ? `${agent.worktree.status || "ready"}${agent.worktree.dirty ? ` · ${t("worktreeDirty")}` : ""}` : ""],
     [t("provider"), agent.provider || ""],
     [t("currentTask"), currentTask?.title || agent.current_task_id || t("noCurrentTask")],
+    [t("command"), agent.command || ""],
     [t("launchDetail"), detail?.session?.last_launch_detail || ""],
     [t("exitCode"), detail?.session?.last_exit_code ?? ""],
     [t("lastError"), detail?.session?.last_error || ""]
@@ -1694,6 +1729,17 @@ function quoteShell(value) {
   return `"${String(value || "").replaceAll('"', '\\"')}"`;
 }
 
+function internalAgentScriptPath(scriptName) {
+  const root = (state.meta?.root || ".").replace(/[\\/]+$/, "");
+  const separator = root.includes("\\") ? "\\" : "/";
+  return `${root}${separator}scripts${separator}${scriptName}`;
+}
+
+function internalNodeCommand(scriptName, args = "") {
+  const suffix = String(args || "").trim();
+  return `node ${quoteShell(internalAgentScriptPath(scriptName))}${suffix ? ` ${suffix}` : ""}`;
+}
+
 function recommendedCommand() {
   const form = qs("#agentForm");
   const name = form.elements.name.value.trim() || "new-agent";
@@ -1712,18 +1758,24 @@ function recommendedCommand() {
     if (provider === "custom") {
       return "";
     }
-    return `node scripts/mock-acp-agent.js --name ${quoteShell(name)}`;
+    return internalNodeCommand("mock-acp-agent.js", `--name ${quoteShell(name)}`);
   }
   if (mode === "exec") {
     if (provider === "custom") {
       return "";
     }
     if (provider === "codex") {
-      return `node scripts/codex-agent.js --name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`;
+      return internalNodeCommand(
+        "codex-agent.js",
+        `--name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`
+      );
     }
-    return `node scripts/codex-agent.js --name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`;
+    return internalNodeCommand(
+      "codex-agent.js",
+      `--name ${quoteShell(name)} --mode exec --cwd ${quoteShell(cwd)}`
+    );
   }
-  return `node scripts/mock-agent.js --role ${role} --name ${quoteShell(name)}`;
+  return internalNodeCommand("mock-agent.js", `--role ${role} --name ${quoteShell(name)}`);
 }
 
 function syncProviderDefaults() {
@@ -1767,6 +1819,7 @@ function syncCommandPreset() {
 
 function resetLauncherDefaults(form) {
   form.elements.name.value = "new-agent";
+  form.elements.mode.value = "exec";
   form.elements.isolation_mode.value = "shared";
   if (form.elements.provider.value === "custom") {
     return;
@@ -1786,6 +1839,15 @@ function resetLauncherDefaults(form) {
 async function startAgent(agentId) {
   try {
     await api(`/api/agents/${agentId}/start`, { method: "POST", body: "{}" });
+  } catch (error) {
+    alert(error.message);
+  }
+  await loadState();
+}
+
+async function openAgentCli(agentId) {
+  try {
+    await api(`/api/agents/${agentId}/cli`, { method: "POST", body: "{}" });
   } catch (error) {
     alert(error.message);
   }
@@ -1957,6 +2019,35 @@ async function deleteTask(taskId) {
   await loadState(false);
 }
 
+async function deleteGroup(groupId) {
+  if (!state.selectedWorkspaceId || !groupId) {
+    return;
+  }
+  const group = state.groups.find(
+    (candidate) => candidate.workspace_id === state.selectedWorkspaceId && candidate.group_id === groupId
+  );
+  if (group?.group_id === state.meta?.defaultGroupId) {
+    alert(t("defaultGroupProtected"));
+    return;
+  }
+  if (!confirm(t("confirmDeleteGroup"))) {
+    return;
+  }
+  await api(`/api/groups/${encodeURIComponent(state.selectedWorkspaceId)}/${encodeURIComponent(groupId)}`, {
+    method: "DELETE"
+  });
+  if (state.selectedGroupId === groupId) {
+    state.selectedGroupId = null;
+    state.selectedTaskId = null;
+    state.agentConsoleId = null;
+    state.handoffRulesOpen = false;
+    state.replayOpen = false;
+    window.location.hash = "";
+    localStorage.removeItem("tendrilflow.groupId");
+  }
+  await loadState(false);
+}
+
 async function saveHandoffRules(rules) {
   if (!state.selectedWorkspaceId || !state.selectedGroupId) {
     return;
@@ -2010,6 +2101,12 @@ function bindEvents() {
   });
 
   qs("#groupList").addEventListener("click", async (event) => {
+    const remove = event.target.closest("[data-group-delete]");
+    if (remove) {
+      event.stopPropagation();
+      await deleteGroup(remove.dataset.groupDelete);
+      return;
+    }
     const card = event.target.closest("[data-group-id]");
     if (!card) {
       return;
@@ -2039,7 +2136,10 @@ function bindEvents() {
     syncModeForProvider();
     syncCommandPreset();
   });
-  qs('#agentForm input[name="cwd"]').addEventListener("change", () => {
+  qs('#agentForm input[name="name"]').addEventListener("input", () => {
+    syncCommandPreset();
+  });
+  qs('#agentForm input[name="cwd"]').addEventListener("input", () => {
     syncCommandPreset();
   });
 
@@ -2074,11 +2174,17 @@ function bindEvents() {
 
   qs("#agentList").addEventListener("click", async (event) => {
     const start = event.target.closest("[data-agent-start]");
+    const cli = event.target.closest("[data-agent-cli]");
     const stop = event.target.closest("[data-agent-stop]");
     const remove = event.target.closest("[data-agent-delete]");
     if (start) {
       event.stopPropagation();
       await startAgent(start.dataset.agentStart);
+      return;
+    }
+    if (cli) {
+      event.stopPropagation();
+      await openAgentCli(cli.dataset.agentCli);
       return;
     }
     if (stop) {
@@ -2103,7 +2209,8 @@ function bindEvents() {
     const payload = Object.fromEntries(form.entries());
     payload.workspace_id = state.selectedWorkspaceId;
     payload.group_id = state.selectedGroupId;
-    await api("/api/agents", { method: "POST", body: JSON.stringify(payload) });
+    const data = await api("/api/agents", { method: "POST", body: JSON.stringify(payload) });
+    showToast(`${t("agentCreated")}: ${data.agent?.name || payload.name}`);
     resetLauncherDefaults(event.currentTarget);
     await loadState();
   });
@@ -2290,6 +2397,11 @@ function bindEvents() {
   qs("#consoleStartButton").addEventListener("click", async () => {
     if (state.agentConsoleId) {
       await startAgent(state.agentConsoleId);
+    }
+  });
+  qs("#consoleCliButton").addEventListener("click", async () => {
+    if (state.agentConsoleId) {
+      await openAgentCli(state.agentConsoleId);
     }
   });
   qs("#consoleStopButton").addEventListener("click", async () => {

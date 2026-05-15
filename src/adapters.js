@@ -335,5 +335,6 @@ function createAdapterSession(agent, callbacks) {
 module.exports = {
   AcpSession,
   LegacyCliSession,
-  createAdapterSession
+  createAdapterSession,
+  parseEnv
 };

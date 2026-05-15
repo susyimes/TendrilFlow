@@ -118,7 +118,7 @@ test("HTTP API supports launcher mode and delete actions", async (t) => {
       group_id: groupResponse.group.group_id,
       mode: "exec",
       provider: "codex",
-      command: "",
+      command: "node scripts/mock-agent.js --name api-worker",
       cwd: process.cwd()
     })
   }).then((response) => response.json());
@@ -127,6 +127,19 @@ test("HTTP API supports launcher mode and delete actions", async (t) => {
   assert.equal(agentResponse.agent.workspace_id, workspaceResponse.workspace.workspace_id);
   assert.equal(agentResponse.agent.group_id, groupResponse.group.group_id);
   assert.equal(agentResponse.agent.transport, "legacy_cli");
+
+  const cliLaunch = await fetch(`${baseUrl}/api/agents/${agentResponse.agent.id}/cli`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ dry_run: true, platform: "win32" })
+  }).then((response) => response.json());
+
+  assert.equal(cliLaunch.agent_id, agentResponse.agent.id);
+  assert.match(cliLaunch.command, /^codex resume --include-non-interactive/);
+  assert.match(cliLaunch.command, /-C '/);
+  assert.equal(cliLaunch.dry_run, true);
+  assert.equal(cliLaunch.launcher.file, "cmd.exe");
+  assert.match(cliLaunch.launcher.args.join(" "), /start powershell\.exe/);
 
   const taskResponse = await fetch(`${baseUrl}/api/tasks`, {
     method: "POST",
@@ -148,6 +161,60 @@ test("HTTP API supports launcher mode and delete actions", async (t) => {
     method: "DELETE"
   }).then((response) => response.json());
   assert.equal(deletedTask.deleted, true);
+});
+
+test("HTTP API deletes groups and contained tasks and agents", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const workspaceResponse = await fetch(`${baseUrl}/api/workspaces`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Delete Group Workspace" })
+  }).then((response) => response.json());
+
+  const groupResponse = await fetch(`${baseUrl}/api/groups`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Delete Me", workspace_id: workspaceResponse.workspace.workspace_id })
+  }).then((response) => response.json());
+
+  const agentResponse = await fetch(`${baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "delete-group-worker",
+      role: "work",
+      workspace_id: workspaceResponse.workspace.workspace_id,
+      group_id: groupResponse.group.group_id,
+      mode: "mock",
+      provider: "mock",
+      command: "",
+      cwd: process.cwd()
+    })
+  }).then((response) => response.json());
+
+  const taskResponse = await fetch(`${baseUrl}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "Deleted with group",
+      workspace_id: workspaceResponse.workspace.workspace_id,
+      group_id: groupResponse.group.group_id,
+      owner_agent_id: agentResponse.agent.id
+    })
+  }).then((response) => response.json());
+
+  const deletedGroup = await fetch(
+    `${baseUrl}/api/groups/${workspaceResponse.workspace.workspace_id}/${groupResponse.group.group_id}`,
+    { method: "DELETE" }
+  ).then((response) => response.json());
+  const state = await fetch(`${baseUrl}/api/state`).then((response) => response.json());
+
+  assert.equal(deletedGroup.deleted, true);
+  assert.ok(!state.groups.some((group) => group.group_id === groupResponse.group.group_id));
+  assert.ok(!state.agents.some((agent) => agent.id === agentResponse.agent.id));
+  assert.ok(!state.tasks.some((task) => task.task_id === taskResponse.task.task_id));
 });
 
 test("HTTP API supports group handoff rule canvas data", async (t) => {

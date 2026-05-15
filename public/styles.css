@@ -136,6 +136,23 @@ h2 {
   white-space: nowrap;
 }
 
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 20;
+  max-width: min(360px, calc(100vw - 36px));
+  padding: 12px 14px;
+  border: 1px solid #b7ddd3;
+  border-radius: 8px;
+  background: #effaf6;
+  color: var(--accent-strong);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
 .language-control span {
   color: var(--muted);
   font-size: 12px;
@@ -549,6 +566,12 @@ body.inspector-collapsed .inspector {
 }
 
 .task-side {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
+.group-side {
   display: grid;
   justify-items: end;
   gap: 8px;

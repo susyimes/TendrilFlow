@@ -149,6 +149,21 @@ test("stores launcher configuration including provider, command, cwd, and mode",
   assert.equal(agent.base_cwd, root);
 });
 
+test("keeps internal adapter command name aligned with the agent name", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const agent = await orchestrator.createAgent({
+    name: "unicorn",
+    role: "work",
+    mode: "exec",
+    provider: "codex",
+    cwd: root,
+    command: `node scripts/codex-agent.js --name "new-agent" --mode exec --cwd "${root}"`
+  });
+
+  assert.match(agent.command, /--name "unicorn"/);
+  assert.doesNotMatch(agent.command, /--name "new-agent"/);
+});
+
 test("records per-agent session logs for console inspection", async () => {
   const { orchestrator } = await makeOrchestrator();
   const review = await createTestAgent(orchestrator, {
@@ -170,6 +185,163 @@ test("records per-agent session logs for console inspection", async () => {
   assert.ok(logs.some((event) => event.type === "process_started"));
   assert.ok(logs.some((event) => event.task_id === task.task_id));
   assert.ok(logs.every((event) => event.agent_id === review.id));
+});
+
+test("prepares a visible CLI launcher for an agent command", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, {
+    name: "cli-worker",
+    command: "node scripts/mock-agent.js --role work --name cli-worker"
+  });
+
+  const launch = await orchestrator.openAgentCli(worker.id, { dry_run: true, platform: "win32" });
+  const logs = await orchestrator.store.readAgentLogs(worker.id);
+  const scriptPath = path.join(root, "scripts", "mock-agent.js");
+
+  assert.equal(launch.agent_id, worker.id);
+  assert.equal(launch.command, `node "${scriptPath}" --role work --name cli-worker`);
+  assert.equal(launch.cwd, root);
+  assert.equal(launch.dry_run, true);
+  assert.equal(launch.launcher.file, "cmd.exe");
+  assert.match(launch.launcher.args.join(" "), /start powershell\.exe/);
+  assert.match(launch.launcher.args.join(" "), /-NoExit/);
+  assert.ok(logs.some((event) => event.type === "cli_launch" && event.content.dry_run === true));
+});
+
+test("starts internal agent scripts from TendrilFlow root when agent cwd is external", async (t) => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const scriptsDir = path.join(root, "scripts");
+  const scriptPath = path.join(scriptsDir, "mock-agent.js");
+  const externalCwd = path.join(root, "external-project");
+  await fs.mkdir(scriptsDir, { recursive: true });
+  await fs.mkdir(externalCwd, { recursive: true });
+  await fs.writeFile(scriptPath, "setInterval(() => {}, 1000);\n", "utf8");
+  const worker = await createTestAgent(orchestrator, {
+    name: "external-cwd-worker",
+    cwd: externalCwd,
+    command: "node scripts/mock-agent.js --role work --name external-cwd-worker"
+  });
+  t.after(async () => {
+    await orchestrator.stopAgent(worker.id).catch(() => undefined);
+  });
+
+  const started = await orchestrator.startAgent(worker.id);
+  let startedLog = null;
+  for (let attempt = 0; attempt < 10 && !startedLog; attempt += 1) {
+    const logs = await orchestrator.store.readAgentLogs(worker.id);
+    startedLog = logs.find((event) => event.type === "process_started") || null;
+    if (!startedLog) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  assert.equal(started.status, "running");
+  assert.equal(startedLog.content.command, `node "${scriptPath}" --role work --name external-cwd-worker`);
+  assert.equal(startedLog.content.cwd, externalCwd);
+});
+
+test("opens Codex agents through codex resume instead of the adapter wrapper", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, {
+    name: "codex-worker",
+    provider: "codex",
+    mode: "exec",
+    command: `node scripts/codex-agent.js --name "codex-worker" --mode exec --cwd "${root}" --sandbox workspace-write --search`
+  });
+
+  const launch = await orchestrator.openAgentCli(worker.id, { dry_run: true, platform: "win32" });
+
+  assert.match(launch.command, /^codex resume --include-non-interactive/);
+  assert.match(launch.command, /-C '.*tendrilflow-/i);
+  assert.match(launch.command, /--sandbox 'workspace-write'/);
+  assert.match(launch.command, /--search/);
+  assert.doesNotMatch(launch.command, /codex-agent\.js/);
+});
+
+test("opens ACP provider CLIs without protocol adapter arguments", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const gemini = await createTestAgent(orchestrator, {
+    name: "gemini-planner",
+    provider: "gemini",
+    mode: "acp",
+    command: "gemini --acp"
+  });
+  const kimi = await createTestAgent(orchestrator, {
+    name: "kimi-reviewer",
+    provider: "kimi",
+    mode: "acp",
+    command: "kimi acp"
+  });
+
+  const geminiLaunch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
+  const kimiLaunch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+
+  assert.equal(geminiLaunch.command, "gemini");
+  assert.equal(kimiLaunch.command, "kimi");
+});
+
+test("opens separate Codex resume sessions for agents sharing one workspace", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const sessionsDir = path.join(root, "codex-sessions");
+  orchestrator.codexSessionsDir = () => sessionsDir;
+  await fs.mkdir(path.join(sessionsDir, "2026", "05", "14"), { recursive: true });
+  await fs.writeFile(
+    path.join(sessionsDir, "2026", "05", "14", "host.jsonl"),
+    [
+      JSON.stringify({
+        type: "session_meta",
+        payload: { id: "session-host", cwd: root, source: "exec", base_instructions: { text: "x".repeat(5000) } }
+      }),
+      JSON.stringify({ type: "message", payload: { text: "Current agent: host-agent (agent_host_test)" } })
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(sessionsDir, "2026", "05", "14", "qoo.jsonl"),
+    [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-qoo", cwd: root, source: "exec" } }),
+      JSON.stringify({ type: "message", payload: { text: "Current agent: qoo (agent_qoo_test)" } })
+    ].join("\n"),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(sessionsDir, "2026", "05", "14", "desktop.jsonl"),
+    [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-desktop", cwd: root, source: "vscode" } }),
+      JSON.stringify({
+        type: "message",
+        payload: { text: "Debug transcript mentions host-agent (agent_host_test) and qoo (agent_qoo_test)." }
+      })
+    ].join("\n"),
+    "utf8"
+  );
+  const host = await createTestAgent(orchestrator, {
+    id: "agent_host_test",
+    name: "host-agent",
+    provider: "codex",
+    mode: "exec",
+    command: `node scripts/codex-agent.js --name "host-agent" --mode exec --cwd "${root}"`
+  });
+  const qoo = await createTestAgent(orchestrator, {
+    id: "agent_qoo_test",
+    name: "qoo",
+    provider: "codex",
+    mode: "exec",
+    command: `node scripts/codex-agent.js --name "qoo" --mode exec --cwd "${root}"`
+  });
+
+  const hostLaunch = await orchestrator.openAgentCli(host.id, { dry_run: true, platform: "win32" });
+  const qooLaunch = await orchestrator.openAgentCli(qoo.id, { dry_run: true, platform: "win32" });
+  const savedHost = await orchestrator.store.getAgent(host.id);
+  const savedQoo = await orchestrator.store.getAgent(qoo.id);
+
+  assert.equal(hostLaunch.codex_session_id, "session-host");
+  assert.equal(qooLaunch.codex_session_id, "session-qoo");
+  assert.match(hostLaunch.command, /'session-host'$/);
+  assert.match(qooLaunch.command, /'session-qoo'$/);
+  assert.notEqual(hostLaunch.command, qooLaunch.command);
+  assert.equal(savedHost.codex_session_id, "session-host");
+  assert.equal(savedQoo.codex_session_id, "session-qoo");
 });
 
 test("worktree isolation prepares an agent-specific git worktree and injects it into context", async () => {

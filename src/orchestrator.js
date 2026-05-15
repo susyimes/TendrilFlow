@@ -1,11 +1,12 @@
 const path = require("node:path");
 const fs = require("node:fs/promises");
-const { execFile } = require("node:child_process");
+const os = require("node:os");
+const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
-const { createAdapterSession } = require("./adapters");
+const { createAdapterSession, parseEnv } = require("./adapters");
 const { mapAcpUpdateToEvent } = require("./acpMapping");
 const { FileStore } = require("./storage");
-const { makeId, normalizeStatus, nowIso, slugify } = require("./model");
+const { DEFAULT_GROUP_ID, makeId, normalizeStatus, nowIso, slugify } = require("./model");
 const { HOST_DEFAULT_PLAYBOOK, buildCommunicationExecutionProtocol } = require("./protocol");
 
 const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -14,6 +15,185 @@ const execFileAsync = promisify(execFile);
 
 function quoteShell(value) {
   return `"${String(value || "").replaceAll('"', '\\"')}"`;
+}
+
+const INTERNAL_AGENT_SCRIPTS = ["codex-agent.js", "mock-agent.js", "mock-acp-agent.js"];
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function internalAgentScriptPath(rootDir, scriptName) {
+  return path.join(rootDir, "scripts", scriptName);
+}
+
+function internalNodeCommand(rootDir, scriptName, args = "") {
+  const suffix = String(args || "").trim();
+  return `node ${quoteShell(internalAgentScriptPath(rootDir, scriptName))}${suffix ? ` ${suffix}` : ""}`;
+}
+
+function absolutizeInternalAgentCommand(command, rootDir) {
+  let next = String(command || "");
+  for (const scriptName of INTERNAL_AGENT_SCRIPTS) {
+    const escaped = escapeRegExp(scriptName);
+    const pattern = new RegExp(
+      `\\b(node(?:\\.exe)?)\\s+(?:"(?:\\.[\\\\/])?scripts[\\\\/]${escaped}"|'(?:\\.[\\\\/])?scripts[\\\\/]${escaped}'|(?:\\.[\\\\/])?scripts[\\\\/]${escaped})`,
+      "gi"
+    );
+    next = next.replace(pattern, (_match, nodeCommand) => {
+      return `${nodeCommand} ${quoteShell(internalAgentScriptPath(rootDir, scriptName))}`;
+    });
+  }
+  return next;
+}
+
+function hasInternalAgentScript(command) {
+  return INTERNAL_AGENT_SCRIPTS.some((scriptName) => {
+    const pattern = new RegExp(`(?:^|[\\\\/"'\\s])${escapeRegExp(scriptName)}(?:$|["'\\s])`, "i");
+    return pattern.test(String(command || ""));
+  });
+}
+
+function syncInternalAgentCommandName(command, name) {
+  if (!command || !name || !hasInternalAgentScript(command)) {
+    return command;
+  }
+  const replacement = quoteShell(name);
+  const optionPattern = /(^|\s)(--name(?:=|\s+))("[^"]*"|'[^']*'|\S+)/;
+  const match = command.match(optionPattern);
+  if (match) {
+    const currentName = match[3].replace(/^"([^"]*)"$/, "$1").replace(/^'([^']*)'$/, "$1");
+    if (currentName === name) {
+      return command;
+    }
+    return command.replace(optionPattern, (_match, prefix, option) => `${prefix}${option}${replacement}`);
+  }
+  return `${command} --name ${replacement}`;
+}
+
+function quotePowerShellLiteral(value) {
+  return `'${String(value || "").replaceAll("'", "''")}'`;
+}
+
+function powerShellExecutable(value) {
+  const command = String(value || "").trim();
+  if (/^[a-zA-Z0-9_.-]+$/.test(command)) {
+    return command;
+  }
+  return `& ${quotePowerShellLiteral(command)}`;
+}
+
+function quotePosix(value) {
+  return `'${String(value || "").replaceAll("'", "'\\''")}'`;
+}
+
+function shellOptionValue(command, name) {
+  const pattern = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`);
+  const match = String(command || "").match(pattern);
+  return match ? match[1] ?? match[2] ?? match[3] ?? "" : "";
+}
+
+function shellHasFlag(command, name) {
+  return new RegExp(`(?:^|\\s)--${name}(?:\\s|$)`).test(String(command || ""));
+}
+
+function isCodexCliAgent(agent) {
+  return agent.provider === "codex" || /\bcodex-agent\.js\b/i.test(String(agent.command || ""));
+}
+
+function interactiveAcpCommandForAgent(agent) {
+  const provider = String(agent.provider || "").toLowerCase();
+  const configuredCommand = String(agent.command || "").trim();
+  const env = parseEnv(agent.env);
+  if (provider === "gemini") {
+    return (env.TENDRILFLOW_GEMINI_COMMAND || configuredCommand.replace(/(^|\s)--acp(?=\s|$)/g, " ").trim() || "gemini").trim();
+  }
+  if (provider === "kimi") {
+    return (env.TENDRILFLOW_KIMI_COMMAND || configuredCommand.replace(/(^|\s)acp(?=\s|$)/g, " ").trim() || "kimi").trim();
+  }
+  return configuredCommand;
+}
+
+function cliCommandForAgent(agent, cwd, sessionId = "") {
+  if (isCodexCliAgent(agent)) {
+    return codexResumeCommandForAgent(agent, cwd, sessionId);
+  }
+  if (agent.mode === "acp") {
+    return interactiveAcpCommandForAgent(agent);
+  }
+  return String(agent.command || "").trim();
+}
+
+function codexResumeCommandForAgent(agent, cwd, sessionId = "") {
+  const env = parseEnv(agent.env);
+  const configuredCommand = String(agent.command || "");
+  const codexCommand = shellOptionValue(configuredCommand, "codex-command") || env.TENDRILFLOW_CODEX_COMMAND || "codex";
+  const sandbox = shellOptionValue(configuredCommand, "sandbox") || env.TENDRILFLOW_CODEX_SANDBOX || "";
+  const model = shellOptionValue(configuredCommand, "model") || env.TENDRILFLOW_CODEX_MODEL || "";
+  const enableSearch = shellHasFlag(configuredCommand, "search") || env.TENDRILFLOW_CODEX_SEARCH === "1";
+  const args = ["resume", "--include-non-interactive", "-C", quotePowerShellLiteral(cwd)];
+  if (sandbox) {
+    args.push("--sandbox", quotePowerShellLiteral(sandbox));
+  }
+  if (model) {
+    args.push("--model", quotePowerShellLiteral(model));
+  }
+  if (enableSearch) {
+    args.push("--search");
+  }
+  if (sessionId) {
+    args.push(quotePowerShellLiteral(sessionId));
+  }
+  return `${powerShellExecutable(codexCommand)} ${args.join(" ")}`;
+}
+
+function terminalLauncherFor(command, cwd, platform = process.platform, env = process.env) {
+  if (platform === "win32") {
+    const encodedCommand = Buffer.from(`Set-Location -LiteralPath ${quotePowerShellLiteral(cwd)}; ${command}`, "utf16le").toString(
+      "base64"
+    );
+    return {
+      platform,
+      file: "cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/c",
+        [
+          "start",
+          "powershell.exe",
+          "-NoExit",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-EncodedCommand",
+          encodedCommand
+        ].join(" ")
+      ]
+    };
+  }
+
+  if (platform === "darwin") {
+    const script = `cd ${quotePosix(cwd)}; ${command}`;
+    return {
+      platform,
+      file: "osascript",
+      args: [
+        "-e",
+        'tell application "Terminal" to activate',
+        "-e",
+        `tell application "Terminal" to do script ${JSON.stringify(script)}`
+      ]
+    };
+  }
+
+  const shell = env.SHELL || "bash";
+  const terminal = env.TERMINAL || "x-terminal-emulator";
+  return {
+    platform,
+    file: terminal,
+    args: ["-e", "sh", "-lc", `cd ${quotePosix(cwd)}; ${command}; exec ${quotePosix(shell)}`]
+  };
 }
 
 function eventText(event) {
@@ -146,6 +326,25 @@ class Orchestrator {
     return this.store.createGroup(input);
   }
 
+  async deleteGroup(workspaceId, groupId) {
+    await this.init();
+    const group = await this.store.getGroup(workspaceId, groupId);
+    if (!group) {
+      return false;
+    }
+    if (groupId === DEFAULT_GROUP_ID) {
+      throw new Error("Default group cannot be deleted.");
+    }
+
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === workspaceId && agent.group_id === groupId
+    );
+    for (const agent of agents) {
+      await this.deleteAgent(agent.id);
+    }
+    return this.store.deleteGroup(workspaceId, groupId);
+  }
+
   async handoffPolicy(workspaceId, groupId) {
     await this.init();
     const group = await this.store.getGroup(workspaceId, groupId);
@@ -230,7 +429,15 @@ class Orchestrator {
 
   async createAgent(input) {
     await this.init();
-    return this.store.upsertAgent(input);
+    return this.store.upsertAgent({
+      ...input,
+      command: syncInternalAgentCommandName(input.command, input.name)
+    });
+  }
+
+  agentWithResolvedInternalCommand(agent) {
+    const command = absolutizeInternalAgentCommand(agent.command, this.rootDir);
+    return command === agent.command ? agent : { ...agent, command };
   }
 
   async deleteAgent(agentId) {
@@ -553,8 +760,159 @@ class Orchestrator {
     });
   }
 
+  codexSessionsDir() {
+    return path.join(os.homedir(), ".codex", "sessions");
+  }
+
+  async listCodexSessionFiles(dir = this.codexSessionsDir()) {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error) => {
+      if (error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    });
+    const files = [];
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...(await this.listCodexSessionFiles(fullPath)));
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        files.push(fullPath);
+      }
+    }
+    return files;
+  }
+
+  async codexSessionMeta(filePath) {
+    const handle = await fs.open(filePath, "r");
+    try {
+      const chunks = [];
+      const buffer = Buffer.alloc(4096);
+      let position = 0;
+      while (true) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (!bytesRead) {
+          break;
+        }
+        const chunk = buffer.subarray(0, bytesRead);
+        const newlineIndex = chunk.indexOf(10);
+        chunks.push(Buffer.from(newlineIndex >= 0 ? chunk.subarray(0, newlineIndex) : chunk));
+        if (newlineIndex >= 0) {
+          break;
+        }
+        position += bytesRead;
+      }
+      const firstLine = Buffer.concat(chunks).toString("utf8");
+      const meta = JSON.parse(firstLine || "{}");
+      const stat = await fs.stat(filePath);
+      return {
+        ...(meta.payload || {}),
+        path: filePath,
+        last_write_ms: stat.mtimeMs
+      };
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  async findCodexSessionForAgent(agent) {
+    const targetCwd = path.resolve(agent.cwd || this.rootDir).toLowerCase();
+    const idMarker = `(${agent.id})`;
+    const files = await this.listCodexSessionFiles();
+    const candidates = [];
+    for (const filePath of files) {
+      const meta = await this.codexSessionMeta(filePath).catch(() => null);
+      if (!meta?.id || !meta.cwd || path.resolve(meta.cwd).toLowerCase() !== targetCwd) {
+        continue;
+      }
+      if (meta.source !== "exec") {
+        continue;
+      }
+      const raw = await fs.readFile(filePath, "utf8").catch(() => "");
+      if (!raw.includes(idMarker)) {
+        continue;
+      }
+      candidates.push(meta);
+    }
+    return candidates.sort((a, b) => (b.last_write_ms || 0) - (a.last_write_ms || 0))[0] || null;
+  }
+
+  async codexSessionIdForAgent(agent) {
+    if (agent.codex_session_id) {
+      return agent.codex_session_id;
+    }
+    const session = await this.findCodexSessionForAgent(agent);
+    if (!session?.id) {
+      return "";
+    }
+    await this.store.patchAgent(agent.id, {
+      codex_session_id: session.id,
+      codex_session_path: session.path
+    });
+    return session.id;
+  }
+
+  async openAgentCli(agentId, input = {}) {
+    let agent = await this.requireAgent(agentId);
+    agent = this.agentWithResolvedInternalCommand(agent);
+    if (agent.isolation_mode === "worktree") {
+      agent = await this.ensureAgentWorktree(agent);
+    }
+
+    const codexSessionId = isCodexCliAgent(agent) ? await this.codexSessionIdForAgent(agent) : "";
+    const command = cliCommandForAgent(agent, path.resolve(agent.cwd || this.rootDir), codexSessionId);
+    if (!command) {
+      throw new Error(`Agent ${agentId} has no CLI command configured.`);
+    }
+
+    const dryRun = Boolean(input.dry_run || input.dryRun);
+    const cwd = path.resolve(agent.cwd || this.rootDir);
+    const launcher = terminalLauncherFor(command, cwd, dryRun && input.platform ? input.platform : process.platform);
+    let pid = null;
+
+    if (!dryRun) {
+      const child = spawn(launcher.file, launcher.args, {
+        cwd,
+        env: { ...process.env, ...parseEnv(agent.env) },
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false
+      });
+      child.unref();
+      pid = child.pid || null;
+    }
+
+    await this.store.appendAgentLog(agent, {
+      type: "cli_launch",
+      content: {
+        text: dryRun ? `Prepared CLI launcher for ${command}.` : `Opened CLI terminal for ${command}.`,
+        command,
+        codex_session_id: codexSessionId || null,
+        cwd,
+        launcher: `${launcher.file} ${launcher.args.join(" ")}`,
+        dry_run: dryRun,
+        pid
+      }
+    });
+
+    return {
+      agent_id: agent.id,
+      command,
+      codex_session_id: codexSessionId || null,
+      cwd,
+      dry_run: dryRun,
+      pid,
+      launcher: {
+        platform: launcher.platform,
+        file: launcher.file,
+        args: launcher.args
+      }
+    };
+  }
+
   async startAgent(agentId) {
     let agent = await this.requireAgent(agentId);
+    agent = this.agentWithResolvedInternalCommand(agent);
     const existing = this.sessions.get(agentId);
     if (existing) {
       await this.store.appendAgentLog(agent, {
@@ -1854,12 +2212,16 @@ class Orchestrator {
       if (spec.provider === "kimi") {
         return "kimi acp";
       }
-      return `node scripts/mock-acp-agent.js --name ${quoteShell(spec.name)}`;
+      return internalNodeCommand(this.rootDir, "mock-acp-agent.js", `--name ${quoteShell(spec.name)}`);
     }
     if (spec.provider === "codex" || spec.mode === "exec") {
-      return `node scripts/codex-agent.js --name ${quoteShell(spec.name)} --mode exec --cwd ${quoteShell(cwd)}`;
+      return internalNodeCommand(
+        this.rootDir,
+        "codex-agent.js",
+        `--name ${quoteShell(spec.name)} --mode exec --cwd ${quoteShell(cwd)}`
+      );
     }
-    return `node scripts/mock-agent.js --role ${spec.role} --name ${quoteShell(spec.name)}`;
+    return internalNodeCommand(this.rootDir, "mock-agent.js", `--role ${spec.role} --name ${quoteShell(spec.name)}`);
   }
 
   async maybeCreateAgentFromHostCommand(task, hostAgent, message) {

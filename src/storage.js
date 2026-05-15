@@ -987,6 +987,26 @@ class FileStore {
     return group;
   }
 
+  safeGroupDir(workspaceId, groupId) {
+    const groupsRoot = path.resolve(this.groupsDir(workspaceId));
+    const groupRoot = path.resolve(this.groupDir(workspaceId, groupId));
+    const relative = path.relative(groupsRoot, groupRoot);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`Invalid group id: ${groupId}`);
+    }
+    return groupRoot;
+  }
+
+  async deleteGroup(workspaceId, groupId) {
+    const groupRoot = this.safeGroupDir(workspaceId, groupId);
+    const group = await this.readJson(path.join(groupRoot, "group.json"), null).catch(() => null);
+    if (!group) {
+      return false;
+    }
+    await fs.rm(groupRoot, { recursive: true, force: true });
+    return true;
+  }
+
   async readGroupMemory(workspaceId, groupId) {
     await this.ensureGroupMemory(workspaceId, groupId);
     const memory = {};
@@ -1252,6 +1272,8 @@ class FileStore {
       base_cwd: path.resolve(input.base_cwd || existing?.base_cwd || input.cwd || this.rootDir),
       isolation_mode: normalizeIsolationMode(input.isolation_mode || existing?.isolation_mode),
       worktree: input.worktree !== undefined ? input.worktree : existing?.worktree || null,
+      codex_session_id: input.codex_session_id || existing?.codex_session_id || null,
+      codex_session_path: input.codex_session_path || existing?.codex_session_path || null,
       command: input.command?.trim() || "",
       env: normalizeEnv(input.env),
       status: existing?.status || "stopped",

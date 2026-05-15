@@ -123,6 +123,13 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const groupRoute = pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)$/);
+      if (groupRoute && req.method === "DELETE") {
+        const [, workspaceId, groupId] = groupRoute.map(decodeURIComponent);
+        sendJson(res, 200, { deleted: await orchestrator.deleteGroup(workspaceId, groupId) });
+        return;
+      }
+
       const handoffPolicyRoute = pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/handoff-rules$/);
       if (handoffPolicyRoute && req.method === "GET") {
         const [, workspaceId, groupId] = handoffPolicyRoute.map(decodeURIComponent);
@@ -199,6 +206,12 @@ function createHttpServer(orchestrator) {
       const agentLogsRoute = pathname.match(/^\/api\/agents\/([^/]+)\/logs$/);
       if (agentLogsRoute && req.method === "GET") {
         sendJson(res, 200, { logs: await orchestrator.agentLogs(agentLogsRoute[1], Number(url.searchParams.get("limit") || 200)) });
+        return;
+      }
+
+      const agentCliRoute = pathname.match(/^\/api\/agents\/([^/]+)\/cli$/);
+      if (agentCliRoute && req.method === "POST") {
+        sendJson(res, 200, await orchestrator.openAgentCli(agentCliRoute[1], await readJson(req)));
         return;
       }
 

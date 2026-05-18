@@ -62,7 +62,7 @@ TendrilFlow Core stays narrow: it provides the communication layer, control plan
 
 ## Skill Layer
 
-The first skill layer is file-first, not a full low-code agent builder. TendrilFlow creates editable workspace and group skill files such as `workspace.context`, `host.playbook`, `host.task_graph`, `host.route_to_agent`, `host.control`, `host.handoff_policy`, `review.evidence_check`, `debug.recovery`, and `work.execution_report`.
+The first skill layer is file-first, not a full low-code agent builder. TendrilFlow creates editable workspace and group skill files such as `workspace.context`, `host.playbook`, `host.task_graph`, `host.route_to_agent`, `group.route_to_agent`, `host.control`, `host.handoff_policy`, `review.evidence_check`, `debug.recovery`, and `work.execution_report`.
 
 When a task is sent to an agent, TendrilFlow injects matching skill summaries and file paths based on the agent role. The actual capability still belongs to each agent's own tools, skills, model, adapter, and repository instructions.
 
@@ -106,7 +106,7 @@ When work moves from one agent to another, TendrilFlow should create a handoff c
 
 Default handoff rules are owned by the Host Agent handoff skill. Users should not design system workflow rules in the task sidebar. Custom handoff rules belong in a group-level Handoff Rules Canvas that edits Host skill state: agents are nodes, and custom agent-to-agent handoff paths are edges.
 
-From the product perspective, the system should not secretly forward or decide. The Host Agent calls its own tools, such as `host.route_to_agent`, `host.create_agent`, `host.update_handoff_rules`, and `host.create_handoff`; TendrilFlow Core only carries the communication primitive, persists the state, and renders the auditable trace.
+From the product perspective, the system should not secretly forward or decide. The Host Agent calls its own tools, such as `host.route_to_agent`, `host.create_agent`, `host.update_handoff_rules`, and `host.create_handoff`; agents can use the explicit `group.route_to_agent` tool when visible user or Host intent authorizes it. TendrilFlow Core only carries the communication primitive, persists state, enforces permission/dedupe/max-hop guards, and renders the auditable trace.
 
 ## Agent Communication And Execution Protocol
 

@@ -1,4 +1,8 @@
 const PROTOCOL_VERSION = "tendrilflow.communication_execution.v1";
+const GROUP_ROUTE_PROTOCOL = "tendrilflow.group_route.v1";
+const GROUP_ROUTE_TOOL_ID = "group.route_to_agent";
+const HOST_ROUTE_TOOL_ID = "host.route_to_agent";
+const GROUP_ROUTE_MAX_HOPS = 2;
 const HOST_DEFAULT_PLAYBOOK = ["plan", "clarify", "execute", "verify", "fix", "finalize"];
 
 const ROLE_FOCUS = {
@@ -39,6 +43,31 @@ const ROLE_FOCUS = {
 
 function roleFocusFor(agent = {}) {
   return ROLE_FOCUS[agent.role] || ROLE_FOCUS.work;
+}
+
+function buildGroupRouteToolContract(options = {}) {
+  const heading = options.heading || "Available TendrilFlow tools:";
+  return [
+    heading,
+    `- ${GROUP_ROUTE_TOOL_ID}: ask another visible group member to respond in the Agent Room when you decide their help is needed.`,
+    "- This is a communication tool only; it does not replace your own model, tools, skills, or repository instructions.",
+    "- Use it only from visible user intent, Host intent, or an authorized delegation shown in the transcript.",
+    "- Plain natural-language @mentions in agent output are visible text only and never invoke the tool.",
+    "",
+    `${GROUP_ROUTE_TOOL_ID} invocation:`,
+    "```tendrilflow.route",
+    '{"to":"agent name","message":"specific request","reason":"visible user or Host authorization","expect_response":true}',
+    "```",
+    "",
+    "Core-enforced route guards:",
+    `- Protocol: ${GROUP_ROUTE_PROTOCOL}.`,
+    "- Permission gate: non-Host agents can route only to a target authorized by visible user or Host delegation intent.",
+    "- Dedupe gate: the same authorized source, target, and message is delivered at most once.",
+    `- Default hop limit: a route chain stops after ${GROUP_ROUTE_MAX_HOPS} hop(s).`,
+    "- Bounded visible route rules may authorize a specific finite max hop count for that rule.",
+    "- Visible transcript: route requests, deliveries, blocks, and results are recorded as room events and tool summaries.",
+    "- Loop guard: agent prose, summaries, or route results do not trigger new routes unless a fresh authorized tool request is emitted."
+  ].join("\n");
 }
 
 function buildCommunicationExecutionProtocol(agent = {}) {
@@ -92,13 +121,20 @@ function buildCommunicationExecutionProtocol(agent = {}) {
     "- Host Agent may use host.stop_agents and host.broadcast_instruction when the visible room intent requires it.",
     "- Stop and broadcast are communication/safety primitives; they do not replace each agent's own tools or skills.",
     "",
+    buildGroupRouteToolContract(),
+    "",
     ...roleFocusFor(agent)
   ].join("\n");
 }
 
 module.exports = {
+  GROUP_ROUTE_MAX_HOPS,
+  GROUP_ROUTE_PROTOCOL,
+  GROUP_ROUTE_TOOL_ID,
+  HOST_ROUTE_TOOL_ID,
   HOST_DEFAULT_PLAYBOOK,
   PROTOCOL_VERSION,
+  buildGroupRouteToolContract,
   buildCommunicationExecutionProtocol,
   roleFocusFor
 };

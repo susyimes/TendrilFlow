@@ -11,6 +11,7 @@ const {
   nowIso,
   slugify
 } = require("./model");
+const { GROUP_ROUTE_TOOL_ID, HOST_ROUTE_TOOL_ID, buildGroupRouteToolContract } = require("./protocol");
 const { redactForStorage } = require("./safety");
 
 const MEMORY_FILES = {
@@ -82,7 +83,7 @@ const DEFAULT_GROUP_SKILLS = [
     ].join("\n")
   },
   {
-    skill_id: "host.route_to_agent",
+    skill_id: HOST_ROUTE_TOOL_ID,
     scope: "group",
     roles: ["host"],
     title: "Host Route To Agent",
@@ -96,8 +97,25 @@ const DEFAULT_GROUP_SKILLS = [
       "- Route only from explicit user or Host intent.",
       "- Include current task context, recent room trace, and the exact request.",
       "- Ask the target agent to answer in the shared Agent Room.",
+      "- Emit or trigger the explicit host.route_to_agent tool call; do not rely on prose implying that routing happened.",
       "- Do not route based on another agent's natural-language output.",
-      "- Avoid repeated routes that could create loop storms."
+      "- Avoid repeated routes that could create loop storms.",
+      "- TendrilFlow records the tool call, route delivery, and target response in the visible transcript."
+    ].join("\n")
+  },
+  {
+    skill_id: GROUP_ROUTE_TOOL_ID,
+    scope: "group",
+    roles: ["*"],
+    title: "Group Route To Agent",
+    summary:
+      "Use the explicit group.route_to_agent tool when visible user or Host intent authorizes asking another member to respond.",
+    body: [
+      "# Group Route To Agent",
+      "",
+      "Use this skill when you decide another group member should be asked for help inside the visible Agent Room.",
+      "",
+      buildGroupRouteToolContract({ heading: "Tool contract:" })
     ].join("\n")
   },
   {

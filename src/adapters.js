@@ -50,10 +50,16 @@ class LegacyCliSession {
     this.usesTurnQueue = usesTurnCompletionMarkers(agent.command);
     this.activeTurn = null;
     this.pendingTurns = [];
+    this.eventQueue = Promise.resolve();
+  }
+
+  enqueueEvent(callback) {
+    this.eventQueue = this.eventQueue.then(callback, callback).catch(() => undefined);
+    return this.eventQueue;
   }
 
   emitSessionEvent(event) {
-    this.callbacks.onSessionEvent?.(this.agent.id, event);
+    return this.enqueueEvent(() => this.callbacks.onSessionEvent?.(this.agent.id, event));
   }
 
   async start() {
@@ -106,40 +112,44 @@ class LegacyCliSession {
     reader.on("line", (line) => {
       const taskId = this.usesTurnQueue ? this.activeTurn?.task_id || null : this.currentTaskId;
       if (line.trim()) {
-        this.emitSessionEvent({
+        const sessionEvent = {
           type: channel,
           task_id: taskId,
           content: { text: line }
+        };
+        const taskEvent =
+          channel === "stderr"
+            ? {
+                type: "tool_call_summary",
+                actor: { kind: "agent", id: this.agent.id },
+                content: { title: "stderr", text: line }
+              }
+            : {
+                type: "agent_message",
+                actor: { kind: "agent", id: this.agent.id },
+                content: { text: line, source: "legacy_cli" }
+              };
+        this.enqueueEvent(async () => {
+          await this.callbacks.onSessionEvent?.(this.agent.id, sessionEvent);
+          if (/^TENDRILFLOW_PROVIDER_SESSION_ID=\S+$/i.test(line.trim())) {
+            return;
+          }
+          if (this.usesTurnQueue && isTurnLifecycleLine(line)) {
+            if (isTurnCompletionLine(line)) {
+              this.advanceTurn();
+            }
+            return;
+          }
+          if (!taskId) {
+            return;
+          }
+          await this.callbacks.onTaskEvent?.(taskId, taskEvent);
         });
+        return;
       }
       if (!line.trim()) {
         return;
       }
-      if (this.usesTurnQueue && isTurnLifecycleLine(line)) {
-        if (isTurnCompletionLine(line)) {
-          this.advanceTurn();
-        }
-        return;
-      }
-      if (!taskId) {
-        return;
-      }
-      if (/^TENDRILFLOW_PROVIDER_SESSION_ID=\S+$/i.test(line.trim())) {
-        return;
-      }
-      const event =
-        channel === "stderr"
-          ? {
-              type: "tool_call_summary",
-              actor: { kind: "agent", id: this.agent.id },
-              content: { title: "stderr", text: line }
-            }
-          : {
-              type: "agent_message",
-              actor: { kind: "agent", id: this.agent.id },
-              content: { text: line, source: "legacy_cli" }
-            };
-      this.callbacks.onTaskEvent?.(taskId, event);
     });
   }
 

@@ -225,7 +225,7 @@ Skill Layer 的目的不是把 TendrilFlow 做成低代码 agent builder，而�
 - Workspace skills：`.tendrilflow/workspaces/{workspace_id}/skills/`
 - Group skills：`.tendrilflow/workspaces/{workspace_id}/groups/{group_id}/skills/`
 
-默认会创建 `workspace.context`、`host.playbook`、`host.task_graph`、`host.route_to_agent`、`host.control`、`host.handoff_policy`、`review.evidence_check`、`debug.recovery` 和 `work.execution_report` 等 skill 文件。
+默认会创建 `workspace.context`、`host.playbook`、`host.task_graph`、`host.route_to_agent`、`group.route_to_agent`、`host.control`、`host.handoff_policy`、`review.evidence_check`、`debug.recovery` 和 `work.execution_report` 等 skill 文件。
 
 当 TendrilFlow 把任务发送给 agent 时，会根据当前 agent 的 role 匹配 skill 摘要，并把 skill id、摘要和文件路径注入任务上下文。实际执行能力仍然属于 agent 自己的 tools、skills、模型和 adapter；TendrilFlow Core 只负责保存、暴露和注入这些协作契约。
 
@@ -435,6 +435,7 @@ Agent 应能围绕方案和风险进行讨论。
 从产品语义上，这不是 Orchestrator 替用户转发，而是 Host Agent 调用内部 skill/tool：
 
 - `host.route_to_agent`：把当前任务上下文、群主要求和可见 transcript 发送给目标 agent，让目标 agent 在群里回复。
+- `group.route_to_agent`：作为 init/context 中显式暴露给 agent 的群聊通信工具；agent 可在可见用户或 Host 授权下自行决定是否调用，Core 继续执行权限、去重、最大 hop 和可见 transcript 护栏。
 - `host.create_agent`：根据用户要求创建新的群组成员。
 - `host.update_handoff_rules`：调整 Host handoff skill 的规则状态。
 - `host.create_handoff`：后续用于生成正式交接卡并切换 owner。

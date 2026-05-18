@@ -22,12 +22,34 @@ function parseEnv(env) {
     }, {});
 }
 
+function usesTurnCompletionMarkers(command) {
+  return /\b(?:codex-agent|provider-agent)\.js\b/i.test(String(command || ""));
+}
+
+function isTurnLifecycleLine(line) {
+  const value = String(line || "").trim();
+  return (
+    /^TENDRILFLOW_PROVIDER_SESSION_ID=\S+$/i.test(value) ||
+    /^[^:]+ ready as (?:(?:codex|claude|gemini|kimi)\s+)?CLI adapter \([^)]+\)\.$/i.test(value) ||
+    /^[^:]+:\s+starting\s+(?:codex exec|(?:claude|gemini|kimi)\s+headless turn)\.$/i.test(value) ||
+    /^[^:]+:\s+(?:codex exec exited with code|(?:claude|gemini|kimi)\s+headless turn (?:completed|exited with code\b))/i.test(value)
+  );
+}
+
+function isTurnCompletionLine(line) {
+  const value = String(line || "").trim();
+  return /^[^:]+:\s+(?:codex exec exited with code|(?:claude|gemini|kimi)\s+headless turn (?:completed|exited with code\b))/i.test(value);
+}
+
 class LegacyCliSession {
   constructor(agent, callbacks) {
     this.agent = agent;
     this.callbacks = callbacks;
     this.process = null;
     this.currentTaskId = null;
+    this.usesTurnQueue = usesTurnCompletionMarkers(agent.command);
+    this.activeTurn = null;
+    this.pendingTurns = [];
   }
 
   emitSessionEvent(event) {
@@ -82,14 +104,27 @@ class LegacyCliSession {
       this.callbacks.onError?.(this.agent.id, error);
     });
     reader.on("line", (line) => {
+      const taskId = this.usesTurnQueue ? this.activeTurn?.task_id || null : this.currentTaskId;
       if (line.trim()) {
         this.emitSessionEvent({
           type: channel,
-          task_id: this.currentTaskId,
+          task_id: taskId,
           content: { text: line }
         });
       }
-      if (!this.currentTaskId || !line.trim()) {
+      if (!line.trim()) {
+        return;
+      }
+      if (this.usesTurnQueue && isTurnLifecycleLine(line)) {
+        if (isTurnCompletionLine(line)) {
+          this.advanceTurn();
+        }
+        return;
+      }
+      if (!taskId) {
+        return;
+      }
+      if (/^TENDRILFLOW_PROVIDER_SESSION_ID=\S+$/i.test(line.trim())) {
         return;
       }
       const event =
@@ -104,14 +139,41 @@ class LegacyCliSession {
               actor: { kind: "agent", id: this.agent.id },
               content: { text: line, source: "legacy_cli" }
             };
-      this.callbacks.onTaskEvent?.(this.currentTaskId, event);
+      this.callbacks.onTaskEvent?.(taskId, event);
     });
   }
 
+  activateNextTurn() {
+    if (this.activeTurn || !this.pendingTurns.length) {
+      return;
+    }
+    this.activeTurn = this.pendingTurns.shift();
+    this.currentTaskId = this.activeTurn.task_id;
+  }
+
+  advanceTurn() {
+    this.activeTurn = null;
+    this.currentTaskId = null;
+    this.activateNextTurn();
+  }
+
   async sendMessage(task, text) {
-    this.currentTaskId = task.task_id;
+    if (this.usesTurnQueue) {
+      this.pendingTurns.push({ task_id: task.task_id });
+      this.activateNextTurn();
+    } else {
+      this.currentTaskId = task.task_id;
+    }
     const line = `${text.replace(/\r?\n/g, " ")}\n`;
     if (!this.writeLine(line)) {
+      if (this.usesTurnQueue) {
+        const index = this.pendingTurns.findIndex((turn) => turn.task_id === task.task_id);
+        if (index >= 0) {
+          this.pendingTurns.splice(index, 1);
+        } else if (this.activeTurn?.task_id === task.task_id) {
+          this.advanceTurn();
+        }
+      }
       return false;
     }
     this.emitSessionEvent({
@@ -119,6 +181,20 @@ class LegacyCliSession {
       task_id: task.task_id,
       content: { text: line.trim() }
     });
+    return true;
+  }
+
+  writeSessionLine(line) {
+    if (this.usesTurnQueue) {
+      this.pendingTurns.push({ task_id: null, session_only: true });
+      this.activateNextTurn();
+    }
+    if (!this.writeLine(line)) {
+      if (this.usesTurnQueue && this.activeTurn?.session_only) {
+        this.advanceTurn();
+      }
+      return false;
+    }
     return true;
   }
 
@@ -139,6 +215,9 @@ class LegacyCliSession {
     if (this.process && !this.process.killed) {
       this.process.kill();
     }
+    this.activeTurn = null;
+    this.pendingTurns = [];
+    this.currentTaskId = null;
   }
 }
 
@@ -300,9 +379,21 @@ class AcpSession {
 
   async sendMessage(task, text) {
     this.currentTaskId = task.task_id;
-    await this.waitForSessionReady();
+    const env = parseEnv(this.agent.env);
+    const timeoutMs = Number(env.TENDRILFLOW_ACP_SESSION_READY_TIMEOUT_MS || 1500);
+    const sessionId = await this.waitForSessionReady(timeoutMs);
+    if (!sessionId) {
+      this.emitSessionEvent({
+        type: "error",
+        task_id: task.task_id,
+        content: {
+          text: "ACP session was not ready; prompt was not sent."
+        }
+      });
+      return false;
+    }
     return this.sendRpc("prompt", {
-      sessionId: this.sessionId,
+      sessionId,
       prompt: text
     });
   }

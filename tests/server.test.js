@@ -68,6 +68,36 @@ test("HTTP API supports the core task room flow", async (t) => {
   assert.equal(applied.parent_task.child_task_ids.length, applied.tasks.length);
 });
 
+test("HTTP API supports group chat before any task exists", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const workspaceResponse = await fetch(`${baseUrl}/api/workspaces`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Group Chat Workspace" })
+  }).then((response) => response.json());
+  const groupResponse = await fetch(`${baseUrl}/api/groups`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "No Task Chat", workspace_id: workspaceResponse.workspace.workspace_id })
+  }).then((response) => response.json());
+
+  const groupPath = `/api/groups/${encodeURIComponent(workspaceResponse.workspace.workspace_id)}/${encodeURIComponent(groupResponse.group.group_id)}`;
+  const posted = await fetch(`${baseUrl}${groupPath}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "不用任务也先聊一句" })
+  }).then((response) => response.json());
+  const room = await fetch(`${baseUrl}${groupPath}/room`).then((response) => response.json());
+  const state = await fetch(`${baseUrl}/api/state`).then((response) => response.json());
+
+  assert.equal(posted.events.length, 1);
+  assert.equal(room.events[0].content.text, "不用任务也先聊一句");
+  assert.ok(room.room_path.endsWith("events.jsonl"));
+  assert.ok(!state.tasks.some((task) => task.workspace_id === workspaceResponse.workspace.workspace_id && task.group_id === groupResponse.group.group_id));
+});
+
 test("static file serving blocks encoded path traversal", async (t) => {
   const { baseUrl, server } = await startTestServer();
   t.after(() => server.close());

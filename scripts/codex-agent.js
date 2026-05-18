@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 const readline = require("node:readline");
 
 const args = process.argv.slice(2);
@@ -65,6 +67,86 @@ function drainQueue() {
   });
 }
 
+function quoteCmdArg(value) {
+  const text = String(value || "");
+  if (text && !/[\s&()^=;!'+,`~|<>"]/u.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/"/g, "'")}"`;
+}
+
+function windowsCommandLine(command, commandArgs) {
+  return [command, ...commandArgs].map(quoteCmdArg).join(" ");
+}
+
+function isExecutableFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch (_error) {
+    return false;
+  }
+}
+
+function resolveWindowsCommand(command) {
+  if (process.platform !== "win32") {
+    return { file: command, argsPrefix: [] };
+  }
+  const raw = String(command || "").trim();
+  if (!raw) {
+    return { file: command, argsPrefix: [] };
+  }
+  const hasPath = /[\\/]/u.test(raw);
+  const ext = path.extname(raw).toLowerCase();
+  if (hasPath && ext === ".exe" && isExecutableFile(raw)) {
+    return { file: raw, argsPrefix: [] };
+  }
+  if (hasPath && [".cmd", ".bat"].includes(ext) && isExecutableFile(raw)) {
+    return { file: "cmd.exe", argsPrefix: ["/d", "/c", raw] };
+  }
+  if (hasPath && isExecutableFile(raw)) {
+    return { file: raw, argsPrefix: [] };
+  }
+
+  const pathDirs = String(process.env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  const baseNames = ext ? [raw] : [raw, `${raw}.exe`, `${raw}.cmd`, `${raw}.bat`, `${raw}.com`];
+  const candidates = [];
+  for (const dir of pathDirs) {
+    for (const base of baseNames) {
+      candidates.push(path.join(dir, base));
+    }
+  }
+  const sorted = candidates.sort((a, b) => {
+    const priority = (candidate) => {
+      const candidateExt = path.extname(candidate).toLowerCase();
+      if (candidateExt === ".exe") return 0;
+      if (candidateExt === ".cmd") return 1;
+      if (candidateExt === ".bat") return 2;
+      if (candidateExt === ".com") return 3;
+      return 4;
+    };
+    return priority(a) - priority(b);
+  });
+  const found = sorted.find(isExecutableFile);
+  if (!found) {
+    return { file: raw, argsPrefix: [] };
+  }
+  const foundExt = path.extname(found).toLowerCase();
+  if ([".cmd", ".bat"].includes(foundExt)) {
+    return { file: "cmd.exe", argsPrefix: ["/d", "/c", found] };
+  }
+  return { file: found, argsPrefix: [] };
+}
+
+function codexLaunch(command, commandArgs) {
+  if (process.platform === "win32") {
+    return { file: "cmd.exe", args: ["/d", "/c", windowsCommandLine(command, commandArgs)] };
+  }
+  const resolved = resolveWindowsCommand(command);
+  return { file: resolved.file, args: [...resolved.argsPrefix, ...commandArgs] };
+}
+
 async function runPrompt(prompt) {
   if (mode !== "exec") {
     console.log(
@@ -80,19 +162,21 @@ async function runPrompt(prompt) {
   if (enableSearch) {
     execArgs.push("--search");
   }
-  execArgs.push(prompt);
+  execArgs.push("-");
 
   console.log(`${name}: starting codex exec.`);
   await new Promise((resolve) => {
-    const child = spawn(codexCommand, execArgs, {
+    const launch = codexLaunch(codexCommand, execArgs);
+    const child = spawn(launch.file, launch.args, {
       cwd,
       env: process.env,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     });
     activeChild = child;
 
+    child.stdin.end(`${prompt}\n`);
     child.stdout.on("data", (chunk) => process.stdout.write(chunk));
     child.stderr.on("data", (chunk) => process.stderr.write(chunk));
     child.on("error", (error) => {

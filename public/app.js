@@ -22,6 +22,8 @@ const i18n = {
     groupTasks: "群组任务",
     groupAgents: "群组成员",
     selectedGroup: "当前群组",
+    groupChat: "群聊",
+    groupChatHint: "没有任务时也可以先在群聊里讨论；创建任务后可继续沉淀执行过程",
     agentsUnit: "成员",
     tasksUnit: "任务",
     noGroups: "还没有群组",
@@ -115,7 +117,7 @@ const i18n = {
     provider_mock: "Mock 测试",
     provider_custom: "Custom",
     command: "启动命令",
-    commandPlaceholder: "gemini --acp",
+    commandPlaceholder: "gemini",
     usePresetCommand: "套用推荐命令",
     createAgent: "创建 Agent",
     agentCreated: "Agent 创建成功",
@@ -214,6 +216,8 @@ const i18n = {
     groupTasks: "Group Tasks",
     groupAgents: "Group Agents",
     selectedGroup: "Current Group",
+    groupChat: "Group chat",
+    groupChatHint: "You can talk in the group before creating a task; task rooms remain available for execution trace.",
     agentsUnit: "agents",
     tasksUnit: "tasks",
     noGroups: "No groups yet",
@@ -307,7 +311,7 @@ const i18n = {
     provider_mock: "Mock/Test",
     provider_custom: "Custom",
     command: "Command",
-    commandPlaceholder: "gemini --acp",
+    commandPlaceholder: "gemini",
     usePresetCommand: "Use Preset Command",
     createAgent: "Create Agent",
     agentCreated: "Agent created",
@@ -395,6 +399,7 @@ const state = {
   selectedGroupId: localStorage.getItem("tendrilflow.groupId") || null,
   selectedTaskId: null,
   selectedTask: null,
+  groupRoom: null,
   events: [],
   handoffRulesOpen: false,
   handoffPolicy: null,
@@ -649,11 +654,21 @@ async function loadState(keepTask = true) {
 async function loadSelectedTask() {
   if (!state.selectedTaskId) {
     state.selectedTask = null;
-    state.events = [];
+    if (state.selectedWorkspaceId && state.selectedGroupId) {
+      const data = await api(
+        `/api/groups/${encodeURIComponent(state.selectedWorkspaceId)}/${encodeURIComponent(state.selectedGroupId)}/room?limit=300`
+      ).catch(() => null);
+      state.groupRoom = data || null;
+      state.events = data?.events || [];
+    } else {
+      state.groupRoom = null;
+      state.events = [];
+    }
     return;
   }
   const data = await api(`/api/tasks/${state.selectedTaskId}`);
   state.selectedTask = data.task;
+  state.groupRoom = null;
   state.events = data.events;
 }
 
@@ -864,10 +879,18 @@ function renderTaskMeta(task) {
 
 function renderRoom() {
   const task = state.selectedTask;
-  qs("#roomTitle").textContent = task ? task.title : t("agentRoom");
+  const group = currentGroup();
+  const roomKey = task
+    ? task.task_id
+    : group
+      ? `group:${state.selectedWorkspaceId}:${state.selectedGroupId}`
+      : null;
+  qs("#roomTitle").textContent = task ? task.title : group ? `${group.name} · ${t("agentRoom")}` : t("agentRoom");
   qs("#roomMeta").textContent = task
     ? `${t("roomOwner")}: ${agentName(task.owner_agent_id)} · ${t("roomPath")}: ${task.room_path}`
-    : t("selectTask");
+    : group
+      ? `${t("groupChat")}: ${group.name} · ${t("roomPath")}: ${state.groupRoom?.room_path || ""}`
+      : t("selectTask");
   qs("#taskStatusSelect").disabled = !task;
   qs("#taskOwnerSelect").disabled = !task;
   qs("#finalReportButton").disabled = !task;
@@ -877,7 +900,7 @@ function renderRoom() {
   qs("#ownerContinueButton").disabled = !task || !task.owner_agent_id;
   qs("#taskStatusSelect").value = task?.status || "todo";
   qs("#taskOwnerSelect").value = task?.owner_agent_id || "";
-  qs("#nextActionText").textContent = task ? t(`next_${task.status}`) : t("selectTask");
+  qs("#nextActionText").textContent = task ? t(`next_${task.status}`) : group ? t("groupChatHint") : t("selectTask");
   qs("#focusOwnerText").textContent = task
     ? `${t("owner")}: ${agentName(task.owner_agent_id)}`
     : "";
@@ -886,17 +909,17 @@ function renderRoom() {
     button.disabled = !task;
   });
   qsa("#messageForm textarea, #messageForm button").forEach((node) => {
-    node.disabled = !task;
+    node.disabled = !task && !group;
   });
 
   const stream = qs("#eventStream");
   const previousTaskId = state.lastRenderedTaskId;
   const previousEventId = state.lastRenderedEventId;
   const nextEventId = state.events.at(-1)?.event_id || null;
-  const taskChanged = previousTaskId !== (task?.task_id || null);
+  const taskChanged = previousTaskId !== roomKey;
   const eventChanged = previousEventId !== nextEventId;
   const oldScrollTop = stream.scrollTop;
-  if (!task) {
+  if (!roomKey) {
     stream.innerHTML = `<div class="empty-state">${escapeHtml(t("selectTask"))}</div>`;
     state.lastRenderedTaskId = null;
     state.lastRenderedEventId = null;
@@ -904,7 +927,7 @@ function renderRoom() {
   }
   if (!state.events.length) {
     stream.innerHTML = `<div class="empty-state">${escapeHtml(t("noEvents"))}</div>`;
-    state.lastRenderedTaskId = task.task_id;
+    state.lastRenderedTaskId = roomKey;
     state.lastRenderedEventId = null;
     return;
   }
@@ -915,7 +938,7 @@ function renderRoom() {
     stream.scrollTop = oldScrollTop;
   }
   state.shouldStickToBottom = false;
-  state.lastRenderedTaskId = task.task_id;
+  state.lastRenderedTaskId = roomKey;
   state.lastRenderedEventId = nextEventId;
 }
 
@@ -1772,6 +1795,18 @@ function recommendedCommand() {
     if (provider === "custom") {
       return "";
     }
+    if (provider === "gemini") {
+      return internalNodeCommand(
+        "provider-agent.js",
+        `--provider "gemini" --name ${quoteShell(name)} --cwd ${quoteShell(cwd)}`
+      );
+    }
+    if (provider === "kimi") {
+      return internalNodeCommand(
+        "provider-agent.js",
+        `--provider "kimi" --name ${quoteShell(name)} --cwd ${quoteShell(cwd)}`
+      );
+    }
     if (provider === "codex") {
       return internalNodeCommand(
         "codex-agent.js",
@@ -1779,7 +1814,10 @@ function recommendedCommand() {
       );
     }
     if (provider === "claude") {
-      return `claude --name ${quoteShell(name)}`;
+      return internalNodeCommand(
+        "provider-agent.js",
+        `--provider "claude" --name ${quoteShell(name)} --cwd ${quoteShell(cwd)}`
+      );
     }
     return internalNodeCommand(
       "codex-agent.js",
@@ -1800,7 +1838,7 @@ function syncProviderDefaults() {
       form.elements.provider.value = "gemini";
     }
   } else if (form.elements.mode.value === "exec") {
-    if (!["codex", "claude"].includes(provider)) {
+    if (!["codex", "claude", "gemini", "kimi"].includes(provider)) {
       form.elements.provider.value = "codex";
     }
   } else if (provider !== "mock") {
@@ -1811,9 +1849,7 @@ function syncProviderDefaults() {
 function syncModeForProvider() {
   const form = qs("#agentForm");
   const provider = form.elements.provider.value;
-  if (provider === "gemini" || provider === "kimi") {
-    form.elements.mode.value = "acp";
-  } else if (provider === "codex" || provider === "claude") {
+  if (["codex", "claude", "gemini", "kimi"].includes(provider)) {
     form.elements.mode.value = "exec";
   } else if (provider === "mock") {
     form.elements.mode.value = "mock";
@@ -1871,10 +1907,18 @@ async function stopAgent(agentId) {
 }
 
 async function sendRoomMessage(text) {
-  if (!state.selectedTaskId || !text.trim()) {
+  if (!text.trim()) {
     return;
   }
-  await api(`/api/tasks/${state.selectedTaskId}/messages`, {
+  const endpoint = state.selectedTaskId
+    ? `/api/tasks/${state.selectedTaskId}/messages`
+    : state.selectedWorkspaceId && state.selectedGroupId
+      ? `/api/groups/${encodeURIComponent(state.selectedWorkspaceId)}/${encodeURIComponent(state.selectedGroupId)}/messages`
+      : null;
+  if (!endpoint) {
+    return;
+  }
+  await api(endpoint, {
     method: "POST",
     body: JSON.stringify({ text })
   });
@@ -2320,9 +2364,6 @@ function bindEvents() {
 
   qs("#messageForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.selectedTaskId) {
-      return;
-    }
     const textarea = qs('#messageForm textarea[name="text"]');
     await sendRoomMessage(textarea.value);
     textarea.value = "";

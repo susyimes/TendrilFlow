@@ -142,6 +142,21 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const groupRoomRoute = pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/room$/);
+      if (groupRoomRoute && req.method === "GET") {
+        const [, workspaceId, groupId] = groupRoomRoute.map(decodeURIComponent);
+        sendJson(res, 200, await orchestrator.groupRoom(workspaceId, groupId, { limit: Number(url.searchParams.get("limit") || 0) }));
+        return;
+      }
+
+      const groupMessageRoute = pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/messages$/);
+      if (groupMessageRoute && req.method === "POST") {
+        const [, workspaceId, groupId] = groupMessageRoute.map(decodeURIComponent);
+        const body = await readJson(req);
+        sendJson(res, 201, await orchestrator.postGroupMessage(workspaceId, groupId, body.text || ""));
+        return;
+      }
+
       if (pathname === "/api/skills" && req.method === "GET") {
         sendJson(res, 200, {
           skills: await orchestrator.listSkills({

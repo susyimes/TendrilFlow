@@ -1232,7 +1232,10 @@ body.inspector-collapsed .inspector {
 .agent-list {
   display: grid;
   gap: 8px;
-  max-height: 360px;
+  align-content: start;
+  grid-auto-rows: max-content;
+  min-height: 0;
+  max-height: none;
   padding: 10px;
 }
 

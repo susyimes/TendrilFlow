@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
-const { execFile } = require("node:child_process");
+const crypto = require("node:crypto");
+const { execFile, spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -8,6 +9,10 @@ const { promisify } = require("node:util");
 const { Orchestrator } = require("../src/orchestrator");
 
 const execFileAsync = promisify(execFile);
+
+function kimiWorkspaceHash(cwd) {
+  return crypto.createHash("md5").update(path.resolve(cwd)).digest("hex");
+}
 
 async function makeOrchestrator() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "tendrilflow-"));
@@ -52,7 +57,10 @@ test("creates a file-backed task room with a host-only default group", async () 
   assert.ok(initialState.groups.some((group) => group.group_id === "group_main"));
   assert.ok(agents.every((candidate) => candidate.workspace_id === "workspace_main"));
   assert.ok(agents.every((candidate) => candidate.group_id === "group_main"));
-  assert.ok(agents.some((candidate) => candidate.id === "agent_host" && candidate.name === "host-agent"));
+  const host = agents.find((candidate) => candidate.id === "agent_host" && candidate.name === "host-agent");
+  assert.ok(host);
+  assert.equal(host.provider, "codex");
+  assert.equal(host.mode, "exec");
   assert.equal(agents.length, 1);
 
   const task = await orchestrator.createTask({
@@ -73,6 +81,82 @@ test("creates a file-backed task room with a host-only default group", async () 
   assert.match(rawEvents, /"type":"status_change"/);
 });
 
+test("new groups create a Codex Host Agent with TendrilFlow init context prepared", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Host Workspace" });
+  const group = await orchestrator.createGroup({ name: "Codex Host Group", workspace_id: workspace.workspace_id });
+  const agents = await orchestrator.store.listAgents();
+  const host = agents.find(
+    (candidate) => candidate.workspace_id === workspace.workspace_id && candidate.group_id === group.group_id && candidate.role === "host"
+  );
+
+  assert.ok(host);
+  assert.equal(host.name, "host-agent");
+  assert.equal(host.provider, "codex");
+  assert.equal(host.mode, "exec");
+  assert.match(host.command, /codex-agent\.js/);
+  assert.match(host.command, /--name "host-agent"/);
+  assert.equal(host.init_delivery, "codex_exec_session");
+  assert.equal(host.init_status, "pending");
+  assert.equal(host.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.match(host.init_prompt, /Agent: host-agent/);
+  assert.match(host.init_prompt, /Provider: codex/);
+  assert.match(host.init_prompt, /Role: host/);
+
+  const launch = await orchestrator.openAgentCli(host.id, { dry_run: true, platform: "win32" });
+  assert.match(launch.command, /^codex -C /);
+  assert.match(launch.command, /TendrilFlow Agent Initialization/);
+  assert.equal(launch.init_prompt_included, true);
+});
+
+test("startup migration upgrades generated mock group hosts to Codex CLI", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Mock Host Workspace" });
+  const group = await orchestrator.createGroup({ name: "Legacy Mock Host Group", workspace_id: workspace.workspace_id });
+  const host = (await orchestrator.store.listAgents()).find(
+    (candidate) => candidate.workspace_id === workspace.workspace_id && candidate.group_id === group.group_id && candidate.role === "host"
+  );
+  await orchestrator.store.patchAgent(host.id, {
+    provider: "mock",
+    mode: "mock",
+    command: "node scripts/mock-agent.js --role host --name host-agent"
+  });
+
+  orchestrator.store.initialized = false;
+  orchestrator.hostInitPrepared = false;
+  await orchestrator.init();
+
+  const migrated = await orchestrator.store.getAgent(host.id);
+  assert.equal(migrated.provider, "codex");
+  assert.equal(migrated.mode, "exec");
+  assert.match(migrated.command, /codex-agent\.js/);
+  assert.equal(migrated.init_delivery, "codex_exec_session");
+  assert.equal(migrated.init_status, "pending");
+  assert.equal(migrated.init_profile_version, "tendrilflow.agent_init.v1");
+});
+
+test("startup migration keeps generated Host Agent command aligned with host-agent", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Renamed Host Workspace" });
+  const group = await orchestrator.createGroup({ name: "Renamed Host Group", workspace_id: workspace.workspace_id });
+  const host = (await orchestrator.store.listAgents()).find(
+    (candidate) => candidate.workspace_id === workspace.workspace_id && candidate.group_id === group.group_id && candidate.role === "host"
+  );
+  await orchestrator.store.patchAgent(host.id, {
+    provider: "codex",
+    mode: "exec",
+    command: `node scripts/codex-agent.js --name "sam" --mode exec --cwd "${root}"`
+  });
+
+  orchestrator.store.initialized = false;
+  orchestrator.hostInitPrepared = false;
+  await orchestrator.init();
+
+  const migrated = await orchestrator.store.getAgent(host.id);
+  assert.match(migrated.command, /--name "host-agent"/);
+  assert.doesNotMatch(migrated.command, /--name "sam"/);
+});
+
 test("creates tasks without an owner by default", async () => {
   const { orchestrator } = await makeOrchestrator();
 
@@ -87,6 +171,621 @@ test("creates tasks without an owner by default", async () => {
   assert.deepEqual(task.blocked_by, []);
   assert.equal(task.claim, null);
   assert.equal(task.playbook_stage, "intake");
+});
+
+test("records group room messages without creating a task", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Chat Workspace" });
+  const group = await orchestrator.createGroup({ name: "Chat Only", workspace_id: workspace.workspace_id });
+
+  const room = await orchestrator.postGroupMessage(workspace.workspace_id, group.group_id, "先在群里聊一下");
+  const tasks = (await orchestrator.store.listTasks()).filter(
+    (task) => task.workspace_id === workspace.workspace_id && task.group_id === group.group_id
+  );
+
+  assert.equal(tasks.length, 0);
+  assert.equal(room.group.group_id, group.group_id);
+  assert.match(room.room_path, /events\.jsonl$/);
+  assert.equal(room.events.length, 1);
+  assert.equal(room.events[0].type, "user_message");
+  assert.equal(room.events[0].content.text, "先在群里聊一下");
+});
+
+test("routes group room mentions to running agents without creating a task", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Mention Workspace" });
+  const group = await orchestrator.createGroup({ name: "Mention Chat", workspace_id: workspace.workspace_id });
+  const worker = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  let delivered = null;
+  orchestrator.sessions.set(worker.id, {
+    sendMessage: async (task, text) => {
+      delivered = { task, text };
+      await orchestrator.store.appendGroupEvent(task.workspace_id, task.group_id, {
+        type: "agent_message",
+        actor: { kind: "agent", id: worker.id },
+        content: { text: "收到，我会在群聊里回复。", source: "test_session" }
+      });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(worker.id, { status: "running" });
+
+  const room = await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@克劳德 查一下 Google I/O 时间"
+  );
+  const tasks = (await orchestrator.store.listTasks()).filter(
+    (task) => task.workspace_id === workspace.workspace_id && task.group_id === group.group_id
+  );
+
+  assert.equal(tasks.length, 0);
+  assert.ok(delivered);
+  assert.equal(delivered.task.workspace_id, workspace.workspace_id);
+  assert.equal(delivered.task.group_id, group.group_id);
+  assert.match(delivered.task.task_id, /^group_room:/);
+  assert.match(delivered.text, /Current task: \(none\)/);
+  assert.match(delivered.text, /Google I\/O/);
+  assert.ok(room.events.some((event) => event.type === "tool_call_summary" && event.content.tool === "group.route_to_agent"));
+  assert.ok(room.events.some((event) => event.type === "agent_message" && event.actor.id === worker.id));
+});
+
+test("internal CLI wrappers keep consecutive task and group replies in the originating rooms", async (t) => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Serial Workspace", root_dir: root });
+  const group = await orchestrator.createGroup({ name: "Serial Chat", workspace_id: workspace.workspace_id });
+  const scriptPath = path.join(root, "provider-agent.js");
+  await fs.writeFile(
+    scriptPath,
+    `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+const queue = [];
+let busy = false;
+console.log("serial-worker ready as gemini CLI adapter (exec).");
+function drain() {
+  if (busy || !queue.length) return;
+  const prompt = queue.shift();
+  busy = true;
+  console.log("serial-worker: starting gemini headless turn.");
+  setTimeout(() => {
+    console.log(prompt.includes("FIRST_TASK") ? "reply-FIRST_TASK" : "reply-SECOND_GROUP");
+    console.log("serial-worker: gemini headless turn completed.");
+    busy = false;
+    drain();
+  }, 80);
+}
+rl.on("line", (line) => {
+  queue.push(line);
+  drain();
+});
+`,
+    "utf8"
+  );
+  const worker = await createTestAgent(orchestrator, {
+    name: "serial-worker",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    command: `node "${scriptPath}"`
+  });
+  t.after(async () => {
+    await orchestrator.stopAgent(worker.id).catch(() => undefined);
+  });
+  await orchestrator.startAgent(worker.id);
+  const task = await orchestrator.createTask({
+    title: "Serial ownership",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    owner_agent_id: worker.id
+  });
+
+  await orchestrator.postRoomMessage(task.task_id, "@serial-worker FIRST_TASK");
+  await orchestrator.postGroupMessage(workspace.workspace_id, group.group_id, "@serial-worker SECOND_GROUP");
+  await new Promise((resolve) => setTimeout(resolve, 320));
+
+  const taskEvents = await orchestrator.store.readEvents(task.task_id);
+  const groupEvents = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.ok(taskEvents.some((event) => event.type === "agent_message" && event.content.text === "reply-FIRST_TASK"));
+  assert.ok(!taskEvents.some((event) => event.content?.text === "reply-SECOND_GROUP"));
+  assert.ok(groupEvents.some((event) => event.type === "agent_message" && event.content.text === "reply-SECOND_GROUP"));
+  assert.ok(!groupEvents.some((event) => event.content?.text === "reply-FIRST_TASK"));
+  assert.ok(
+    !groupEvents.some((event) =>
+      /ready as gemini CLI adapter|headless turn completed|starting gemini headless turn/.test(event.content?.text || "")
+    )
+  );
+});
+
+test("background adapter init output does not pollute the first group room reply", async (t) => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Init Queue Workspace", root_dir: root });
+  const group = await orchestrator.createGroup({ name: "Init Queue Chat", workspace_id: workspace.workspace_id });
+  const scriptPath = path.join(root, "provider-agent.js");
+  await fs.writeFile(
+    scriptPath,
+    `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+const queue = [];
+let busy = false;
+console.log("init-queue ready as gemini CLI adapter (exec).");
+function drain() {
+  if (busy || !queue.length) return;
+  const prompt = queue.shift();
+  busy = true;
+  console.log("init-queue: starting gemini headless turn.");
+  setTimeout(() => {
+    console.log(prompt.includes("TendrilFlow Agent Initialization") ? "INIT_ACK" : "GROUP_ACK");
+    console.log("init-queue: gemini headless turn completed.");
+    busy = false;
+    drain();
+  }, 80);
+}
+rl.on("line", (line) => {
+  queue.push(line);
+  drain();
+});
+`,
+    "utf8"
+  );
+  const worker = await orchestrator.createAgent({
+    name: "init-queue",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    provider: "gemini",
+    mode: "exec",
+    cwd: root,
+    command: `node "${scriptPath}"`
+  });
+  t.after(async () => {
+    await orchestrator.stopAgent(worker.id).catch(() => undefined);
+  });
+  await orchestrator.startAgent(worker.id);
+  await orchestrator.postGroupMessage(workspace.workspace_id, group.group_id, "@init-queue hello after init");
+  await new Promise((resolve) => setTimeout(resolve, 320));
+
+  const groupEvents = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.ok(groupEvents.some((event) => event.type === "agent_message" && event.content.text === "GROUP_ACK"));
+  assert.ok(!groupEvents.some((event) => event.type === "agent_message" && event.content.text === "INIT_ACK"));
+  assert.ok(!groupEvents.some((event) => /ready as gemini CLI adapter/.test(event.content?.text || "")));
+});
+
+test("group delegation intent routes to coordinator before the target", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Delegation Workspace" });
+  const group = await orchestrator.createGroup({ name: "Delegation Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const claudeDeliveries = [];
+  const jennyDeliveries = [];
+  orchestrator.sessions.set(claude.id, {
+    sendMessage: async (task, text) => {
+      claudeDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async (task, text) => {
+      jennyDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(claude.id, { status: "running" });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+
+  const room = await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@克劳德 你让珍妮给你汇报一下它使用的什么模型"
+  );
+
+  assert.equal(claudeDeliveries.length, 1);
+  assert.equal(jennyDeliveries.length, 0);
+  assert.match(claudeDeliveries[0].text, /Delegation intent:/);
+  assert.match(claudeDeliveries[0].text, /tendrilflow\.route/);
+  assert.ok(room.events.some((event) => event.type === "group_delegation_intent"));
+});
+
+test("group chat routes direct Host Agent mentions", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Group Host Mention Workspace" });
+  const group = await orchestrator.createGroup({ name: "Group Host Mention Chat", workspace_id: workspace.workspace_id });
+  const host = (await orchestrator.store.listAgents()).find(
+    (agent) => agent.workspace_id === workspace.workspace_id && agent.group_id === group.group_id && agent.role === "host"
+  );
+  assert.ok(host);
+
+  const hostDeliveries = [];
+  orchestrator.sessions.set(host.id, {
+    sendMessage: async (task, text) => {
+      hostDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(host.id, { status: "running" });
+
+  await orchestrator.postGroupMessage(workspace.workspace_id, group.group_id, "@群主 看一下当前群聊状态");
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(hostDeliveries.length, 1);
+  assert.match(hostDeliveries[0].task.task_id, /^group_room:/);
+  assert.match(hostDeliveries[0].text, /TendrilFlow group room context/);
+  assert.match(hostDeliveries[0].text, /User message:\n@群主 看一下当前群聊状态/);
+  assert.ok(
+    events.some(
+      (event) => event.type === "tool_call_summary" && event.content?.target_agent_id === host.id
+    )
+  );
+});
+
+test("group delegation can use Host Agent as coordinator", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Group Host Delegation Workspace" });
+  const group = await orchestrator.createGroup({ name: "Group Host Delegation Chat", workspace_id: workspace.workspace_id });
+  const host = (await orchestrator.store.listAgents()).find(
+    (agent) => agent.workspace_id === workspace.workspace_id && agent.group_id === group.group_id && agent.role === "host"
+  );
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  assert.ok(host);
+
+  const hostDeliveries = [];
+  const jennyDeliveries = [];
+  orchestrator.sessions.set(host.id, {
+    sendMessage: async (task, text) => {
+      hostDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async (task, text) => {
+      jennyDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(host.id, { status: "running" });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+
+  await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@群主 你让珍妮汇报当前 provider"
+  );
+
+  let events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(hostDeliveries.length, 1);
+  assert.equal(jennyDeliveries.length, 0);
+  assert.match(hostDeliveries[0].text, /Delegation intent:/);
+  assert.match(hostDeliveries[0].text, /Target: 珍妮/);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "group_delegation_intent" &&
+        event.content?.coordinator_agent_id === host.id &&
+        event.content?.target_agent_id === jenny.id
+    )
+  );
+
+  const routeEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: host.id },
+    content: {
+      text: [
+        "```tendrilflow.route",
+        '{"to":"珍妮","message":"请汇报当前 provider。","reason":"用户让 Host Agent 协调珍妮","expect_response":true}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, routeEvent);
+
+  events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(jennyDeliveries.length, 1);
+  assert.match(jennyDeliveries[0].text, /Delegation delivery:/);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "group_route_delivery" &&
+        event.content?.source_agent_id === host.id &&
+        event.content?.target_agent_id === jenny.id
+    )
+  );
+});
+
+test("authorized group route block reaches target and reports result to coordinator", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Route Workspace" });
+  const group = await orchestrator.createGroup({ name: "Route Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const claudeDeliveries = [];
+  const jennyDeliveries = [];
+  orchestrator.sessions.set(claude.id, {
+    sendMessage: async (task, text) => {
+      claudeDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async (task, text) => {
+      jennyDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(claude.id, { status: "running" });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+  await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@克劳德 你让珍妮给你汇报一下它使用的什么模型"
+  );
+
+  const routeEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: claude.id },
+    content: {
+      text: [
+        "```tendrilflow.route",
+        '{"to":"珍妮","message":"请汇报你当前使用的 provider、模型和运行方式。","reason":"用户要求我协调珍妮汇报模型信息","expect_response":true}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, routeEvent);
+
+  assert.equal(jennyDeliveries.length, 1);
+  assert.match(jennyDeliveries[0].task.task_id, /^group_room:/);
+  assert.match(jennyDeliveries[0].text, /Delegation delivery:/);
+  assert.match(jennyDeliveries[0].text, /provider/);
+
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, routeEvent);
+  assert.equal(jennyDeliveries.length, 1);
+
+  const bannerEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: jenny.id },
+    content: { text: "珍妮: starting gemini headless turn." }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, bannerEvent);
+  assert.equal(claudeDeliveries.length, 1);
+
+  const codexLifecycleEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: jenny.id },
+    content: { text: "珍妮: codex exec exited with code 0." }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, codexLifecycleEvent);
+  assert.equal(claudeDeliveries.length, 1);
+
+  const jennyEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: jenny.id },
+    content: { text: "我当前使用 Gemini CLI Exec，模型信息以 CLI 当前配置为准。" }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, jennyEvent);
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  const tasks = (await orchestrator.store.listTasks()).filter(
+    (task) => task.workspace_id === workspace.workspace_id && task.group_id === group.group_id
+  );
+  assert.equal(tasks.length, 0);
+  assert.ok(events.some((event) => event.type === "group_route_request" && event.actor.id === claude.id));
+  assert.ok(events.some((event) => event.type === "group_route_delivery" && event.content.target_agent_id === jenny.id));
+  assert.ok(events.some((event) => event.type === "group_route_blocked" && event.content.reason === "duplicate_route"));
+  assert.ok(events.some((event) => event.type === "group_route_result" && event.content.responder_agent_id === jenny.id));
+  assert.equal(claudeDeliveries.length, 2);
+  assert.match(claudeDeliveries[1].text, /Route result from 珍妮/);
+});
+
+test("streamed group route blocks are assembled before routing", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Streamed Route Workspace" });
+  const group = await orchestrator.createGroup({ name: "Streamed Route Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jennyDeliveries = [];
+  orchestrator.sessions.set(claude.id, { sendMessage: async () => true });
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async (task, text) => {
+      jennyDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(claude.id, { status: "running" });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+  await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@克劳德 你让珍妮给你汇报一下它使用的什么模型"
+  );
+
+  for (const text of [
+    "```tendrilflow.route",
+    '{"to":"珍妮","message":"请汇报当前 provider。","reason":"用户要求我协调珍妮","expect_response":false}',
+    "```"
+  ]) {
+    const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+      type: "agent_message",
+      actor: { kind: "agent", id: claude.id },
+      content: { text }
+    });
+    await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+  }
+
+  const jennyEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: jenny.id },
+    content: { text: "Gemini CLI Exec." }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, jennyEvent);
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(jennyDeliveries.length, 1);
+  assert.ok(events.some((event) => event.type === "group_route_request" && event.content.parsed === true));
+  assert.ok(events.some((event) => event.type === "group_route_delivery" && event.content.expect_response === false));
+  assert.ok(!events.some((event) => event.type === "group_route_result"));
+});
+
+test("plain agent mentions in group chat do not auto-route", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Plain Mention Workspace" });
+  const group = await orchestrator.createGroup({ name: "Plain Mention Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  let jennyDeliveries = 0;
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async () => {
+      jennyDeliveries += 1;
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+
+  const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: claude.id },
+    content: { text: "@珍妮 请汇报你的模型。" }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(jennyDeliveries, 0);
+  assert.ok(!events.some((candidate) => candidate.type === "group_route_delivery"));
+  assert.ok(!events.some((candidate) => candidate.type === "group_route_request"));
+});
+
+test("unauthorized group route block is blocked", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Blocked Route Workspace" });
+  const group = await orchestrator.createGroup({ name: "Blocked Route Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  let jennyDeliveries = 0;
+  orchestrator.sessions.set(jenny.id, {
+    sendMessage: async () => {
+      jennyDeliveries += 1;
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(jenny.id, { status: "running" });
+
+  const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: claude.id },
+    content: {
+      text: '```tendrilflow.route\n{"to":"珍妮","message":"请汇报模型。","reason":"没有用户授权","expect_response":true}\n```'
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(jennyDeliveries, 0);
+  assert.ok(events.some((candidate) => candidate.type === "group_route_blocked" && candidate.content.reason === "not_authorized"));
+});
+
+test("arrow group delegation syntax authorizes coordinator route", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Arrow Route Workspace" });
+  const group = await orchestrator.createGroup({ name: "Arrow Route Chat", workspace_id: workspace.workspace_id });
+  const claude = await createTestAgent(orchestrator, {
+    name: "克劳德",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const jenny = await createTestAgent(orchestrator, {
+    name: "珍妮",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const claudeDeliveries = [];
+  orchestrator.sessions.set(claude.id, {
+    sendMessage: async (task, text) => {
+      claudeDeliveries.push({ task, text });
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(claude.id, { status: "running" });
+
+  await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    "@克劳德 -> @珍妮: 请汇报当前 provider 和模型"
+  );
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(claudeDeliveries.length, 1);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "group_delegation_intent" &&
+        event.content.coordinator_agent_id === claude.id &&
+        event.content.target_agent_id === jenny.id &&
+        event.content.instruction === "请汇报当前 provider 和模型"
+    )
+  );
 });
 
 test("tasks keep scoped dependencies and reject cross-group task references", async () => {
@@ -323,6 +1022,253 @@ test("opens ACP provider CLIs without protocol adapter arguments", async () => {
   assert.equal(kimiLaunch.init_prompt_included, true);
 });
 
+test("opens initialized Gemini and Kimi CLIs with stable resume behavior", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const gemini = await createTestAgent(orchestrator, {
+    name: "gemini-planner",
+    provider: "gemini",
+    mode: "acp",
+    command: "gemini --acp",
+    provider_session_id: "b194c806-1909-480b-9296-3942bba663fc",
+    initialized_at: "2026-05-15T10:38:16.730Z"
+  });
+  const kimi = await createTestAgent(orchestrator, {
+    name: "kimi-reviewer",
+    provider: "kimi",
+    mode: "acp",
+    command: "kimi acp",
+    cwd: root,
+    initialized_at: "2026-05-15T10:45:40.695Z"
+  });
+
+  const geminiLaunch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
+  const kimiLaunch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+
+  assert.match(geminiLaunch.command, /^gemini --resume 'b194c806-1909-480b-9296-3942bba663fc'$/i);
+  assert.equal(geminiLaunch.init_prompt_included, false);
+  assert.match(kimiLaunch.command, /^kimi --work-dir /);
+  assert.doesNotMatch(kimiLaunch.command, /\bacp\b/);
+  assert.doesNotMatch(kimiLaunch.command, /--continue/);
+  assert.equal(kimiLaunch.init_prompt_included, false);
+});
+
+test("opens Kimi CLI by resuming the stored provider session id", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const kimi = await orchestrator.createAgent({
+    name: "kimi-reviewer",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    cwd: root,
+    command: "kimi --model kimi-k2.6",
+    provider_session_id: "7f12c3da-a86c-4237-93cc-fc1bcd6838d5",
+    initialized_at: "2026-05-15T10:45:40.695Z"
+  });
+
+  const launch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(kimi.id);
+
+  assert.equal(saved.provider_session_id, "7f12c3da-a86c-4237-93cc-fc1bcd6838d5");
+  assert.match(launch.command, /^kimi --work-dir /);
+  assert.match(launch.command, /-r '7f12c3da-a86c-4237-93cc-fc1bcd6838d5'/);
+  assert.match(launch.command, /--model 'kimi-k2.6'/);
+  assert.equal(launch.init_prompt_included, false);
+});
+
+test("discovers a Kimi session by agent init context before opening CLI", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const sessionsRoot = path.join(root, "kimi-sessions");
+  orchestrator.kimiSessionsDir = () => sessionsRoot;
+  const kimiSessionId = "2bd2eefe-0f43-4f8f-b46a-7e5cc66eb028";
+  const sessionDir = path.join(sessionsRoot, kimiWorkspaceHash(root), kimiSessionId);
+  await fs.mkdir(sessionDir, { recursive: true });
+
+  const kimi = await orchestrator.createAgent({
+    id: "agent_kimi_resume_test",
+    name: "kimi-reviewer",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    cwd: root,
+    initialized_at: "2026-05-15T10:45:40.695Z"
+  });
+  await fs.writeFile(
+    path.join(sessionDir, "context.jsonl"),
+    JSON.stringify({
+      role: "user",
+      content: `TendrilFlow Agent Initialization\n- Agent: kimi-reviewer (${kimi.id})`
+    }),
+    "utf8"
+  );
+
+  const launch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(kimi.id);
+
+  assert.equal(saved.provider_session_id, kimiSessionId);
+  assert.equal(saved.provider_session_source, "agent_id");
+  assert.match(saved.command, new RegExp(`--session-id "${kimiSessionId}"`));
+  assert.match(launch.command, new RegExp(`-r '${kimiSessionId}'`));
+});
+
+test("does not attach a fresh Kimi agent to an unrelated latest cwd session", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const sessionsRoot = path.join(root, "kimi-sessions");
+  orchestrator.kimiSessionsDir = () => sessionsRoot;
+  const sessionDir = path.join(sessionsRoot, kimiWorkspaceHash(root), "d970d242-84cc-46f3-8ae7-8d6998045d3f");
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, "context.jsonl"), JSON.stringify({ role: "user", content: "unrelated" }), "utf8");
+  const kimi = await orchestrator.createAgent({
+    name: "fresh-kimi",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    cwd: root
+  });
+
+  const launch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(kimi.id);
+
+  assert.equal(saved.provider_session_id, null);
+  assert.doesNotMatch(launch.command, /-r 'd970d242/);
+  assert.match(launch.command, /--prompt /);
+  assert.equal(launch.init_prompt_included, true);
+});
+
+test("captures Kimi provider session ids emitted by the background adapter", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const kimi = await orchestrator.createAgent({
+    name: "kimi-worker",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    cwd: root,
+    init_status: "initializing"
+  });
+
+  await orchestrator.captureProviderSessionMarker(kimi.id, {
+    type: "stdout",
+    content: { text: "TENDRILFLOW_PROVIDER_SESSION_ID=8f4bfe92-9afe-428c-a11e-04d752729c99" }
+  });
+  await orchestrator.captureProviderSessionMarker(kimi.id, {
+    type: "stdout",
+    content: { text: "kimi-worker: kimi headless turn completed." }
+  });
+  const saved = await orchestrator.store.getAgent(kimi.id);
+
+  assert.equal(saved.provider_session_id, "8f4bfe92-9afe-428c-a11e-04d752729c99");
+  assert.match(saved.command, /--session-id "8f4bfe92-9afe-428c-a11e-04d752729c99"/);
+  assert.equal(saved.init_status, "initialized");
+  assert.ok(saved.initialized_at);
+});
+
+test("captures Gemini and Claude provider session ids emitted by the background adapter", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const gemini = await orchestrator.createAgent({
+    name: "gemini-worker",
+    role: "work",
+    provider: "gemini",
+    mode: "exec",
+    cwd: root,
+    init_status: "initializing"
+  });
+  const claude = await orchestrator.createAgent({
+    name: "claude-worker",
+    role: "work",
+    provider: "claude",
+    mode: "exec",
+    cwd: root,
+    init_status: "initializing"
+  });
+
+  await orchestrator.captureProviderSessionMarker(gemini.id, {
+    type: "stdout",
+    content: { text: "TENDRILFLOW_PROVIDER_SESSION_ID=747ddac5-ddd7-427c-99d9-1193e9b0674e" }
+  });
+  await orchestrator.captureProviderSessionMarker(gemini.id, {
+    type: "stdout",
+    content: { text: "gemini-worker: gemini headless turn completed." }
+  });
+  await orchestrator.captureProviderSessionMarker(claude.id, {
+    type: "stdout",
+    content: { text: "TENDRILFLOW_PROVIDER_SESSION_ID=eb57d47e-0095-47c7-8af9-f2905159dbb6" }
+  });
+  await orchestrator.captureProviderSessionMarker(claude.id, {
+    type: "stdout",
+    content: { text: "claude-worker: claude headless turn completed." }
+  });
+  const savedGemini = await orchestrator.store.getAgent(gemini.id);
+  const savedClaude = await orchestrator.store.getAgent(claude.id);
+
+  assert.equal(savedGemini.provider_session_id, "747ddac5-ddd7-427c-99d9-1193e9b0674e");
+  assert.equal(savedGemini.provider_session_source, "provider_adapter");
+  assert.match(savedGemini.command, /--session-id "747ddac5-ddd7-427c-99d9-1193e9b0674e"/);
+  assert.equal(savedGemini.init_status, "initialized");
+  assert.equal(savedClaude.provider_session_id, "eb57d47e-0095-47c7-8af9-f2905159dbb6");
+  assert.equal(savedClaude.provider_session_source, "provider_adapter");
+  assert.match(savedClaude.command, /--session-id "eb57d47e-0095-47c7-8af9-f2905159dbb6"/);
+  assert.equal(savedClaude.init_status, "initialized");
+});
+
+test("opens initialized Claude CLI by resuming the stored provider session id", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const claude = await orchestrator.createAgent({
+    name: "claude-reviewer",
+    role: "work",
+    provider: "claude",
+    mode: "exec",
+    cwd: root,
+    command: "claude --model sonnet --permission-mode plan",
+    provider_session_id: "3f2b8f45-328a-4a0d-a25d-269a4f5c7121",
+    initialized_at: "2026-05-15T10:45:40.695Z"
+  });
+
+  const launch = await orchestrator.openAgentCli(claude.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(claude.id);
+
+  assert.equal(saved.provider_session_id, "3f2b8f45-328a-4a0d-a25d-269a4f5c7121");
+  assert.match(launch.command, /^claude --resume '3f2b8f45-328a-4a0d-a25d-269a4f5c7121'/);
+  assert.match(launch.command, /--name 'claude-reviewer'/);
+  assert.match(launch.command, /--model 'sonnet'/);
+  assert.match(launch.command, /--permission-mode 'plan'/);
+  assert.equal(launch.init_prompt_included, false);
+});
+
+test("legacy initialized Gemini and Claude agents do not receive random resume ids", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const gemini = await createTestAgent(orchestrator, {
+    name: "legacy-gemini",
+    provider: "gemini",
+    mode: "exec",
+    command: "gemini --model flash",
+    cwd: root,
+    initialized_at: "2026-05-15T10:38:16.730Z"
+  });
+  await orchestrator.store.patchAgent(gemini.id, { provider_session_id: null });
+  const claude = await createTestAgent(orchestrator, {
+    name: "legacy-claude",
+    provider: "claude",
+    mode: "exec",
+    command: "claude --model sonnet",
+    cwd: root,
+    initialized_at: "2026-05-15T10:38:16.730Z"
+  });
+  await orchestrator.store.patchAgent(claude.id, {
+    provider_session_id: null,
+    claude_session_id: null
+  });
+
+  const geminiLaunch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
+  const claudeLaunch = await orchestrator.openAgentCli(claude.id, { dry_run: true, platform: "win32" });
+  const savedGemini = await orchestrator.store.getAgent(gemini.id);
+  const savedClaude = await orchestrator.store.getAgent(claude.id);
+
+  assert.equal(savedGemini.provider_session_id, null);
+  assert.match(geminiLaunch.command, /^gemini --model 'flash' --resume 'latest'$/);
+  assert.equal(savedClaude.provider_session_id, null);
+  assert.equal(savedClaude.claude_session_id, null);
+  assert.match(claudeLaunch.command, /^claude --continue --name 'legacy-claude' --model 'sonnet'$/);
+});
+
 test("opens Claude Code as an interactive CLI with a stable session identity", async () => {
   const { orchestrator } = await makeOrchestrator();
   const claude = await createTestAgent(orchestrator, {
@@ -349,6 +1295,222 @@ test("opens Claude Code as an interactive CLI with a stable session identity", a
   assert.doesNotMatch(launch.command, /dangerously-skip-permissions/);
 });
 
+test("provider exec agents use a background adapter while Open CLI launches the native TUI", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const gemini = await orchestrator.createAgent({
+    name: "gemini-direct",
+    role: "work",
+    provider: "gemini",
+    mode: "exec",
+    cwd: root,
+    command: "gemini --model flash --approval-mode plan"
+  });
+  const kimi = await orchestrator.createAgent({
+    name: "kimi-direct",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    cwd: root,
+    command: "kimi --model kimi-k2.6"
+  });
+
+  assert.match(gemini.command, /provider-agent\.js/);
+  assert.match(gemini.command, /--provider "gemini"/);
+  assert.match(gemini.command, /--model "flash"/);
+  assert.match(gemini.command, /--approval-mode "plan"/);
+  assert.match(kimi.command, /provider-agent\.js/);
+  assert.match(kimi.command, /--provider "kimi"/);
+
+  const geminiLaunch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
+  const kimiLaunch = await orchestrator.openAgentCli(kimi.id, { dry_run: true, platform: "win32" });
+
+  assert.match(geminiLaunch.command, /^gemini\b/);
+  assert.doesNotMatch(geminiLaunch.command, /provider-agent\.js/);
+  assert.match(geminiLaunch.command, /--model 'flash'/);
+  assert.match(geminiLaunch.command, /--approval-mode 'plan'/);
+  assert.match(kimiLaunch.command, /^kimi --work-dir /);
+  assert.doesNotMatch(kimiLaunch.command, /provider-agent\.js/);
+  assert.match(kimiLaunch.command, /--model 'kimi-k2.6'/);
+});
+
+test("provider background adapter runs provider CLIs through stdin/stdout pipes", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "tendrilflow-provider-adapter-"));
+  const fakeProvider = path.join(root, process.platform === "win32" ? "fake-provider.cmd" : "fake-provider");
+  if (process.platform === "win32") {
+    await fs.writeFile(fakeProvider, "@echo fake-provider %*\r\n@more\r\n", "utf8");
+  } else {
+    await fs.writeFile(fakeProvider, "#!/usr/bin/env sh\necho \"fake-provider $*\"\ncat\n", "utf8");
+    await fs.chmod(fakeProvider, 0o755);
+  }
+
+  const adapter = spawn(
+    process.execPath,
+    [
+      path.join(__dirname, "..", "scripts", "provider-agent.js"),
+      "--provider",
+      "kimi",
+      "--name",
+      "pipe-kimi",
+      "--cwd",
+      root,
+      "--provider-command",
+      fakeProvider,
+      "--timeout-ms",
+      "5000"
+    ],
+    { cwd: path.join(__dirname, ".."), stdio: ["pipe", "pipe", "pipe"] }
+  );
+  t.after(() => {
+    if (!adapter.killed) {
+      adapter.kill();
+    }
+  });
+
+  let output = "";
+  adapter.stdout.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+  });
+  adapter.stderr.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+  });
+  adapter.stdin.write("hello from TendrilFlow room\n");
+
+  for (let attempt = 0; attempt < 80 && !/headless turn completed/.test(output); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.match(output, /pipe-kimi ready as kimi CLI adapter/);
+  assert.match(output, /fake-provider/);
+  assert.match(output, /--final-message-only/);
+  assert.match(output, /hello from TendrilFlow room/);
+  assert.match(output, /kimi headless turn completed/);
+});
+
+test("provider background adapter emits Gemini and Claude session markers", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "tendrilflow-provider-marker-"));
+  const fakeProvider = path.join(root, process.platform === "win32" ? "fake-provider.cmd" : "fake-provider");
+  if (process.platform === "win32") {
+    await fs.writeFile(fakeProvider, "@echo fake-provider %*\r\n@more\r\n", "utf8");
+  } else {
+    await fs.writeFile(fakeProvider, "#!/usr/bin/env sh\necho \"fake-provider $*\"\ncat\n", "utf8");
+    await fs.chmod(fakeProvider, 0o755);
+  }
+
+  async function runAdapter(provider, sessionId) {
+    const adapter = spawn(
+      process.execPath,
+      [
+        path.join(__dirname, "..", "scripts", "provider-agent.js"),
+        "--provider",
+        provider,
+        "--name",
+        `${provider}-marker`,
+        "--cwd",
+        root,
+        "--provider-command",
+        fakeProvider,
+        "--session-id",
+        sessionId,
+        "--timeout-ms",
+        "5000"
+      ],
+      { cwd: path.join(__dirname, ".."), stdio: ["pipe", "pipe", "pipe"] }
+    );
+    t.after(() => {
+      if (!adapter.killed) {
+        adapter.kill();
+      }
+    });
+    let output = "";
+    adapter.stdout.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+    });
+    adapter.stderr.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+    });
+    adapter.stdin.write(`hello from ${provider}\n`);
+    for (let attempt = 0; attempt < 80 && !/headless turn completed/.test(output); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return output;
+  }
+
+  const geminiOutput = await runAdapter("gemini", "747ddac5-ddd7-427c-99d9-1193e9b0674e");
+  const claudeOutput = await runAdapter("claude", "eb57d47e-0095-47c7-8af9-f2905159dbb6");
+
+  assert.match(geminiOutput, /fake-provider/);
+  assert.match(geminiOutput, /--session-id 747ddac5-ddd7-427c-99d9-1193e9b0674e/);
+  assert.match(geminiOutput, /TENDRILFLOW_PROVIDER_SESSION_ID=747ddac5-ddd7-427c-99d9-1193e9b0674e/);
+  assert.match(claudeOutput, /fake-provider/);
+  assert.match(claudeOutput, /--session-id eb57d47e-0095-47c7-8af9-f2905159dbb6/);
+  assert.match(claudeOutput, /TENDRILFLOW_PROVIDER_SESSION_ID=eb57d47e-0095-47c7-8af9-f2905159dbb6/);
+});
+
+test("Gemini background adapter resumes an existing session id instead of creating it again", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "tendrilflow-gemini-resume-"));
+  const geminiRoot = path.join(root, "gemini-home");
+  const sessionId = "de1a8f4c-73ac-4331-9bd7-722b542617df";
+  const chatsDir = path.join(geminiRoot, "tmp", "tendrilflow", "chats");
+  const fakeProvider = path.join(root, process.platform === "win32" ? "fake-provider.cmd" : "fake-provider");
+  await fs.mkdir(chatsDir, { recursive: true });
+  await fs.writeFile(
+    path.join(chatsDir, "session-existing.jsonl"),
+    `${JSON.stringify({ sessionId, projectHash: "tendrilflow", startTime: "2026-05-18T00:00:00.000Z" })}\n`,
+    "utf8"
+  );
+  if (process.platform === "win32") {
+    await fs.writeFile(fakeProvider, "@echo fake-provider %*\r\n", "utf8");
+  } else {
+    await fs.writeFile(fakeProvider, "#!/usr/bin/env sh\necho \"fake-provider $*\"\n", "utf8");
+    await fs.chmod(fakeProvider, 0o755);
+  }
+
+  const adapter = spawn(
+    process.execPath,
+    [
+      path.join(__dirname, "..", "scripts", "provider-agent.js"),
+      "--provider",
+      "gemini",
+      "--name",
+      "gemini-resume",
+      "--cwd",
+      root,
+      "--provider-command",
+      fakeProvider,
+      "--session-id",
+      sessionId,
+      "--timeout-ms",
+      "5000"
+    ],
+    {
+      cwd: path.join(__dirname, ".."),
+      env: { ...process.env, TENDRILFLOW_GEMINI_ROOT: geminiRoot },
+      stdio: ["pipe", "pipe", "pipe"]
+    }
+  );
+  t.after(() => {
+    if (!adapter.killed) {
+      adapter.kill();
+    }
+  });
+  let output = "";
+  adapter.stdout.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+  });
+  adapter.stderr.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+  });
+  adapter.stdin.write("hello existing gemini session\n");
+  for (let attempt = 0; attempt < 80 && !/headless turn completed/.test(output); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.match(output, /fake-provider/);
+  assert.match(output, /--resume de1a8f4c-73ac-4331-9bd7-722b542617df/);
+  assert.doesNotMatch(output, /--session-id de1a8f4c-73ac-4331-9bd7-722b542617df/);
+  assert.match(output, /TENDRILFLOW_PROVIDER_SESSION_ID=de1a8f4c-73ac-4331-9bd7-722b542617df/);
+});
+
 test("prepares provider-neutral TendrilFlow context for non-Codex CLIs", async () => {
   const { root, orchestrator } = await makeOrchestrator();
   const workspace = await orchestrator.createWorkspace({ name: "Polyglot Workspace", root_dir: root });
@@ -362,19 +1524,130 @@ test("prepares provider-neutral TendrilFlow context for non-Codex CLIs", async (
     cwd: root
   });
 
-  const init = await orchestrator.initializeAgentSession(gemini.id);
-  const saved = await orchestrator.store.getAgent(gemini.id);
+  const init = await orchestrator.initializeAgentSession(gemini.id, { dry_run: true });
+  const preparedAgent = init.agent;
 
   assert.equal(init.prepared, true);
-  assert.equal(init.init_delivery, "interactive_prompt");
-  assert.equal(saved.init_status, "prepared");
-  assert.equal(saved.init_profile_version, "tendrilflow.agent_init.v1");
-  assert.match(saved.provider_session_id, /^[0-9a-f-]{36}$/i);
-  assert.match(saved.init_prompt, /Provider: gemini/);
-  assert.match(saved.init_prompt, /Runtime Envelope:/);
-  assert.match(saved.init_prompt, /Role contract:/);
-  assert.match(saved.init_prompt, /Safety & Boundaries:/);
-  assert.match(saved.init_prompt, /Task-specific context is injected later/);
+  assert.equal(init.init_delivery, "background_adapter_prompt");
+  assert.equal(preparedAgent.mode, "exec");
+  assert.match(preparedAgent.command, /provider-agent\.js/);
+  assert.match(preparedAgent.command, /--provider "gemini"/);
+  assert.equal(preparedAgent.init_status, "pending");
+  assert.equal(preparedAgent.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.match(preparedAgent.provider_session_id, /^[0-9a-f-]{36}$/i);
+  assert.match(preparedAgent.init_prompt, /Provider: gemini/);
+  assert.match(preparedAgent.init_prompt, /Runtime Envelope:/);
+  assert.match(preparedAgent.init_prompt, /Role contract:/);
+  assert.match(preparedAgent.init_prompt, /Safety & Boundaries:/);
+  assert.match(preparedAgent.init_prompt, /Task-specific context is injected later/);
+});
+
+test("all CLI provider init prompts include the group route protocol", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Route Protocol Workspace", root_dir: root });
+  const group = await orchestrator.createGroup({ name: "Route Protocol Crew", workspace_id: workspace.workspace_id });
+  for (const provider of ["codex", "gemini", "claude", "kimi"]) {
+    const agent = await orchestrator.createAgent({
+      name: `${provider}-member`,
+      role: "work",
+      workspace_id: workspace.workspace_id,
+      group_id: group.group_id,
+      provider,
+      mode: "exec",
+      cwd: root,
+      command: provider === "codex" ? `node scripts/codex-agent.js --name ${provider}-member --mode exec --cwd "${root}"` : undefined
+    });
+    const prompt = await orchestrator.buildAgentInitializationPrompt(agent);
+    assert.match(prompt, new RegExp(`Provider: ${provider}`));
+    assert.match(prompt, /```tendrilflow\.route/);
+    assert.match(prompt, /Plain @mentions in your own natural-language reply are visible text only and do not trigger routing/);
+  }
+});
+
+test("headless initialization creates a resumable Gemini session before opening CLI", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const geminiRoot = path.join(root, "gemini-home");
+  orchestrator.geminiRootDir = () => geminiRoot;
+  orchestrator.runHeadlessProviderCommand = async (_command, args) => {
+    const sessionId = args[args.indexOf("--session-id") + 1];
+    const prompt = args[args.indexOf("--prompt") + 1];
+    const projectDir = path.join(geminiRoot, "tmp", "fake-project");
+    const chatsDir = path.join(projectDir, "chats");
+    await fs.mkdir(chatsDir, { recursive: true });
+    await fs.writeFile(path.join(projectDir, ".project_root"), root, "utf8");
+    await fs.writeFile(
+      path.join(chatsDir, `session-test-${sessionId.slice(0, 8)}.jsonl`),
+      [
+        JSON.stringify({ sessionId, projectHash: "fake", startTime: "2026-05-18T00:00:00.000Z", kind: "main" }),
+        JSON.stringify({ type: "user", content: [{ text: prompt }] }),
+        JSON.stringify({ type: "gemini", content: "Acknowledged." })
+      ].join("\n"),
+      "utf8"
+    );
+    return { stdout: "Acknowledged.", stderr: "" };
+  };
+  const gemini = await orchestrator.createAgent({
+    id: "agent_gemini_headless_init",
+    name: "gemini-init",
+    role: "work",
+    provider: "gemini",
+    mode: "exec",
+    cwd: root
+  });
+
+  const init = await orchestrator.initializeAgentSession(gemini.id);
+  const launch = await orchestrator.openAgentCli(gemini.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(gemini.id);
+
+  assert.equal(init.initialized, true);
+  assert.equal(saved.init_status, "initialized");
+  assert.equal(saved.provider_session_source, "headless_init");
+  assert.match(saved.provider_session_path, /session-test-/);
+  assert.match(launch.command, new RegExp(`^gemini --resume '${saved.provider_session_id}'$`));
+  const rawSession = await fs.readFile(saved.provider_session_path, "utf8");
+  assert.match(rawSession, /agent_gemini_headless_init/);
+});
+
+test("headless initialization creates a resumable Claude session before opening CLI", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const claudeProjects = path.join(root, "claude-projects");
+  orchestrator.claudeProjectsDir = () => claudeProjects;
+  orchestrator.runHeadlessProviderCommand = async (_command, args) => {
+    const sessionId = args[args.indexOf("--session-id") + 1];
+    const prompt = args.at(-1);
+    const projectDir = orchestrator.claudeProjectDirForCwd(root);
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: prompt }, sessionId, cwd: root }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Acknowledged." }] }, sessionId })
+      ].join("\n"),
+      "utf8"
+    );
+    return { stdout: "Acknowledged.", stderr: "" };
+  };
+  const claude = await orchestrator.createAgent({
+    id: "agent_claude_headless_init",
+    name: "claude-init",
+    role: "work",
+    provider: "claude",
+    mode: "exec",
+    cwd: root
+  });
+
+  const init = await orchestrator.initializeAgentSession(claude.id);
+  const launch = await orchestrator.openAgentCli(claude.id, { dry_run: true, platform: "win32" });
+  const saved = await orchestrator.store.getAgent(claude.id);
+
+  assert.equal(init.initialized, true);
+  assert.equal(saved.init_status, "initialized");
+  assert.equal(saved.provider_session_source, "headless_init");
+  assert.equal(saved.claude_session_id, saved.provider_session_id);
+  assert.match(saved.provider_session_path, new RegExp(`${saved.provider_session_id}\\.jsonl$`));
+  assert.match(launch.command, new RegExp(`^claude --resume '${saved.provider_session_id}' --name 'claude-init'`));
+  const rawSession = await fs.readFile(saved.provider_session_path, "utf8");
+  assert.match(rawSession, /agent_claude_headless_init/);
 });
 
 test("opens separate Codex resume sessions for agents sharing one workspace", async () => {
@@ -754,7 +2027,11 @@ test("startup migrates legacy host agent naming in agents and task references", 
 
   const migratedAgents = await orchestrator.store.listAgents();
   const migratedTask = await orchestrator.store.getTask(task.task_id);
-  assert.ok(migratedAgents.some((agent) => agent.id === "agent_host" && agent.name === "host-agent" && agent.role === "host"));
+  const migratedHost = migratedAgents.find((agent) => agent.id === "agent_host" && agent.name === "host-agent" && agent.role === "host");
+  assert.ok(migratedHost);
+  assert.equal(migratedHost.provider, "codex");
+  assert.equal(migratedHost.mode, "exec");
+  assert.match(migratedHost.command, /codex-agent\.js/);
   assert.ok(!migratedAgents.some((agent) => agent.id === "agent_coordinator" || agent.name === "coordinator" || agent.role === "coordinator"));
   assert.equal(migratedTask.owner_agent_id, "agent_host");
   assert.ok(migratedTask.participant_agent_ids.includes("agent_host"));
@@ -968,9 +2245,10 @@ test("host can create group agents from visible room commands", async () => {
   const events = await orchestrator.store.readEvents(task.task_id);
   assert.ok(created);
   assert.equal(created.provider, "gemini");
-  assert.equal(created.mode, "acp");
+  assert.equal(created.mode, "exec");
   assert.equal(created.isolation_mode, "worktree");
-  assert.equal(created.command, "gemini --acp");
+  assert.match(created.command, /provider-agent\.js/);
+  assert.match(created.command, /--provider "gemini"/);
   assert.ok(events.some((event) => event.type === "system_event" && event.content.agent_id === created.id));
 });
 
@@ -988,7 +2266,9 @@ test("host can create Claude Code agents from visible room commands", async () =
   assert.ok(created);
   assert.equal(created.provider, "claude");
   assert.equal(created.mode, "exec");
-  assert.equal(created.command, 'claude --name "claude-scout"');
+  assert.match(created.command, /provider-agent\.js/);
+  assert.match(created.command, /--provider "claude"/);
+  assert.match(created.command, /--name "claude-scout"/);
   assert.match(created.claude_session_id, /^[0-9a-f-]{36}$/i);
 });
 
@@ -1264,6 +2544,54 @@ rl.on("line", (line) => {
   const events = await orchestrator.store.readEvents(task.task_id);
   assert.ok(events.some((event) => event.type === "agent_message" && event.content.text === "prompt used ready session"));
   assert.ok(!events.some((event) => event.content?.text === "prompt was sent before session"));
+});
+
+test("ACP sessions fail closed when newSession is not ready", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const scriptPath = path.join(root, "stalled-acp-agent.js");
+  await fs.writeFile(
+    scriptPath,
+    `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+function write(payload) { process.stdout.write(JSON.stringify(payload) + "\\n"); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    write({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
+  } else if (message.method === "newSession") {
+    setTimeout(() => write({ jsonrpc: "2.0", id: message.id, result: { sessionId: "late-session" } }), 300);
+  } else if (message.method === "prompt") {
+    write({ method: "session/update", params: { update: { kind: "agent_message", message: "prompt should not be sent before ready" } } });
+  }
+});
+`,
+    "utf8"
+  );
+  const agent = await createTestAgent(orchestrator, {
+    name: "stalled-acp",
+    role: "work",
+    mode: "acp",
+    provider: "mock",
+    command: `node "${scriptPath}"`,
+    env: { TENDRILFLOW_ACP_SESSION_READY_TIMEOUT_MS: "40" }
+  });
+  const task = await orchestrator.createTask({
+    title: "Stalled ACP",
+    owner_agent_id: agent.id
+  });
+
+  await orchestrator.startAgent(agent.id);
+  await orchestrator.postRoomMessage(task.task_id, "@stalled-acp run only after session is ready");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  await orchestrator.stopAgent(agent.id);
+
+  const events = await orchestrator.store.readEvents(task.task_id);
+  const logs = await orchestrator.store.readAgentLogs(agent.id);
+  assert.ok(!events.some((event) => event.content?.text === "prompt should not be sent before ready"));
+  assert.ok(events.some((event) => event.type === "agent_message" && event.actor.id === agent.id));
+  assert.ok(logs.some((event) => event.type === "error" && /ACP session was not ready/.test(event.content?.text || "")));
+  assert.ok(logs.some((event) => /Could not send to the running CLI session/.test(event.content?.text || "")));
 });
 
 test("generates a final report and moves the task to done", async () => {

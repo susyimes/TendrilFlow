@@ -14,6 +14,8 @@ const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000;
 const AGENT_STALE_AFTER_MS = 5 * 60 * 1000;
 const AGENT_INIT_PROFILE = "standard";
 const AGENT_INIT_PROFILE_VERSION = "tendrilflow.agent_init.v1";
+const GROUP_ROUTE_PROTOCOL = "tendrilflow.group_route.v1";
+const GROUP_ROUTE_MAX_HOPS = 2;
 const execFileAsync = promisify(execFile);
 
 function spawnFileAsync(file, args, options = {}) {
@@ -79,11 +81,109 @@ function spawnFileAsync(file, args, options = {}) {
   });
 }
 
+async function existsFile(filePath) {
+  if (!filePath) {
+    return false;
+  }
+  try {
+    const stats = await fs.stat(filePath);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function resolveWindowsCommandForSpawn(command) {
+  const value = String(command || "").trim();
+  if (process.platform !== "win32" || !value) {
+    return { file: value, argsPrefix: [] };
+  }
+  const candidates = [];
+  const addCandidate = (candidate) => {
+    const trimmed = String(candidate || "").trim();
+    if (trimmed && !candidates.includes(trimmed)) {
+      candidates.push(trimmed);
+    }
+  };
+
+  if (/[\\/]/.test(value) || /^[A-Za-z]:/.test(value)) {
+    addCandidate(value);
+  } else {
+    try {
+      const { stdout } = await execFileAsync("where.exe", [value], { windowsHide: true });
+      stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .forEach(addCandidate);
+    } catch {
+      addCandidate(value);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const ext = path.extname(candidate).toLowerCase();
+    if (ext === ".exe") {
+      return { file: candidate, argsPrefix: [] };
+    }
+    if (ext === ".ps1") {
+      return {
+        file: "powershell.exe",
+        argsPrefix: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", candidate]
+      };
+    }
+    if (!ext) {
+      const exeShim = `${candidate}.exe`;
+      if (await existsFile(exeShim)) {
+        return { file: exeShim, argsPrefix: [] };
+      }
+      const psShim = `${candidate}.ps1`;
+      if (await existsFile(psShim)) {
+        return {
+          file: "powershell.exe",
+          argsPrefix: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psShim]
+        };
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const ext = path.extname(candidate).toLowerCase();
+    if (ext === ".cmd" || ext === ".bat") {
+      return { file: "cmd.exe", argsPrefix: ["/d", "/s", "/c", candidate] };
+    }
+  }
+
+  return { file: value, argsPrefix: [] };
+}
+
+function commandErrorDetails(error) {
+  const parts = [error?.message || String(error)];
+  const stderr = String(error?.stderr || "").trim();
+  const stdout = String(error?.stdout || "").trim();
+  if (stderr) {
+    parts.push(`stderr:\n${stderr.slice(-4000)}`);
+  }
+  if (stdout) {
+    parts.push(`stdout:\n${stdout.slice(-4000)}`);
+  }
+  return parts.join("\n");
+}
+
+function groupRouteTaskId(workspaceId, groupId) {
+  return `group_room:${workspaceId}:${groupId}`;
+}
+
+function parseGroupRouteTaskId(taskId) {
+  const match = String(taskId || "").match(/^group_room:([^:]+):([^:]+)$/);
+  return match ? { workspace_id: match[1], group_id: match[2] } : null;
+}
+
 function quoteShell(value) {
   return `"${String(value || "").replaceAll('"', '\\"')}"`;
 }
 
-const INTERNAL_AGENT_SCRIPTS = ["codex-agent.js", "mock-agent.js", "mock-acp-agent.js"];
+const INTERNAL_AGENT_SCRIPTS = ["codex-agent.js", "provider-agent.js", "mock-agent.js", "mock-acp-agent.js"];
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -174,6 +274,12 @@ function displayShellArg(value) {
   return /^[a-zA-Z0-9_./:=+-]+$/.test(String(value || "")) ? String(value) : quotePowerShellLiteral(value);
 }
 
+function maybePushArg(args, name, value) {
+  if (value) {
+    args.push(name, value);
+  }
+}
+
 function shellOptionValue(command, name) {
   const pattern = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`);
   const match = String(command || "").match(pattern);
@@ -182,6 +288,108 @@ function shellOptionValue(command, name) {
 
 function shellHasFlag(command, name) {
   return new RegExp(`(?:^|\\s)--${name}(?:\\s|$)`).test(String(command || ""));
+}
+
+function kimiWorkspaceHash(cwd) {
+  return crypto.createHash("md5").update(path.resolve(cwd)).digest("hex");
+}
+
+function includesText(haystack, needle) {
+  return Boolean(needle) && String(haystack || "").toLowerCase().includes(String(needle).toLowerCase());
+}
+
+function commandFirstToken(command) {
+  const trimmed = String(command || "").trim().replace(/^&\s+/, "");
+  const match = trimmed.match(/^"([^"]+)"|'([^']+)'|(\S+)/);
+  return match ? match[1] || match[2] || match[3] || "" : "";
+}
+
+function executableName(commandOrPath) {
+  return path
+    .basename(String(commandOrPath || "").trim())
+    .replace(/\.(cmd|bat|exe|ps1)$/i, "")
+    .toLowerCase();
+}
+
+function isProviderAdapterCommand(command) {
+  return /\bprovider-agent\.js\b/i.test(String(command || ""));
+}
+
+function isProviderBackgroundAdapterAgent(agent) {
+  return (
+    agent.mode === "exec" &&
+    ["claude", "gemini", "kimi"].includes(String(agent.provider || "").toLowerCase()) &&
+    isProviderAdapterCommand(agent.command)
+  );
+}
+
+function isRawProviderCliCommand(provider, command) {
+  const raw = String(command || "").trim();
+  if (!raw) {
+    return true;
+  }
+  return executableName(commandFirstToken(raw)) === provider;
+}
+
+function providerCommandOption(provider, command) {
+  const explicit = shellOptionValue(command, `${provider}-command`) || shellOptionValue(command, "provider-command");
+  if (explicit) {
+    return explicit;
+  }
+  const first = commandFirstToken(command);
+  return executableName(first) === provider && first.toLowerCase() !== provider ? first : "";
+}
+
+function providerAdapterCommand(rootDir, provider, name, cwd, sourceCommand = "", options = {}) {
+  const normalizedProvider = String(provider || "").toLowerCase();
+  const args = [
+    "--provider",
+    quoteShell(normalizedProvider),
+    "--name",
+    quoteShell(name || `${normalizedProvider}-agent`),
+    "--cwd",
+    quoteShell(cwd || rootDir)
+  ];
+  const commandOption = providerCommandOption(normalizedProvider, sourceCommand);
+  if (commandOption) {
+    args.push("--provider-command", quoteShell(commandOption));
+  }
+  const model = shellOptionValue(sourceCommand, "model") || options.model || "";
+  if (model) {
+    args.push("--model", quoteShell(model));
+  }
+  const sessionId =
+    options.provider_session_id ||
+    options.session_id ||
+    shellOptionValue(sourceCommand, "session-id") ||
+    shellOptionValue(sourceCommand, "session") ||
+    "";
+  if (sessionId) {
+    args.push("--session-id", quoteShell(sessionId));
+  }
+  const timeoutMs = shellOptionValue(sourceCommand, "timeout-ms") || options.timeout_ms || "";
+  if (timeoutMs) {
+    args.push("--timeout-ms", quoteShell(timeoutMs));
+  }
+  if (normalizedProvider === "claude") {
+    const permissionMode = shellOptionValue(sourceCommand, "permission-mode") || options.permission_mode || "";
+    const tools = shellOptionValue(sourceCommand, "tools") || options.tools || "";
+    if (permissionMode) {
+      args.push("--permission-mode", quoteShell(permissionMode));
+    }
+    if (tools) {
+      args.push("--tools", quoteShell(tools));
+    }
+  } else if (normalizedProvider === "gemini") {
+    const approvalMode = shellOptionValue(sourceCommand, "approval-mode") || options.approval_mode || "";
+    if (approvalMode) {
+      args.push("--approval-mode", quoteShell(approvalMode));
+    }
+    if (shellHasFlag(sourceCommand, "no-skip-trust")) {
+      args.push("--no-skip-trust");
+    }
+  }
+  return internalNodeCommand(rootDir, "provider-agent.js", args.join(" "));
 }
 
 function isCodexCliAgent(agent) {
@@ -235,12 +443,22 @@ function cliCommandForAgent(agent, cwd, sessionId = "", initPrompt = "") {
 function claudeCliCommandForAgent(agent, initPrompt = "") {
   const env = parseEnv(agent.env);
   const configuredCommand = String(agent.command || "");
-  const claudeCommand = shellOptionValue(configuredCommand, "claude-command") || env.TENDRILFLOW_CLAUDE_COMMAND || "claude";
+  const claudeCommand =
+    shellOptionValue(configuredCommand, "claude-command") ||
+    shellOptionValue(configuredCommand, "provider-command") ||
+    env.TENDRILFLOW_CLAUDE_COMMAND ||
+    "claude";
   const sessionId =
     agent.provider_session_id ||
     agent.claude_session_id ||
     shellOptionValue(configuredCommand, "session-id") ||
     env.TENDRILFLOW_CLAUDE_SESSION_ID ||
+    "";
+  const resumeTarget =
+    agent.provider_session_id ||
+    agent.claude_session_id ||
+    shellOptionValue(configuredCommand, "resume") ||
+    env.TENDRILFLOW_CLAUDE_RESUME ||
     "";
   const sessionName =
     agent.provider_session_name || agent.claude_session_name || shellOptionValue(configuredCommand, "name") || agent.name || "";
@@ -249,7 +467,13 @@ function claudeCliCommandForAgent(agent, initPrompt = "") {
     shellOptionValue(configuredCommand, "permission-mode") || env.TENDRILFLOW_CLAUDE_PERMISSION_MODE || "";
   const tools = shellOptionValue(configuredCommand, "tools") || env.TENDRILFLOW_CLAUDE_TOOLS || "";
   const args = [];
-  if (sessionId) {
+  if (initPrompt && sessionId) {
+    args.push("--session-id", quotePowerShellLiteral(sessionId));
+  } else if (resumeTarget) {
+    args.push("--resume", quotePowerShellLiteral(resumeTarget));
+  } else if (agent.initialized_at || agent.init_status === "initialized") {
+    args.push("--continue");
+  } else if (sessionId) {
     args.push("--session-id", quotePowerShellLiteral(sessionId));
   }
   if (sessionName) {
@@ -273,8 +497,15 @@ function claudeCliCommandForAgent(agent, initPrompt = "") {
 function geminiCliCommandForAgent(agent, initPrompt = "") {
   const env = parseEnv(agent.env);
   const configuredCommand = String(agent.command || "");
-  const geminiCommand = env.TENDRILFLOW_GEMINI_COMMAND || configuredCommand.replace(/(^|\s)--acp(?=\s|$)/g, " ").trim() || "gemini";
+  const configuredGeminiCommand = configuredCommand.replace(/(^|\s)--acp(?=\s|$)/g, " ").trim();
+  const geminiCommand =
+    shellOptionValue(configuredCommand, "gemini-command") ||
+    shellOptionValue(configuredCommand, "provider-command") ||
+    env.TENDRILFLOW_GEMINI_COMMAND ||
+    (isProviderAdapterCommand(configuredCommand) ? "gemini" : configuredGeminiCommand) ||
+    "gemini";
   const sessionId = agent.provider_session_id || shellOptionValue(configuredCommand, "session-id") || env.TENDRILFLOW_GEMINI_SESSION_ID || "";
+  const resumeTarget = agent.provider_session_id || shellOptionValue(configuredCommand, "resume") || env.TENDRILFLOW_GEMINI_RESUME || "";
   const model = shellOptionValue(configuredCommand, "model") || env.TENDRILFLOW_GEMINI_MODEL || "";
   const approvalMode = shellOptionValue(configuredCommand, "approval-mode") || env.TENDRILFLOW_GEMINI_APPROVAL_MODE || "";
   const args = [];
@@ -289,8 +520,10 @@ function geminiCliCommandForAgent(agent, initPrompt = "") {
       args.push("--session-id", quotePowerShellLiteral(sessionId));
     }
     args.push("--prompt-interactive", quotePowerShellLiteral(initPrompt));
-  } else if (sessionId) {
-    args.push("--resume", quotePowerShellLiteral(sessionId));
+  } else if (resumeTarget) {
+    args.push("--resume", quotePowerShellLiteral(resumeTarget));
+  } else if (agent.initialized_at) {
+    args.push("--resume", quotePowerShellLiteral("latest"));
   }
   return `${powerShellExecutable(geminiCommand)}${args.length ? ` ${args.join(" ")}` : ""}`;
 }
@@ -298,15 +531,32 @@ function geminiCliCommandForAgent(agent, initPrompt = "") {
 function kimiCliCommandForAgent(agent, cwd, initPrompt = "") {
   const env = parseEnv(agent.env);
   const configuredCommand = String(agent.command || "");
-  const kimiCommand = env.TENDRILFLOW_KIMI_COMMAND || configuredCommand.replace(/(^|\s)acp(?=\s|$)/g, " ").trim() || "kimi";
+  const configuredKimiCommand = configuredCommand.replace(/(^|\s)acp(?=\s|$)/g, " ").trim();
+  const kimiCommand =
+    shellOptionValue(configuredCommand, "kimi-command") ||
+    shellOptionValue(configuredCommand, "provider-command") ||
+    env.TENDRILFLOW_KIMI_COMMAND ||
+    (isProviderAdapterCommand(configuredCommand) ? "kimi" : configuredKimiCommand) ||
+    "kimi";
   const model = shellOptionValue(configuredCommand, "model") || env.TENDRILFLOW_KIMI_MODEL || "";
   const args = ["--work-dir", quotePowerShellLiteral(cwd)];
   if (model) {
     args.push("--model", quotePowerShellLiteral(model));
   }
+  const resumeTarget =
+    agent.provider_session_id ||
+    shellOptionValue(configuredCommand, "session") ||
+    shellOptionValue(configuredCommand, "session-id") ||
+    shellOptionValue(configuredCommand, "resume") ||
+    env.TENDRILFLOW_KIMI_SESSION_ID ||
+    env.TENDRILFLOW_KIMI_RESUME ||
+    "";
+  if (resumeTarget) {
+    args.push("-r", quotePowerShellLiteral(resumeTarget));
+  }
   if (initPrompt) {
     args.push("--prompt", quotePowerShellLiteral(initPrompt));
-  } else if (agent.initialized_at) {
+  } else if (shellHasFlag(configuredCommand, "continue") || env.TENDRILFLOW_KIMI_CONTINUE === "1") {
     args.push("--continue");
   }
   return `${powerShellExecutable(kimiCommand)} ${args.join(" ")}`;
@@ -421,20 +671,599 @@ function compactList(values, limit = 12) {
   return Array.from(new Set((values || []).filter(Boolean).map(String))).slice(0, limit);
 }
 
+function hashText(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 24);
+}
+
+function routeComparable(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function routeAgentAliases(agent) {
+  return [agent?.id, agent?.name, agent?.role ? `${agent.role}-agent` : "", agent?.role === "host" ? "群主" : ""]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+}
+
+function extractGroupRouteBlockTexts(text) {
+  const value = String(text || "");
+  const blocks = [];
+  const fencePattern = /```(?:tendrilflow[._-]?route|tendrilflow\.route)\s*([\s\S]*?)```/giu;
+  let match = null;
+  while ((match = fencePattern.exec(value))) {
+    blocks.push(match[1].trim());
+  }
+  const markerPattern = /(?:^|\n)\s*TENDRILFLOW_ROUTE\s+(\{[^\r\n]+\})/giu;
+  while ((match = markerPattern.exec(value))) {
+    blocks.push(match[1].trim());
+  }
+  return blocks;
+}
+
+function isProviderAdapterLifecycleLine(text) {
+  const value = String(text || "").trim();
+  return (
+    /^TENDRILFLOW_PROVIDER_SESSION_ID=\S+$/i.test(value) ||
+    /^[^:]+ ready as (?:(?:codex|claude|gemini|kimi)\s+)?CLI adapter \([^)]+\)\.$/i.test(value) ||
+    /^[^:]+:\s+starting\s+codex exec\.$/i.test(value) ||
+    /^[^:]+:\s+codex exec exited with code\b/i.test(value) ||
+    /^[^:]+:\s+(?:starting\s+)?(?:claude|gemini|kimi)\s+headless turn(?: completed)?\.$/i.test(value) ||
+    /^[^:]+:\s+(?:claude|gemini|kimi)\s+headless turn exited with code\b/i.test(value)
+  );
+}
+
 class Orchestrator {
   constructor(rootDir) {
     this.rootDir = path.resolve(rootDir);
     this.store = new FileStore(this.rootDir);
     this.sessions = new Map();
     this.stoppingAgents = new Set();
+    this.groupRouteBuffers = new Map();
     this.detachedSessionsReconciled = false;
+    this.hostInitPrepared = false;
   }
 
   async init() {
     await this.store.init();
+    await this.ensureProviderExecAdapterCommands();
+    if (!this.hostInitPrepared) {
+      await this.prepareCodexHostAgentInitializations();
+      this.hostInitPrepared = true;
+    }
     if (!this.detachedSessionsReconciled) {
       await this.reconcileDetachedAgentSessions();
       this.detachedSessionsReconciled = true;
+    }
+  }
+
+  kimiSessionsDir() {
+    return path.join(os.homedir(), ".kimi", "sessions");
+  }
+
+  geminiRootDir() {
+    return path.join(os.homedir(), ".gemini");
+  }
+
+  claudeProjectsDir() {
+    return path.join(os.homedir(), ".claude", "projects");
+  }
+
+  claudeProjectDirForCwd(cwd) {
+    const projectName = path.resolve(cwd || this.rootDir).replaceAll(":", "-").replace(/[\\/]/g, "-");
+    return path.join(this.claudeProjectsDir(), projectName);
+  }
+
+  async geminiProjectDirsForCwd(cwd) {
+    const root = this.geminiRootDir();
+    const resolvedCwd = path.resolve(cwd || this.rootDir);
+    const tmpDir = path.join(root, "tmp");
+    const entries = await fs.readdir(tmpDir, { withFileTypes: true }).catch(() => []);
+    const dirs = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const candidate = path.join(tmpDir, entry.name);
+      const projectRoot = await fs.readFile(path.join(candidate, ".project_root"), "utf8").catch(() => "");
+      if (projectRoot && path.resolve(projectRoot.trim()).toLowerCase() === resolvedCwd.toLowerCase()) {
+        dirs.push(candidate);
+      }
+    }
+    const fallback = path.join(tmpDir, slugify(path.basename(resolvedCwd), "project"));
+    if (!dirs.includes(fallback)) {
+      dirs.push(fallback);
+    }
+    return dirs;
+  }
+
+  async listGeminiSessionsForCwd(cwd) {
+    const dirs = await this.geminiProjectDirsForCwd(cwd);
+    const sessions = [];
+    for (const projectDir of dirs) {
+      const chatsDir = path.join(projectDir, "chats");
+      const entries = await fs.readdir(chatsDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile() || !/\.jsonl$/i.test(entry.name)) {
+          continue;
+        }
+        const filePath = path.join(chatsDir, entry.name);
+        const stat = await fs.stat(filePath).catch(() => null);
+        const firstLine = (await fs.readFile(filePath, "utf8").catch(() => "")).split(/\r?\n/, 1)[0] || "";
+        let meta = {};
+        try {
+          meta = firstLine ? JSON.parse(firstLine) : {};
+        } catch (_error) {
+          meta = {};
+        }
+        if (!meta.sessionId) {
+          continue;
+        }
+        sessions.push({
+          id: meta.sessionId,
+          path: filePath,
+          project_dir: projectDir,
+          mtime_ms: stat?.mtimeMs || 0
+        });
+      }
+    }
+    return sessions.sort((a, b) => b.mtime_ms - a.mtime_ms);
+  }
+
+  async geminiSessionForId(cwd, sessionId) {
+    if (!sessionId) {
+      return null;
+    }
+    const sessions = await this.listGeminiSessionsForCwd(cwd);
+    return sessions.find((session) => session.id === sessionId) || null;
+  }
+
+  async findGeminiSessionForAgent(agent, options = {}) {
+    const sessions = await this.listGeminiSessionsForCwd(agent.cwd || this.rootDir);
+    const scored = [];
+    for (const session of sessions.slice(0, 20)) {
+      const raw = await fs.readFile(session.path, "utf8").catch(() => "");
+      let score = 0;
+      if (session.id === agent.provider_session_id) {
+        score += 100;
+      }
+      if (includesText(raw, agent.id)) {
+        score += 100;
+      }
+      if (includesText(raw, "TendrilFlow Agent Initialization")) {
+        score += 20;
+      }
+      if (includesText(raw, `Agent: ${agent.name}`) || includesText(raw, agent.provider_session_name)) {
+        score += 12;
+      }
+      scored.push({ ...session, score });
+    }
+    const direct = scored
+      .filter((session) => session.score >= 100)
+      .sort((a, b) => b.score - a.score || b.mtime_ms - a.mtime_ms)[0];
+    if (direct) {
+      return { ...direct, match: direct.id === agent.provider_session_id ? "session_id" : "agent_id" };
+    }
+    const contextual = scored
+      .filter((session) => session.score >= 30)
+      .sort((a, b) => b.score - a.score || b.mtime_ms - a.mtime_ms)[0];
+    if (contextual) {
+      return { ...contextual, match: "init_context" };
+    }
+    if (options.allowLatestCwd && sessions[0]) {
+      return { ...sessions[0], match: "latest_cwd" };
+    }
+    return null;
+  }
+
+  async claudeSessionForId(cwd, sessionId) {
+    if (!sessionId) {
+      return null;
+    }
+    const filePath = path.join(this.claudeProjectDirForCwd(cwd), `${sessionId}.jsonl`);
+    const stat = await fs.stat(filePath).catch(() => null);
+    return stat ? { id: sessionId, path: filePath, mtime_ms: stat.mtimeMs } : null;
+  }
+
+  async listKimiSessionsForCwd(cwd) {
+    const workspaceDir = path.join(this.kimiSessionsDir(), kimiWorkspaceHash(cwd || this.rootDir));
+    const entries = await fs.readdir(workspaceDir, { withFileTypes: true }).catch(() => []);
+    const sessions = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const sessionDir = path.join(workspaceDir, entry.name);
+      const contextPath = path.join(sessionDir, "context.jsonl");
+      const statePath = path.join(sessionDir, "state.json");
+      const stat =
+        (await fs.stat(contextPath).catch(() => null)) ||
+        (await fs.stat(statePath).catch(() => null));
+      if (!stat) {
+        continue;
+      }
+      sessions.push({
+        id: entry.name,
+        dir: sessionDir,
+        context_path: contextPath,
+        state_path: statePath,
+        mtime_ms: stat.mtimeMs
+      });
+    }
+    return sessions.sort((a, b) => b.mtime_ms - a.mtime_ms);
+  }
+
+  async readKimiSessionSearchText(session) {
+    const parts = [];
+    for (const filePath of [session.context_path, session.state_path]) {
+      const raw = await fs.readFile(filePath, "utf8").catch(() => "");
+      if (raw) {
+        parts.push(raw.slice(0, 120000), raw.slice(-120000));
+      }
+    }
+    return parts.join("\n");
+  }
+
+  async findKimiSessionForAgent(agent, options = {}) {
+    const sessions = await this.listKimiSessionsForCwd(agent.cwd || this.rootDir);
+    const scored = [];
+    for (const session of sessions.slice(0, 20)) {
+      const text = await this.readKimiSessionSearchText(session);
+      let score = 0;
+      if (includesText(text, agent.id)) {
+        score += 100;
+      }
+      if (includesText(text, "TendrilFlow Agent Initialization")) {
+        score += 20;
+      }
+      if (includesText(text, `Agent: ${agent.name}`) || includesText(text, agent.provider_session_name)) {
+        score += 12;
+      }
+      if (includesText(text, path.resolve(agent.cwd || this.rootDir))) {
+        score += 5;
+      }
+      scored.push({ ...session, score });
+    }
+    const direct = scored
+      .filter((session) => session.score >= 100)
+      .sort((a, b) => b.score - a.score || b.mtime_ms - a.mtime_ms)[0];
+    if (direct) {
+      return { ...direct, match: "agent_id" };
+    }
+    const contextual = scored
+      .filter((session) => session.score >= 30)
+      .sort((a, b) => b.score - a.score || b.mtime_ms - a.mtime_ms)[0];
+    if (contextual) {
+      return { ...contextual, match: "init_context" };
+    }
+    if (options.allowLatestCwd && sessions[0]) {
+      return { ...sessions[0], match: "latest_cwd" };
+    }
+    return null;
+  }
+
+  async patchProviderSession(agent, sessionId, source = "provider_marker") {
+    if (!sessionId) {
+      return agent;
+    }
+    const provider = String(agent.provider || "").toLowerCase();
+    const commandSessionId = shellOptionValue(agent.command, "session-id") || shellOptionValue(agent.command, "session");
+    const shouldUpdateCommand = isProviderAdapterCommand(agent.command) && commandSessionId !== sessionId;
+    const shouldUpdateSource = agent.provider_session_source !== source;
+    if (agent.provider_session_id === sessionId && !shouldUpdateCommand && !shouldUpdateSource) {
+      return agent;
+    }
+    const patch = {
+      provider_session_id: sessionId,
+      provider_session_source: source
+    };
+    if (provider === "claude") {
+      patch.claude_session_id = agent.claude_session_id || sessionId;
+      patch.claude_session_name = agent.claude_session_name || agent.provider_session_name || agent.name;
+    }
+    if (shouldUpdateCommand) {
+      patch.command = providerAdapterCommand(this.rootDir, provider, agent.name, agent.cwd || this.rootDir, agent.command, {
+        provider_session_id: sessionId
+      });
+    }
+    return this.store.patchAgent(agent.id, patch);
+  }
+
+  async runHeadlessProviderCommand(command, args, options) {
+    const { shell: _shell, ...spawnOptions } = options || {};
+    const resolved = await resolveWindowsCommandForSpawn(command);
+    return spawnFileAsync(resolved.file, [...resolved.argsPrefix, ...args], spawnOptions);
+  }
+
+  headlessProviderCommand(agent, prompt, sessionId) {
+    const provider = String(agent.provider || "").toLowerCase();
+    const env = parseEnv(agent.env);
+    const configuredCommand = String(agent.command || "");
+    const args = [];
+
+    if (provider === "gemini") {
+      const command =
+        shellOptionValue(configuredCommand, "gemini-command") ||
+        shellOptionValue(configuredCommand, "provider-command") ||
+        env.TENDRILFLOW_GEMINI_COMMAND ||
+        "gemini";
+      const model = shellOptionValue(configuredCommand, "model") || env.TENDRILFLOW_GEMINI_MODEL || "";
+      const approvalMode = shellOptionValue(configuredCommand, "approval-mode") || env.TENDRILFLOW_GEMINI_APPROVAL_MODE || "";
+      maybePushArg(args, "--model", model);
+      maybePushArg(args, "--approval-mode", approvalMode);
+      if (!shellHasFlag(configuredCommand, "no-skip-trust")) {
+        args.push("--skip-trust");
+      }
+      args.push("--session-id", sessionId, "--output-format", "text", "--prompt", prompt);
+      return { command, args };
+    }
+
+    if (provider === "claude") {
+      const command =
+        shellOptionValue(configuredCommand, "claude-command") ||
+        shellOptionValue(configuredCommand, "provider-command") ||
+        env.TENDRILFLOW_CLAUDE_COMMAND ||
+        "claude";
+      const sessionName =
+        agent.provider_session_name || agent.claude_session_name || shellOptionValue(configuredCommand, "name") || agent.name || "";
+      const model = shellOptionValue(configuredCommand, "model") || env.TENDRILFLOW_CLAUDE_MODEL || "";
+      const permissionMode =
+        shellOptionValue(configuredCommand, "permission-mode") || env.TENDRILFLOW_CLAUDE_PERMISSION_MODE || "";
+      const tools = shellOptionValue(configuredCommand, "tools") || env.TENDRILFLOW_CLAUDE_TOOLS || "";
+      args.push("--session-id", sessionId, "--print", "--input-format", "text", "--output-format", "text");
+      maybePushArg(args, "--name", sessionName);
+      maybePushArg(args, "--model", model);
+      maybePushArg(args, "--permission-mode", permissionMode);
+      maybePushArg(args, "--tools", tools);
+      args.push(prompt);
+      return { command, args };
+    }
+
+    return null;
+  }
+
+  async providerStoredSession(agent, providerSessionId = agent.provider_session_id) {
+    if (isGeminiCliAgent(agent)) {
+      return this.geminiSessionForId(agent.cwd || this.rootDir, providerSessionId);
+    }
+    if (isClaudeCliAgent(agent)) {
+      return this.claudeSessionForId(agent.cwd || this.rootDir, providerSessionId);
+    }
+    return null;
+  }
+
+  async initializeHeadlessProviderSession(agent, prompt, preparedPatch = {}, input = {}) {
+    if (!isGeminiCliAgent(agent) && !isClaudeCliAgent(agent)) {
+      return null;
+    }
+    const provider = String(agent.provider || "").toLowerCase();
+    const cwd = path.resolve(agent.cwd || this.rootDir);
+    let sessionId = agent.provider_session_id || preparedPatch.provider_session_id || crypto.randomUUID();
+    const existingSession = await this.providerStoredSession(agent, sessionId);
+    if (existingSession && agent.initialized_at) {
+      const updated = await this.store.patchAgent(agent.id, {
+        ...preparedPatch,
+        provider_session_id: sessionId,
+        provider_session_source: agent.provider_session_source || "verified_existing",
+        provider_session_path: existingSession.path,
+        init_status: "initialized",
+        initialized_at: agent.initialized_at,
+        init_error: null
+      });
+      return {
+        agent: updated,
+        initialized: false,
+        skipped: true,
+        provider_session_id: sessionId,
+        provider_session_path: existingSession.path,
+        reason: "Provider session already exists."
+      };
+    }
+
+    const { command, args } = this.headlessProviderCommand(agent, prompt, sessionId) || {};
+    if (!command) {
+      return null;
+    }
+    const displayCommand = `${powerShellExecutable(command)} ${args.map(displayShellArg).join(" ")}`;
+    agent = await this.store.patchAgent(agent.id, {
+      ...preparedPatch,
+      provider_session_id: sessionId,
+      provider_session_name: preparedPatch.provider_session_name || agent.provider_session_name || agent.name,
+      ...(isClaudeCliAgent(agent)
+        ? {
+            claude_session_id: preparedPatch.claude_session_id || agent.claude_session_id || sessionId,
+            claude_session_name: preparedPatch.claude_session_name || agent.claude_session_name || agent.name
+          }
+        : {}),
+      init_status: "initializing",
+      init_error: null
+    });
+    await this.store.appendAgentLog(agent, {
+      type: "session_init_started",
+      content: {
+        text: `Initializing ${provider} session with TendrilFlow context.`,
+        command: displayCommand,
+        cwd,
+        init_profile_version: AGENT_INIT_PROFILE_VERSION,
+        init_delivery: "headless_provider_session"
+      }
+    });
+
+    try {
+      const { stdout, stderr } = await this.runHeadlessProviderCommand(command, args, {
+        cwd,
+        env: { ...process.env, ...parseEnv(agent.env) },
+        maxBuffer: 4 * 1024 * 1024,
+        timeout: Number(input.timeout_ms || input.timeoutMs || 180000)
+      });
+      const session = await this.providerStoredSession(agent, sessionId);
+      if (!session?.id) {
+        throw new Error(`${provider} init finished, but no matching session was found for ${sessionId}.`);
+      }
+      const updated = await this.patchProviderSession(
+        await this.store.patchAgent(agent.id, {
+          init_status: "initialized",
+          initialized_at: nowIso(),
+          init_error: null,
+          provider_session_path: session.path
+        }),
+        session.id,
+        "headless_init"
+      );
+      await this.store.appendAgentLog(updated, {
+        type: "session_initialized",
+        content: {
+          text: `Initialized ${provider} session ${session.id}.`,
+          command: displayCommand,
+          provider_session_id: session.id,
+          provider_session_path: session.path,
+          stdout: stdout?.slice(-4000) || "",
+          stderr: stderr?.slice(-4000) || ""
+        }
+      });
+      return {
+        agent: updated,
+        initialized: true,
+        provider_session_id: session.id,
+        provider_session_path: session.path,
+        init_delivery: "headless_provider_session",
+        command: displayCommand,
+        stdout,
+        stderr
+      };
+    } catch (error) {
+      const detail = commandErrorDetails(error);
+      await this.store.appendAgentLog(agent, {
+        type: "session_init_failed",
+        content: {
+          text: detail,
+          command: displayCommand,
+          cwd,
+          stdout: error?.stdout?.slice(-4000) || "",
+          stderr: error?.stderr?.slice(-4000) || ""
+        }
+      });
+      await this.store.patchAgent(agent.id, {
+        init_status: "failed",
+        init_error: detail
+      });
+      throw error;
+    }
+  }
+
+  async captureProviderSessionMarker(agentId, event) {
+    if (event?.type !== "stdout") {
+      return;
+    }
+    const text = String(event.content?.text || "").trim();
+    if (!text) {
+      return;
+    }
+    let agent = await this.store.getAgent(agentId);
+    if (!agent || !isProviderBackgroundAdapterAgent(agent)) {
+      return;
+    }
+    const marker = text.match(/^TENDRILFLOW_PROVIDER_SESSION_ID=(\S+)$/);
+    if (marker) {
+      agent = await this.patchProviderSession(agent, marker[1], "provider_adapter");
+    }
+    if (/headless turn completed\.$/i.test(text) && agent?.init_status === "initializing") {
+      await this.store.patchAgent(agent.id, {
+        init_status: "initialized",
+        initialized_at: nowIso(),
+        init_error: null
+      });
+    }
+  }
+
+  async markProviderInitFailed(agentId, event) {
+    if (event?.type !== "stderr") {
+      return;
+    }
+    const text = String(event.content?.text || "").trim();
+    if (!text || !/(headless turn exited with code|failed to start|No such option|Error)/i.test(text)) {
+      return;
+    }
+    const agent = await this.store.getAgent(agentId);
+    if (!agent || !isProviderBackgroundAdapterAgent(agent) || agent.init_status !== "initializing") {
+      return;
+    }
+    await this.store.patchAgent(agent.id, {
+      init_status: "failed",
+      init_error: text
+    });
+  }
+
+  async ensureProviderExecAdapterCommands() {
+    const agents = await this.store.listAgents();
+    for (const agent of agents) {
+      const provider = String(agent.provider || "").toLowerCase();
+      if (!["claude", "gemini", "kimi"].includes(provider) || agent.mode !== "exec") {
+        continue;
+      }
+      if (isProviderAdapterCommand(agent.command)) {
+        const delivery = this.providerInitDelivery(agent);
+        const patch = {};
+        if (agent.init_delivery && agent.init_delivery !== delivery) {
+          patch.init_delivery = delivery;
+        }
+        if (!agent.initialized_at && agent.init_status === "prepared") {
+          patch.init_status = "pending";
+        }
+        const commandSessionId = shellOptionValue(agent.command, "session-id") || shellOptionValue(agent.command, "session");
+        if (agent.provider_session_id && commandSessionId !== agent.provider_session_id) {
+          patch.command = providerAdapterCommand(this.rootDir, provider, agent.name, agent.cwd || this.rootDir, agent.command, {
+            provider_session_id: agent.provider_session_id
+          });
+        }
+        if (Object.keys(patch).length) {
+          await this.store.patchAgent(agent.id, patch);
+        }
+        continue;
+      }
+      if (!isRawProviderCliCommand(provider, agent.command)) {
+        continue;
+      }
+      const providerSessionId =
+        agent.provider_session_id || (provider === "claude" || provider === "gemini" ? crypto.randomUUID() : null);
+      const providerSessionName = agent.provider_session_name || agent.name;
+      const patch = {
+        command: providerAdapterCommand(this.rootDir, provider, agent.name, agent.cwd || this.rootDir, agent.command, {
+          provider_session_id: providerSessionId
+        }),
+        provider_session_name: providerSessionName,
+        init_delivery: "background_adapter_prompt"
+      };
+      if (!agent.initialized_at && agent.init_status === "prepared") {
+        patch.init_status = "pending";
+      }
+      if (providerSessionId) {
+        patch.provider_session_id = providerSessionId;
+      }
+      if (provider === "claude") {
+        patch.claude_session_id = agent.claude_session_id || providerSessionId;
+        patch.claude_session_name = agent.claude_session_name || providerSessionName;
+      }
+      await this.store.patchAgent(agent.id, patch);
+    }
+  }
+
+  async prepareCodexHostAgentInitializations() {
+    const agents = await this.store.listAgents();
+    for (const agent of agents) {
+      if (agent.role !== "host" || !isCodexCliAgent(agent) || agent.initialized_at) {
+        continue;
+      }
+      const delivery = this.providerInitDelivery(agent);
+      if (
+        agent.init_prompt &&
+        agent.init_profile_version === AGENT_INIT_PROFILE_VERSION &&
+        agent.init_delivery === delivery &&
+        agent.init_status
+      ) {
+        continue;
+      }
+      const prepared = await this.prepareAgentInitialization(agent);
+      await this.store.patchAgent(agent.id, prepared.patch);
     }
   }
 
@@ -519,7 +1348,23 @@ class Orchestrator {
 
   async createGroup(input) {
     await this.init();
-    return this.store.createGroup(input);
+    const group = await this.store.createGroup(input);
+    const host = (await this.store.listAgents()).find(
+      (agent) => agent.workspace_id === group.workspace_id && agent.group_id === group.group_id && agent.role === "host"
+    );
+    if (host && isCodexCliAgent(host)) {
+      const prepared = await this.prepareAgentInitialization(host);
+      await this.store.patchAgent(host.id, prepared.patch);
+      await this.store.appendAgentLog(host, {
+        type: "session_init_prepared",
+        content: {
+          text: "Prepared TendrilFlow init context for the group Host Agent.",
+          init_profile_version: AGENT_INIT_PROFILE_VERSION,
+          init_delivery: prepared.delivery
+        }
+      });
+    }
+    return group;
   }
 
   async deleteGroup(workspaceId, groupId) {
@@ -632,24 +1477,61 @@ class Orchestrator {
     };
     const name = input.name?.trim() || "agent";
     if (["claude", "gemini", "kimi"].includes(provider)) {
-      agentInput.mode = input.mode || (provider === "claude" ? "exec" : "acp");
+      agentInput.mode = input.mode || "exec";
       agentInput.provider_session_name = input.provider_session_name || name;
     }
     if (["claude", "gemini"].includes(provider)) {
       agentInput.provider_session_id = input.provider_session_id || crypto.randomUUID();
+    } else if (provider === "kimi" && input.provider_session_id) {
+      agentInput.provider_session_id = input.provider_session_id;
     }
     if (provider === "claude") {
       agentInput.claude_session_id = input.claude_session_id || agentInput.provider_session_id;
       agentInput.claude_session_name = input.claude_session_name || agentInput.provider_session_name;
-      if (!agentInput.command) {
-        agentInput.command = `claude --name ${quoteShell(name)}`;
+      if (!agentInput.command || isRawProviderCliCommand(provider, agentInput.command) || isProviderAdapterCommand(agentInput.command)) {
+        agentInput.command = providerAdapterCommand(
+          this.rootDir,
+          provider,
+          name,
+          agentInput.cwd || input.cwd || this.rootDir,
+          agentInput.command,
+          { provider_session_id: agentInput.provider_session_id }
+        );
       } else {
         agentInput.command = syncCommandNameOption(agentInput.command, name);
       }
     } else if (provider === "gemini" && !agentInput.command) {
-      agentInput.command = "gemini --acp";
+      agentInput.command =
+        agentInput.mode === "acp"
+          ? "gemini --acp"
+          : providerAdapterCommand(this.rootDir, provider, name, agentInput.cwd || input.cwd || this.rootDir, "", {
+              provider_session_id: agentInput.provider_session_id
+            });
+    } else if (provider === "gemini" && agentInput.mode === "exec" && isRawProviderCliCommand(provider, agentInput.command)) {
+      agentInput.command = providerAdapterCommand(
+        this.rootDir,
+        provider,
+        name,
+        agentInput.cwd || input.cwd || this.rootDir,
+        agentInput.command,
+        { provider_session_id: agentInput.provider_session_id }
+      );
     } else if (provider === "kimi" && !agentInput.command) {
-      agentInput.command = "kimi acp";
+      agentInput.command =
+        agentInput.mode === "acp"
+          ? "kimi acp"
+          : providerAdapterCommand(this.rootDir, provider, name, agentInput.cwd || input.cwd || this.rootDir, "", {
+              provider_session_id: agentInput.provider_session_id
+            });
+    } else if (provider === "kimi" && agentInput.mode === "exec" && isRawProviderCliCommand(provider, agentInput.command)) {
+      agentInput.command = providerAdapterCommand(
+        this.rootDir,
+        provider,
+        name,
+        agentInput.cwd || input.cwd || this.rootDir,
+        agentInput.command,
+        { provider_session_id: agentInput.provider_session_id }
+      );
     }
     return this.store.upsertAgent(agentInput);
   }
@@ -1126,6 +2008,12 @@ class Orchestrator {
       "- Do not expose private chain-of-thought. Provide concise rationale, evidence, and results.",
       "- Do not create hidden side conversations. Ask the Host Agent when another member, review, debug help, or handoff is needed.",
       "- Do not auto-route based on another agent's natural-language output; wait for visible user or Host intent.",
+      "- If a visible user or Host asks you to coordinate another agent, do not claim you contacted them in prose.",
+      "- To delegate inside the Agent Room, emit exactly one structured route request block and keep the user-facing explanation short:",
+      '```tendrilflow.route',
+      '{"to":"agent name","message":"specific request for that agent","reason":"why this route is needed","expect_response":true}',
+      '```',
+      "- Plain @mentions in your own natural-language reply are visible text only and do not trigger routing.",
       "",
       ...roleContract,
       "",
@@ -1146,6 +2034,9 @@ class Orchestrator {
     if (isCodexCliAgent(agent)) {
       return "codex_exec_session";
     }
+    if (isProviderBackgroundAdapterAgent(agent)) {
+      return "background_adapter_prompt";
+    }
     if (isClaudeCliAgent(agent) || isGeminiCliAgent(agent) || isKimiCliAgent(agent)) {
       return "interactive_prompt";
     }
@@ -1160,7 +2051,7 @@ class Orchestrator {
       init_profile_version: AGENT_INIT_PROFILE_VERSION,
       init_prompt: prompt,
       init_delivery: delivery,
-      init_status: delivery === "codex_exec_session" ? "pending" : "prepared",
+      init_status: ["codex_exec_session", "background_adapter_prompt"].includes(delivery) ? "pending" : "prepared",
       init_error: null
     };
     if ((isClaudeCliAgent(agent) || isGeminiCliAgent(agent)) && !agent.provider_session_id) {
@@ -1208,14 +2099,19 @@ class Orchestrator {
           prompt
         };
       }
+      if (isGeminiCliAgent(agent) || isClaudeCliAgent(agent)) {
+        return this.initializeHeadlessProviderSession(agent, prompt, patch, input);
+      }
       const updated = await this.store.patchAgent(agent.id, patch);
       await this.store.appendAgentLog(updated, {
         type: "session_init_prepared",
         content: {
           text:
-            delivery === "interactive_prompt"
-              ? "Prepared TendrilFlow init context; it will be delivered as the first interactive CLI prompt."
-              : "Prepared TendrilFlow init context for this provider.",
+            delivery === "background_adapter_prompt"
+              ? "Prepared TendrilFlow init context; it will be delivered to the background CLI adapter on first start."
+              : delivery === "interactive_prompt"
+                ? "Prepared TendrilFlow init context; it will be delivered as the first interactive CLI prompt."
+                : "Prepared TendrilFlow init context for this provider.",
           init_profile_version: AGENT_INIT_PROFILE_VERSION,
           init_delivery: delivery
         }
@@ -1227,9 +2123,11 @@ class Orchestrator {
         init_delivery: delivery,
         prompt,
         reason:
-          delivery === "interactive_prompt"
-            ? "Provider session will receive the init prompt on first CLI open."
-            : "Provider does not have a TendrilFlow-managed session initializer."
+          delivery === "background_adapter_prompt"
+            ? "Provider background adapter will receive the init prompt on first start."
+            : delivery === "interactive_prompt"
+              ? "Provider session will receive the init prompt on first CLI open."
+              : "Provider does not have a TendrilFlow-managed session initializer."
       };
     }
 
@@ -1327,24 +2225,63 @@ class Orchestrator {
     }
     const dryRun = Boolean(input.dry_run || input.dryRun);
     const cwd = path.resolve(agent.cwd || this.rootDir);
+    if (!dryRun && (isGeminiCliAgent(agent) || isClaudeCliAgent(agent))) {
+      const storedSession = await this.providerStoredSession(agent);
+      if (!agent.initialized_at || agent.init_status !== "initialized" || !storedSession) {
+        const prepared = await this.prepareAgentInitialization(agent);
+        const initialized = await this.initializeHeadlessProviderSession(agent, prepared.prompt, prepared.patch, input);
+        if (initialized?.agent) {
+          agent = initialized.agent;
+        }
+      } else if (storedSession.path && !agent.provider_session_path) {
+        agent = await this.store.patchAgent(agent.id, {
+          provider_session_path: storedSession.path,
+          provider_session_source: agent.provider_session_source || "verified_existing"
+        });
+      }
+    }
     if (isClaudeCliAgent(agent) && (!agent.claude_session_id || !agent.claude_session_name)) {
-      const sessionId = agent.provider_session_id || agent.claude_session_id || crypto.randomUUID();
+      const shouldCreateSessionId = !(agent.initialized_at || agent.init_status === "initialized");
+      const sessionId = agent.provider_session_id || agent.claude_session_id || (shouldCreateSessionId ? crypto.randomUUID() : "");
       const sessionName = agent.provider_session_name || agent.claude_session_name || agent.name;
-      agent = await this.store.patchAgent(agent.id, {
-        provider_session_id: agent.provider_session_id || sessionId,
+      const patch = {
         provider_session_name: agent.provider_session_name || sessionName,
-        claude_session_id: agent.claude_session_id || sessionId,
         claude_session_name: agent.claude_session_name || sessionName
-      });
+      };
+      if (sessionId) {
+        patch.provider_session_id = agent.provider_session_id || sessionId;
+        patch.claude_session_id = agent.claude_session_id || sessionId;
+      }
+      agent = await this.store.patchAgent(agent.id, patch);
     } else if (isGeminiCliAgent(agent) && !agent.provider_session_id) {
-      agent = await this.store.patchAgent(agent.id, {
-        provider_session_id: crypto.randomUUID(),
+      const patch = {
         provider_session_name: agent.provider_session_name || agent.name
-      });
-    } else if (isKimiCliAgent(agent) && !agent.provider_session_name) {
-      agent = await this.store.patchAgent(agent.id, {
-        provider_session_name: agent.name
-      });
+      };
+      if (!(agent.initialized_at || agent.init_status === "initialized")) {
+        patch.provider_session_id = crypto.randomUUID();
+      }
+      agent = await this.store.patchAgent(agent.id, patch);
+    } else if (isKimiCliAgent(agent)) {
+      const patch = {};
+      if (!agent.provider_session_name) {
+        patch.provider_session_name = agent.name;
+      }
+      if (!agent.provider_session_id) {
+        const session = await this.findKimiSessionForAgent(agent, {
+          allowLatestCwd: Boolean(agent.initialized_at || agent.init_status === "initialized")
+        });
+        if (session?.id) {
+          patch.provider_session_id = session.id;
+          patch.provider_session_source = session.match;
+          patch.provider_session_path = session.dir;
+        }
+      }
+      if (Object.keys(patch).length) {
+        agent = await this.store.patchAgent(agent.id, patch);
+        if (patch.provider_session_id) {
+          agent = await this.patchProviderSession(agent, patch.provider_session_id, patch.provider_session_source);
+        }
+      }
     }
 
     const codexSessionId = isCodexCliAgent(agent) ? await this.codexSessionIdForAgent(agent) : "";
@@ -1443,15 +2380,46 @@ class Orchestrator {
     if (agent.isolation_mode === "worktree") {
       agent = await this.ensureAgentWorktree(agent);
     }
-
+    let backgroundInitPrompt = "";
+    const needsBackgroundInitRefresh =
+      isProviderBackgroundAdapterAgent(agent) &&
+      (!agent.initialized_at ||
+        !agent.init_prompt ||
+        agent.init_profile_version !== AGENT_INIT_PROFILE_VERSION ||
+        !String(agent.init_prompt || "").includes("tendrilflow.route"));
+    if (needsBackgroundInitRefresh) {
+      if (
+        !agent.init_prompt ||
+        agent.init_profile_version !== AGENT_INIT_PROFILE_VERSION ||
+        !String(agent.init_prompt || "").includes("tendrilflow.route")
+      ) {
+        const prepared = await this.prepareAgentInitialization(agent);
+        agent = await this.store.patchAgent(agent.id, prepared.patch);
+        backgroundInitPrompt = prepared.prompt;
+      } else {
+        backgroundInitPrompt = agent.init_prompt;
+      }
+    }
     const logAgentEvent = async (event) => {
       await this.store.appendAgentLog(agent, event).catch(() => undefined);
     };
     const session = createAdapterSession(agent, {
       onTaskEvent: async (taskId, event) => {
+        const groupRoute = parseGroupRouteTaskId(taskId);
+        if (groupRoute) {
+          const groupEvent = await this.store
+            .appendGroupEvent(groupRoute.workspace_id, groupRoute.group_id, event)
+            .catch(() => null);
+          if (groupEvent) {
+            await this.handleGroupAgentEvent(groupRoute.workspace_id, groupRoute.group_id, groupEvent).catch(() => undefined);
+          }
+          return;
+        }
         await this.store.appendEvent(taskId, event).catch(() => undefined);
       },
       onSessionEvent: async (id, event) => {
+        await this.captureProviderSessionMarker(id, event).catch(() => undefined);
+        await this.markProviderInitFailed(id, event).catch(() => undefined);
         await logAgentEvent({ ...event, agent_id: id });
       },
       onExit: async (id, code) => {
@@ -1488,10 +2456,39 @@ class Orchestrator {
     try {
       const result = await session.start();
       this.sessions.set(agentId, session);
-      return this.store.patchAgent(agentId, {
+      let updated = await this.store.patchAgent(agentId, {
         status: result.status,
-        last_launch_detail: result.detail
+        last_launch_detail: result.detail,
+        last_error: null,
+        last_exit_code: null
       });
+      if (backgroundInitPrompt) {
+        const delivered =
+          typeof session.writeSessionLine === "function"
+            ? session.writeSessionLine(`${backgroundInitPrompt.replace(/\r?\n/g, " ")}\n`)
+            : typeof session.writeLine === "function" &&
+              session.writeLine(`${backgroundInitPrompt.replace(/\r?\n/g, " ")}\n`);
+        if (delivered) {
+          updated = await this.store.patchAgent(agentId, {
+            init_status: "initializing",
+            init_error: null
+          });
+          await this.store.appendAgentLog(updated, {
+            type: "session_init_started",
+            content: {
+              text: "Delivered TendrilFlow init context to the background CLI adapter.",
+              init_profile_version: AGENT_INIT_PROFILE_VERSION,
+              init_delivery: "background_adapter_prompt"
+            }
+          });
+        } else {
+          updated = await this.store.patchAgent(agentId, {
+            init_status: "failed",
+            init_error: "Could not write initialization prompt to the background CLI adapter."
+          });
+        }
+      }
+      return updated;
     } catch (error) {
       await logAgentEvent({
         type: "error",
@@ -1697,6 +2694,18 @@ class Orchestrator {
     return {
       task,
       events: await this.store.readEvents(taskId)
+    };
+  }
+
+  async groupRoom(workspaceId, groupId, options = {}) {
+    const group = await this.store.getGroup(workspaceId, groupId);
+    if (!group) {
+      throw new Error(`Group not found: ${workspaceId}/${groupId}`);
+    }
+    return {
+      group,
+      room_path: this.store.groupRoomPath(workspaceId, groupId),
+      events: await this.store.readGroupEvents(workspaceId, groupId, options)
     };
   }
 
@@ -2011,6 +3020,534 @@ class Orchestrator {
       await this.routeToAgent(task, agent, message);
     }
     return this.taskWithEvents(taskId);
+  }
+
+  async postGroupMessage(workspaceId, groupId, text, actor = { kind: "user", id: "local_user" }) {
+    const message = String(text || "").trim();
+    if (!message) {
+      throw new Error("Message is required.");
+    }
+    const group = await this.store.getGroup(workspaceId, groupId);
+    if (!group) {
+      throw new Error(`Group not found: ${workspaceId}/${groupId}`);
+    }
+    const userEvent = await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "user_message",
+      actor,
+      content: { text: message }
+    });
+    if (actor.kind === "user") {
+      const agents = (await this.store.listAgents()).filter(
+        (agent) => agent.workspace_id === workspaceId && agent.group_id === groupId
+      );
+      const explicitTargets = this.resolveExplicitMentionTargets(message, agents);
+      const delegations = this.resolveGroupDelegationIntents(message, agents, explicitTargets);
+      if (delegations.length) {
+        for (const delegation of delegations) {
+          await this.store.appendGroupEvent(workspaceId, groupId, {
+            type: "group_delegation_intent",
+            actor,
+            content: {
+              protocol: GROUP_ROUTE_PROTOCOL,
+              delegation_id: delegation.delegation_id,
+              source_event_id: userEvent.event_id,
+              coordinator_agent_id: delegation.coordinator.id,
+              coordinator_agent_name: delegation.coordinator.name,
+              target_agent_id: delegation.target.id,
+              target_agent_name: delegation.target.name,
+              instruction: delegation.instruction,
+              original_message: message,
+              max_hops: GROUP_ROUTE_MAX_HOPS,
+              hop_count: 0,
+              status: "authorized",
+              text: `User authorized ${delegation.coordinator.name} to coordinate ${delegation.target.name}.`
+            }
+          });
+        }
+        const byCoordinator = new Map();
+        for (const delegation of delegations) {
+          const current = byCoordinator.get(delegation.coordinator.id) || [];
+          current.push(delegation);
+          byCoordinator.set(delegation.coordinator.id, current);
+        }
+        for (const [coordinatorId, coordinatorDelegations] of byCoordinator.entries()) {
+          const coordinator = agents.find((agent) => agent.id === coordinatorId);
+          if (coordinator) {
+            await this.routeGroupMessageToAgent(workspaceId, groupId, group, coordinator, message, {
+              route_kind: "delegation_intent",
+              delegation_intents: coordinatorDelegations.map((delegation) => ({
+                delegation_id: delegation.delegation_id,
+                target_agent_id: delegation.target.id,
+                target_agent_name: delegation.target.name,
+                instruction: delegation.instruction
+              }))
+            });
+          }
+        }
+        return this.groupRoom(workspaceId, groupId);
+      }
+      for (const agent of explicitTargets) {
+        await this.routeGroupMessageToAgent(workspaceId, groupId, group, agent, message);
+      }
+    }
+    return this.groupRoom(workspaceId, groupId);
+  }
+
+  async routeGroupMessageToAgent(workspaceId, groupId, group, agent, message, options = {}) {
+    await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "tool_call_summary",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        tool: "group.route_to_agent",
+        skill: "group.room_message",
+        text: `Routed group room message to ${agent.name}.`,
+        target_agent_id: agent.id,
+        target_agent_name: agent.name,
+        source_agent_id: options.source_agent?.id || null,
+        source_agent_name: options.source_agent?.name || null,
+        delegation_id: options.delegation_id || null,
+        route_kind: options.route_kind || "direct"
+      }
+    });
+
+    const session = this.sessions.get(agent.id);
+    const syntheticTask = {
+      task_id: groupRouteTaskId(workspaceId, groupId),
+      workspace_id: workspaceId,
+      group_id: groupId,
+      title: `${group?.name || groupId} group room`,
+      status: "group_chat",
+      description: "Group room conversation without an active task.",
+      participant_agent_ids: [agent.id]
+    };
+    let sent = false;
+    if (session) {
+      sent = await session.sendMessage(
+        syntheticTask,
+        await this.buildGroupContextMessage(workspaceId, groupId, message, agent, options)
+      );
+    }
+    if (!sent) {
+      const latestAgent = await this.store.getAgent(agent.id);
+      if (!session && latestAgent?.status === "running") {
+        await this.store.patchAgent(agent.id, {
+          status: "stopped",
+          current_task_id: null,
+          last_error: "No attached CLI session; start the agent again."
+        });
+      }
+      await this.store.appendAgentLog(agent, {
+        type: session ? "error" : "status_change",
+        task_id: syntheticTask.task_id,
+        content: {
+          text: session
+            ? "Could not send group room message to the running CLI session; using internal role responder."
+            : "No running CLI session for group room message; using internal role responder."
+        }
+      });
+      await this.emitGroupRoleResponse(workspaceId, groupId, agent, message);
+    }
+  }
+
+  resolveGroupDelegationIntents(message, agents, explicitTargets = []) {
+    if (!this.hasDelegationIntent(message) && !/(?:->|=>|→)/u.test(message)) {
+      return [];
+    }
+    const arrow = this.resolveArrowGroupDelegation(message, agents);
+    if (arrow) {
+      return [arrow];
+    }
+    const coordinator = explicitTargets[0];
+    if (!coordinator) {
+      return [];
+    }
+    const verbIndex = this.firstDelegationVerbIndex(message);
+    const target = this.findDelegationTargetAfter(message, agents, coordinator, verbIndex);
+    if (!target || target.id === coordinator.id) {
+      return [];
+    }
+    return [
+      {
+        delegation_id: makeId("gdel"),
+        coordinator,
+        target,
+        instruction: this.groupDelegationInstruction(message, coordinator, target)
+      }
+    ];
+  }
+
+  resolveArrowGroupDelegation(message, agents) {
+    const arrow = String(message || "").match(/@([^\s@,，.。:：;；!！?？)）\]]+)\s*(?:->|=>|→)\s*@?([^\s@,，.。:：;；!！?？)）\]]+)\s*[:：]?\s*([\s\S]*)$/u);
+    if (!arrow) {
+      return null;
+    }
+    const coordinator = this.resolveAgentReference(arrow[1], agents);
+    const target = this.resolveAgentReference(arrow[2], agents);
+    if (!coordinator || !target || coordinator.id === target.id) {
+      return null;
+    }
+    const instruction = arrow[3]?.trim() || this.groupDelegationInstruction(message, coordinator, target);
+    return {
+      delegation_id: makeId("gdel"),
+      coordinator,
+      target,
+      instruction
+    };
+  }
+
+  firstDelegationVerbIndex(message) {
+    const match = String(message || "").search(/(给|让|请|叫|安排|通知|问|指挥|协调|交给|转给|派给|route|assign|handoff|ask|tell)/iu);
+    return match >= 0 ? match : 0;
+  }
+
+  findDelegationTargetAfter(message, agents, coordinator, verbIndex = 0) {
+    const normalized = routeComparable(message);
+    const candidates = agents
+      .filter((agent) => agent.id !== coordinator.id)
+      .map((agent) => {
+        let bestIndex = -1;
+        for (const alias of routeAgentAliases(agent)) {
+          const token = routeComparable(alias);
+          if (!token || token === routeComparable(agent.role)) {
+            continue;
+          }
+          const index = normalized.indexOf(token, Math.max(0, verbIndex));
+          const mentionIndex = normalized.indexOf(`@${token}`, Math.max(0, verbIndex));
+          const nextIndex = [index, mentionIndex].filter((value) => value >= 0).sort((a, b) => a - b)[0] ?? -1;
+          if (nextIndex >= 0 && (bestIndex < 0 || nextIndex < bestIndex)) {
+            bestIndex = nextIndex;
+          }
+        }
+        return { agent, index: bestIndex };
+      })
+      .filter((candidate) => candidate.index >= 0)
+      .sort((a, b) => a.index - b.index);
+    return candidates[0]?.agent || null;
+  }
+
+  groupDelegationInstruction(originalMessage, coordinator, target) {
+    return [
+      `Visible user request: ${originalMessage}`,
+      `Coordinator agent: ${coordinator.name} (${coordinator.id}).`,
+      `Target agent: ${target.name} (${target.id}).`,
+      "If you accept the coordination request, send one tendrilflow.route block to the target with the exact request you need answered."
+    ].join("\n");
+  }
+
+  resolveAgentReference(reference, agents) {
+    const token = routeComparable(String(reference || "").replace(/^@/, ""));
+    if (!token) {
+      return null;
+    }
+    return (
+      agents.find((agent) => routeAgentAliases(agent).some((alias) => routeComparable(alias) === token)) ||
+      agents.find((agent) => {
+        const name = routeComparable(agent.name);
+        return name && (name.includes(token) || token.includes(name));
+      })
+    );
+  }
+
+  collectGroupRouteBlocks(workspaceId, groupId, event) {
+    const text = String(event.content?.text || "");
+    const directBlocks = extractGroupRouteBlockTexts(text).map((raw) => ({
+      raw,
+      parent_event_id: event.event_id
+    }));
+    if (directBlocks.length) {
+      return directBlocks;
+    }
+    const sourceId = event.actor?.id;
+    if (!sourceId) {
+      return [];
+    }
+    const key = `${workspaceId}:${groupId}:${sourceId}`;
+    const trimmed = text.trim();
+    const openMatch = trimmed.match(/^```(?:tendrilflow[._-]?route|tendrilflow\.route)\s*(.*)$/iu);
+    if (openMatch) {
+      const rest = openMatch[1]?.trim();
+      this.groupRouteBuffers.set(key, {
+        lines: rest ? [rest] : [],
+        parent_event_id: event.event_id
+      });
+      return [];
+    }
+    const buffer = this.groupRouteBuffers.get(key);
+    if (!buffer) {
+      return [];
+    }
+    if (/^```/.test(trimmed)) {
+      this.groupRouteBuffers.delete(key);
+      return [{ raw: buffer.lines.join("\n").trim(), parent_event_id: buffer.parent_event_id || event.event_id }];
+    }
+    buffer.lines.push(text);
+    if (buffer.lines.length > 80) {
+      this.groupRouteBuffers.delete(key);
+    }
+    return [];
+  }
+
+  parseGroupRouteBlock(raw) {
+    try {
+      const parsed = JSON.parse(String(raw || "").trim());
+      return { ok: true, request: parsed };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+  }
+
+  async handleGroupAgentEvent(workspaceId, groupId, event) {
+    if (event.type !== "agent_message" || event.actor?.kind !== "agent") {
+      return;
+    }
+    const sourceAgent = await this.store.getAgent(event.actor.id);
+    if (!sourceAgent || sourceAgent.workspace_id !== workspaceId || sourceAgent.group_id !== groupId) {
+      return;
+    }
+    for (const block of this.collectGroupRouteBlocks(workspaceId, groupId, event)) {
+      await this.processGroupRouteRequest(workspaceId, groupId, sourceAgent, block, event);
+    }
+    await this.maybeNotifyGroupRouteResult(workspaceId, groupId, sourceAgent, event);
+  }
+
+  async processGroupRouteRequest(workspaceId, groupId, sourceAgent, block, sourceEvent) {
+    const group = await this.store.getGroup(workspaceId, groupId);
+    const parsed = this.parseGroupRouteBlock(block.raw);
+    const requestEvent = await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "group_route_request",
+      actor: { kind: "agent", id: sourceAgent.id },
+      content: {
+        protocol: GROUP_ROUTE_PROTOCOL,
+        source_agent_id: sourceAgent.id,
+        source_agent_name: sourceAgent.name,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        raw: String(block.raw || "").slice(0, 4000),
+        parsed: parsed.ok,
+        text: parsed.ok
+          ? `${sourceAgent.name} requested a structured group route.`
+          : `${sourceAgent.name} emitted an invalid structured group route.`
+      }
+    });
+    if (!parsed.ok) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "invalid_route_json",
+        detail: parsed.error,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+
+    const request = parsed.request || {};
+    const message = String(request.message || request.text || "").trim();
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === workspaceId && agent.group_id === groupId
+    );
+    const target = this.resolveAgentReference(request.to || request.target || request.target_agent_id, agents);
+    if (!target) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "target_not_found",
+        detail: String(request.to || request.target || ""),
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    if (!message) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "empty_route_message",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    if (target.id === sourceAgent.id) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "self_route_blocked",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+
+    const authorization = await this.findGroupRouteAuthorization(workspaceId, groupId, sourceAgent, target);
+    if (!authorization) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "not_authorized",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    const hopCount = Number(authorization.hop_count || 0) + 1;
+    if (hopCount > GROUP_ROUTE_MAX_HOPS) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "max_hops_exceeded",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+
+    const dedupeKey = hashText(
+      [authorization.delegation_id || "host", sourceAgent.id, target.id, message].join("\u0000")
+    );
+    const events = await this.store.readGroupEvents(workspaceId, groupId);
+    if (events.some((event) => event.type === "group_route_delivery" && event.content?.dedupe_key === dedupeKey)) {
+      await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
+        reason: "duplicate_route",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        dedupe_key: dedupeKey
+      });
+      return;
+    }
+
+    const deliveryId = makeId("grtd");
+    await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "group_route_delivery",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: GROUP_ROUTE_PROTOCOL,
+        delivery_id: deliveryId,
+        delegation_id: authorization.delegation_id || null,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        source_agent_id: sourceAgent.id,
+        source_agent_name: sourceAgent.name,
+        coordinator_agent_id: sourceAgent.id,
+        coordinator_agent_name: sourceAgent.name,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        reason: String(request.reason || "").trim(),
+        expect_response: request.expect_response !== false,
+        return_to_agent_id: this.resolveAgentReference(request.return_to || request.return_to_agent_id, agents)?.id || sourceAgent.id,
+        hop_count: hopCount,
+        max_hops: GROUP_ROUTE_MAX_HOPS,
+        dedupe_key: dedupeKey,
+        message,
+        text: `Delivered structured route from ${sourceAgent.name} to ${target.name}.`
+      }
+    });
+    await this.routeGroupMessageToAgent(workspaceId, groupId, group, target, message, {
+      route_kind: "agent_delegation",
+      source_agent: sourceAgent,
+      delegation_id: authorization.delegation_id || null,
+      delivery_id: deliveryId,
+      parent_event_id: block.parent_event_id || sourceEvent.event_id,
+      route_reason: String(request.reason || "").trim(),
+      expect_response: request.expect_response !== false,
+      hop_count: hopCount
+    });
+  }
+
+  async blockGroupRoute(workspaceId, groupId, sourceAgent, content) {
+    await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "group_route_blocked",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: GROUP_ROUTE_PROTOCOL,
+        source_agent_id: sourceAgent.id,
+        source_agent_name: sourceAgent.name,
+        ...content,
+        text: `Blocked structured group route from ${sourceAgent.name}: ${content.reason}.`
+      }
+    });
+  }
+
+  async findGroupRouteAuthorization(workspaceId, groupId, sourceAgent, targetAgent) {
+    if (sourceAgent.role === "host") {
+      return {
+        delegation_id: null,
+        hop_count: 0,
+        authority: "host"
+      };
+    }
+    const events = await this.store.readGroupEvents(workspaceId, groupId);
+    return (
+      events
+        .slice()
+        .reverse()
+        .find(
+          (event) =>
+            event.type === "group_delegation_intent" &&
+            event.content?.status === "authorized" &&
+            event.content?.coordinator_agent_id === sourceAgent.id &&
+            event.content?.target_agent_id === targetAgent.id
+        )?.content || null
+    );
+  }
+
+  async maybeNotifyGroupRouteResult(workspaceId, groupId, responderAgent, responseEvent) {
+    if (isProviderAdapterLifecycleLine(responseEvent.content?.text)) {
+      return;
+    }
+    const events = await this.store.readGroupEvents(workspaceId, groupId);
+    const alreadyResulted = new Set(
+      events
+        .filter((event) => event.type === "group_route_result")
+        .map((event) => event.content?.delivery_id)
+        .filter(Boolean)
+    );
+    const delivery = events
+      .slice()
+      .reverse()
+      .find(
+        (event) =>
+          event.type === "group_route_delivery" &&
+          event.content?.target_agent_id === responderAgent.id &&
+          event.content?.expect_response !== false &&
+          !alreadyResulted.has(event.content?.delivery_id)
+      );
+    if (!delivery) {
+      return;
+    }
+    const returnToId = delivery.content?.return_to_agent_id || delivery.content?.coordinator_agent_id;
+    const coordinator = returnToId ? await this.store.getAgent(returnToId) : null;
+    await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "group_route_result",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: GROUP_ROUTE_PROTOCOL,
+        delivery_id: delivery.content.delivery_id,
+        delegation_id: delivery.content.delegation_id || null,
+        responder_agent_id: responderAgent.id,
+        responder_agent_name: responderAgent.name,
+        return_to_agent_id: coordinator?.id || null,
+        return_to_agent_name: coordinator?.name || null,
+        response_event_id: responseEvent.event_id,
+        response_text: String(responseEvent.content?.text || "").slice(0, 4000),
+        text: `Captured route response from ${responderAgent.name}.`
+      }
+    });
+    if (!coordinator || coordinator.id === responderAgent.id) {
+      return;
+    }
+    const group = await this.store.getGroup(workspaceId, groupId);
+    const resultMessage = [
+      `Route result from ${responderAgent.name}:`,
+      String(responseEvent.content?.text || "").trim(),
+      "",
+      `Original routed request: ${delivery.content?.message || ""}`,
+      "Please read the visible group transcript and respond only if a coordinator follow-up is useful."
+    ].join("\n");
+    await this.routeGroupMessageToAgent(workspaceId, groupId, group, coordinator, resultMessage, {
+      route_kind: "delegation_result",
+      source_agent: responderAgent,
+      delegation_id: delivery.content?.delegation_id || null,
+      delivery_id: delivery.content?.delivery_id || null,
+      parent_event_id: responseEvent.event_id
+    });
   }
 
   resolveControlCommand(message, actor, agents, targets) {
@@ -2349,6 +3886,97 @@ class Orchestrator {
     return nextTask || { ...latestTask, claim };
   }
 
+  async buildGroupContextMessage(workspaceId, groupId, message, agent = null, options = {}) {
+    const workspace = await this.store.getWorkspace(workspaceId);
+    const group = await this.store.getGroup(workspaceId, groupId);
+    const memory = await this.store.readGroupMemory(workspaceId, groupId);
+    const matchedSkills = await this.store.matchedSkillSummaries(workspaceId, groupId, agent || {});
+    const events = await this.store.readGroupEvents(workspaceId, groupId).catch(() => []);
+    const recentEvents = events.slice(-8).map((event) => {
+      const actor = event.actor?.id || event.actor?.kind || "unknown";
+      const text = event.content?.text || event.content?.summary || event.content?.title || event.type;
+      return `- ${event.type} by ${actor}: ${String(text).slice(0, 240)}`;
+    });
+    const memorySections = Object.entries(memory)
+      .map(([fileName, contents]) => `### ${fileName}\n${String(contents).trim().slice(0, 1200) || "(empty)"}`)
+      .join("\n\n");
+    const skillSections = matchedSkills.length
+      ? matchedSkills
+          .map((skill) => {
+            const roles = (skill.roles || []).join(", ") || "*";
+            return `- ${skill.skill_id} (${skill.scope}, roles: ${roles})\n  ${skill.summary || "(no summary)"}\n  Source: ${skill.path}`;
+          })
+          .join("\n")
+      : "(none)";
+    const routeSections = [];
+    if (options.delegation_intents?.length) {
+      routeSections.push(
+        "Delegation intent:",
+        ...options.delegation_intents.flatMap((delegation) => [
+          `- Delegation: ${delegation.delegation_id}`,
+          `  Target: ${delegation.target_agent_name} (${delegation.target_agent_id})`,
+          `  Suggested instruction: ${delegation.instruction}`
+        ]),
+        "To contact a target agent, emit exactly one structured block:",
+        "```tendrilflow.route",
+        '{"to":"target agent name","message":"specific request","reason":"visible user asked me to coordinate this","expect_response":true}',
+        "```",
+        "Do not claim the target has been contacted unless TendrilFlow routes the block."
+      );
+    }
+    if (options.route_kind === "agent_delegation") {
+      routeSections.push(
+        "Delegation delivery:",
+        `- From: ${options.source_agent?.name || "unknown"} (${options.source_agent?.id || "unknown"})`,
+        options.delegation_id ? `- Delegation: ${options.delegation_id}` : "- Delegation: host/direct",
+        options.route_reason ? `- Reason: ${options.route_reason}` : "- Reason: (not provided)",
+        `- Hop: ${options.hop_count || 1}/${GROUP_ROUTE_MAX_HOPS}`,
+        "- Reply visibly in the Agent Room. If the request asks you to report back to a coordinator, include that coordinator in your visible answer."
+      );
+    }
+    if (options.route_kind === "delegation_result") {
+      routeSections.push(
+        "Delegation result:",
+        `- From: ${options.source_agent?.name || "unknown"} (${options.source_agent?.id || "unknown"})`,
+        options.delegation_id ? `- Delegation: ${options.delegation_id}` : "- Delegation: direct",
+        "- You are receiving the target agent's visible response. Summarize or follow up only if useful."
+      );
+    }
+
+    return [
+      "TendrilFlow group room context",
+      "",
+      `Workspace: ${workspace?.name || workspaceId} (${workspaceId})`,
+      `Workspace root: ${workspace?.root_dir || this.rootDir}`,
+      `Group: ${group?.name || groupId} (${groupId})`,
+      "Current task: (none)",
+      "This is visible group chat, not a task assignment. Reply back to the Agent Room with a concise answer, blocker, or next-step question.",
+      "For identity, provider, model, status, or coordination questions, answer from this routing/runtime context first; do not run shell commands unless the user explicitly asks for repository work.",
+      `Agent isolation: ${agent?.isolation_mode || "shared"}`,
+      `Agent working directory: ${agent?.cwd || workspace?.root_dir || this.rootDir}`,
+      agent?.worktree?.path
+        ? `Agent worktree: ${agent.worktree.path} (${agent.worktree.dirty ? "dirty" : "clean"})`
+        : "Agent worktree: (none)",
+      "",
+      buildCommunicationExecutionProtocol(agent || {}),
+      "",
+      "Matched skills:",
+      skillSections,
+      "",
+      "Group routing:",
+      routeSections.join("\n") || "(none)",
+      "",
+      "Group memory:",
+      memorySections,
+      "",
+      "Recent group room events:",
+      recentEvents.join("\n") || "(none)",
+      "",
+      "User message:",
+      message
+    ].join("\n");
+  }
+
   async buildAgentContextMessage(task, message, agent = null) {
     const workspace = await this.store.getWorkspace(task.workspace_id);
     const group = await this.store.getGroup(task.workspace_id, task.group_id);
@@ -2507,6 +4135,32 @@ class Orchestrator {
     if (task.status === "todo") {
       await this.updateTask(task.task_id, { status: "in_progress" });
     }
+  }
+
+  async emitGroupRoleResponse(workspaceId, groupId, agent, message) {
+    if (agent.role === "review") {
+      await this.store.appendGroupEvent(workspaceId, groupId, {
+        type: "review_comment",
+        actor: { kind: "agent", id: agent.id },
+        content: {
+          verdict: "needs_cli",
+          text: `${agent.name}: I was mentioned in the group room, but no running CLI session was attached. Start this agent to get a provider-backed answer.`,
+          source: "role_profile",
+          original_message: message
+        }
+      });
+      return;
+    }
+
+    await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "agent_message",
+      actor: { kind: "agent", id: agent.id },
+      content: {
+        text: `${agent.name}: I was mentioned in the group room, but no running CLI session was attached. Start this agent to get a provider-backed answer.`,
+        source: "role_profile",
+        original_message: message
+      }
+    });
   }
 
   shouldGenerateTaskGraph(message) {
@@ -2695,7 +4349,7 @@ class Orchestrator {
     }
 
     let provider = "gemini";
-    let mode = "acp";
+    let mode = /(acp|协议)/iu.test(message) ? "acp" : "exec";
     if (lower.includes("kimi")) {
       provider = "kimi";
     } else if (lower.includes("claude")) {
@@ -2737,7 +4391,13 @@ class Orchestrator {
       return internalNodeCommand(this.rootDir, "mock-acp-agent.js", `--name ${quoteShell(spec.name)}`);
     }
     if (spec.provider === "claude") {
-      return `claude --name ${quoteShell(spec.name)}`;
+      return providerAdapterCommand(this.rootDir, spec.provider, spec.name, cwd);
+    }
+    if (spec.provider === "gemini") {
+      return providerAdapterCommand(this.rootDir, spec.provider, spec.name, cwd);
+    }
+    if (spec.provider === "kimi") {
+      return providerAdapterCommand(this.rootDir, spec.provider, spec.name, cwd);
     }
     if (spec.provider === "codex" || spec.mode === "exec") {
       return internalNodeCommand(

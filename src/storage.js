@@ -224,6 +224,33 @@ function transportFromMode(mode) {
   return mode === "acp" ? "acp" : "legacy_cli";
 }
 
+function quoteShell(value) {
+  return `"${String(value || "").replaceAll('"', '\\"')}"`;
+}
+
+function codexHostCommand(rootDir, name = "host-agent", cwd = rootDir) {
+  return [
+    "node",
+    quoteShell(path.join(rootDir, "scripts", "codex-agent.js")),
+    "--name",
+    quoteShell(name),
+    "--mode",
+    "exec",
+    "--cwd",
+    quoteShell(cwd)
+  ].join(" ");
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasCodexHostCommand(command, name = "host-agent") {
+  const raw = String(command || "");
+  const namePattern = new RegExp(`--name(?:=|\\s+)("${escapeRegExp(name)}"|'${escapeRegExp(name)}'|${escapeRegExp(name)})(?:\\s|$)`);
+  return raw.includes("codex-agent.js") && namePattern.test(raw);
+}
+
 function normalizeIdList(value) {
   return Array.from(new Set((Array.isArray(value) ? value : []).filter(Boolean).map(String)));
 }
@@ -416,13 +443,13 @@ class FileStore {
       workspace_id: workspaceId,
       group_id: groupId,
       transport: "legacy_cli",
-      mode: "mock",
-      provider: "mock",
+      mode: "exec",
+      provider: "codex",
       cwd: this.rootDir,
       base_cwd: this.rootDir,
       isolation_mode: "shared",
       worktree: null,
-      command: "node scripts/mock-agent.js --role host --name host-agent",
+      command: codexHostCommand(this.rootDir),
       env: {},
       status: "stopped",
       current_task_id: null,
@@ -500,6 +527,14 @@ class FileStore {
 
   handoffPolicyPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
     return path.join(this.groupDir(workspaceId, groupId), "handoff_rules.json");
+  }
+
+  groupEventsPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
+    return path.join(this.groupDir(workspaceId, groupId), "events.jsonl");
+  }
+
+  groupRoomPath(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
+    return path.relative(this.rootDir, this.groupEventsPath(workspaceId, groupId)).replaceAll("\\", "/");
   }
 
   agentLogsDir(workspaceId = DEFAULT_WORKSPACE_ID, groupId = DEFAULT_GROUP_ID) {
@@ -651,8 +686,21 @@ class FileStore {
       const isHost =
         agent.id === "agent_host" || agent.name === "host-agent" || agent.role === "host";
       const legacyCommand = String(agent.command || "").includes(legacyRole);
+      const legacyMockHost =
+        String(agent.provider || "").toLowerCase() === "mock" ||
+        String(agent.mode || "").toLowerCase() === "mock" ||
+        String(agent.command || "").includes("mock-agent.js");
+      const codexHostCommandMismatch =
+        String(agent.provider || "").toLowerCase() === "codex" &&
+        String(agent.mode || "").toLowerCase() === "exec" &&
+        !hasCodexHostCommand(agent.command);
       const needsHostNormalization =
-        agent.id !== "agent_host" || agent.name !== "host-agent" || agent.role !== "host" || legacyCommand;
+        agent.id !== "agent_host" ||
+        agent.name !== "host-agent" ||
+        agent.role !== "host" ||
+        legacyCommand ||
+        legacyMockHost ||
+        codexHostCommandMismatch;
 
       if (!isLegacyHost && !isHost) {
         nextById.set(agent.id, agent);
@@ -672,14 +720,17 @@ class FileStore {
         id: "agent_host",
         name: "host-agent",
         role: "host",
-        transport: agent.transport || hostDefault.transport,
-        mode: agent.mode || hostDefault.mode,
-        provider: agent.provider || hostDefault.provider,
+        transport: legacyMockHost ? hostDefault.transport : agent.transport || hostDefault.transport,
+        mode: legacyMockHost ? hostDefault.mode : agent.mode || hostDefault.mode,
+        provider: legacyMockHost ? hostDefault.provider : agent.provider || hostDefault.provider,
         cwd: agent.cwd || hostDefault.cwd,
         base_cwd: agent.base_cwd || agent.cwd || hostDefault.base_cwd,
         isolation_mode: normalizeIsolationMode(agent.isolation_mode),
         worktree: agent.worktree || null,
-        command: legacyCommand ? hostDefault.command : agent.command || hostDefault.command,
+        command:
+          legacyCommand || legacyMockHost || codexHostCommandMismatch
+            ? codexHostCommand(this.rootDir, "host-agent", agent.cwd || hostDefault.cwd)
+            : agent.command || hostDefault.command,
         env: agent.env || hostDefault.env,
         updated_at: nowIso()
       };
@@ -740,10 +791,43 @@ class FileStore {
     for (const group of await this.listGroupsRaw()) {
       const agentsPath = this.agentsPath(group.workspace_id, group.group_id);
       const agents = await this.readJson(agentsPath, []);
-      if (agents.some((agent) => agent.role === "host")) {
+      const defaultHost = this.hostAgent(group.workspace_id, group.group_id);
+      const hostIndex = agents.findIndex((agent) => agent.role === "host");
+      if (hostIndex === -1) {
+        await this.writeJson(agentsPath, [defaultHost, ...agents]);
         continue;
       }
-      await this.writeJson(agentsPath, [this.hostAgent(group.workspace_id, group.group_id), ...agents]);
+      const host = agents[hostIndex];
+      const legacyMockHost =
+        String(host.provider || "").toLowerCase() === "mock" ||
+        String(host.mode || "").toLowerCase() === "mock" ||
+        String(host.command || "").includes("mock-agent.js");
+      const codexHostCommandMismatch =
+        String(host.provider || "").toLowerCase() === "codex" &&
+        String(host.mode || "").toLowerCase() === "exec" &&
+        !hasCodexHostCommand(host.command);
+      if (!legacyMockHost && !codexHostCommandMismatch) {
+        continue;
+      }
+      const cwd = host.cwd || defaultHost.cwd;
+      const normalized = {
+        ...defaultHost,
+        ...host,
+        id: defaultHost.id,
+        name: "host-agent",
+        role: "host",
+        workspace_id: group.workspace_id,
+        group_id: group.group_id,
+        transport: defaultHost.transport,
+        mode: defaultHost.mode,
+        provider: defaultHost.provider,
+        cwd,
+        base_cwd: host.base_cwd || cwd,
+        command: codexHostCommand(this.rootDir, "host-agent", cwd),
+        updated_at: nowIso()
+      };
+      const next = agents.map((agent, index) => (index === hostIndex ? normalized : agent));
+      await this.writeJson(agentsPath, next);
     }
   }
 
@@ -1375,6 +1459,44 @@ class FileStore {
       .map((line) => JSON.parse(line));
     const limit = Number(options.limit || 0);
     return limit > 0 ? logs.slice(-limit) : logs;
+  }
+
+  async appendGroupEvent(workspaceId, groupId, event) {
+    const group = await this.getGroup(workspaceId, groupId);
+    if (!group) {
+      throw new Error(`Group not found: ${workspaceId}/${groupId}`);
+    }
+    const fullEvent = {
+      event_id: event.event_id || makeId("gevt"),
+      workspace_id: workspaceId,
+      group_id: groupId,
+      timestamp: event.timestamp || nowIso(),
+      type: event.type || "system_event",
+      ...redactForStorage(event)
+    };
+    const eventsPath = this.groupEventsPath(workspaceId, groupId);
+    await fs.mkdir(path.dirname(eventsPath), { recursive: true });
+    await fs.appendFile(eventsPath, `${JSON.stringify(fullEvent)}\n`, "utf8");
+    return fullEvent;
+  }
+
+  async readGroupEvents(workspaceId, groupId, options = {}) {
+    const group = await this.getGroup(workspaceId, groupId);
+    if (!group) {
+      return [];
+    }
+    const raw = await fs.readFile(this.groupEventsPath(workspaceId, groupId), "utf8").catch((error) => {
+      if (error.code === "ENOENT") {
+        return "";
+      }
+      throw error;
+    });
+    const events = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const limit = Number(options.limit || 0);
+    return limit > 0 ? events.slice(-limit) : events;
   }
 
   async listTasks() {

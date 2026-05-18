@@ -178,6 +178,8 @@ const i18n = {
     system: "系统",
     primaryAction: "当前动作",
     processTrace: "执行过程",
+    routeTrace: "Route",
+    systemTrace: "系统",
     agentReply: "回复",
     expandTrace: "展开",
     collapseTrace: "收起",
@@ -372,6 +374,8 @@ const i18n = {
     system: "System",
     primaryAction: "Current action",
     processTrace: "Process",
+    routeTrace: "Route",
+    systemTrace: "System",
     agentReply: "Reply",
     expandTrace: "Expand",
     collapseTrace: "Collapse",
@@ -435,7 +439,6 @@ const qsa = (selector, root = document) => Array.from(root.querySelectorAll(sele
 const t = (key) => i18n[state.lang]?.[key] || i18n.en[key] || key;
 const PROVIDERS = ["codex", "claude", "gemini", "kimi", "mock", "custom"];
 const HANDOFF_TRIGGERS = ["manual", "blocked", "ready_for_review", "owner_change", "done"];
-const PROCESS_BUNDLE_TYPES = new Set(["tool_call_summary", "decision_record", "handoff_note", "system_event", "status_change"]);
 let toastTimer = null;
 
 function syncRouteFromHash() {
@@ -944,41 +947,84 @@ function renderRoom() {
 
 function roomTimelineItems(events) {
   const items = [];
+  const itemByEventId = new Map();
+  const initialDetails = [];
+  let openRouteBlockActor = null;
   let turn = 0;
   for (const event of events) {
-    if (event.type === "user_message" || event.actor?.kind === "user") {
-      turn += 1;
-      items.push(event);
+    const startsRouteBlock = isRouteProtocolBlockStart(event);
+    const isInlineRouteProtocol = isRouteProtocolInline(event);
+    if (startsRouteBlock && !isInlineRouteProtocol) {
+      openRouteBlockActor = eventActorKey(event);
+    }
+    const isRouteProtocolChunk =
+      isInlineRouteProtocol ||
+      Boolean(openRouteBlockActor) &&
+      event.type === "agent_message" &&
+      eventActorKey(event) === openRouteBlockActor;
+    const closesRouteBlock = isInlineRouteProtocol || (isRouteProtocolChunk && isRouteProtocolClose(event));
+
+    if (isPrimaryRoomEvent(event, isRouteProtocolChunk)) {
+      const bucket = event.type === "agent_message" ? "response" : "message";
+      const actorKey = eventActorKey(event);
+      if (event.type === "user_message" || event.actor?.kind === "user") {
+        turn += 1;
+      }
+      const previous = items.at(-1);
+      const item =
+        bucket === "response" &&
+        previous?.kind === "message_item" &&
+        previous.turn === turn &&
+        previous.bucket === bucket &&
+        previous.actorKey === actorKey
+          ? previous
+          : createMessageItem(event, bucket, actorKey, turn);
+      if (item !== previous) {
+        items.push(item);
+      }
+      item.events.push(event);
+      if (initialDetails.length) {
+        item.details.push(...initialDetails.splice(0));
+      }
+      if (event.event_id) {
+        itemByEventId.set(event.event_id, item);
+      }
       continue;
     }
 
-    const bucket = eventBundleBucket(event);
-    if (!bucket) {
-      items.push(event);
-      continue;
-    }
-
-    const actorKey = eventActorKey(event);
-    const previous = items.at(-1);
-    if (
-      previous?.kind === "event_bundle" &&
-      previous.turn === turn &&
-      previous.bucket === bucket &&
-      previous.actorKey === actorKey
-    ) {
-      previous.events.push(event);
+    const detailOwner = detailOwnerForEvent(event, items, itemByEventId);
+    if (detailOwner) {
+      detailOwner.details.push(event);
     } else {
-      items.push({
-        kind: "event_bundle",
-        bundleId: bundleIdForEvent(event, bucket, actorKey, turn),
-        bucket,
-        actorKey,
-        turn,
-        events: [event]
-      });
+      initialDetails.push(event);
+    }
+    if (closesRouteBlock || (openRouteBlockActor && event.type !== "agent_message")) {
+      openRouteBlockActor = null;
     }
   }
+  if (initialDetails.length) {
+    items.push({
+      kind: "detail_bundle",
+      bundleId: bundleIdForEvent(initialDetails[0], "process", "system", turn),
+      bucket: "process",
+      actorKey: "system",
+      turn,
+      events: initialDetails
+    });
+  }
   return items;
+}
+
+function createMessageItem(event, bucket, actorKey, turn) {
+  return {
+    kind: "message_item",
+    messageId: bundleIdForEvent(event, bucket, actorKey, turn),
+    bucket,
+    actorKey,
+    turn,
+    events: [],
+    details: []
+  };
 }
 
 function bundleIdForEvent(event, bucket, actorKey, turn) {
@@ -987,14 +1033,56 @@ function bundleIdForEvent(event, bucket, actorKey, turn) {
     .replace(/\s+/g, "_");
 }
 
-function eventBundleBucket(event) {
-  if (event.type === "agent_message") {
-    return "response";
+function isPrimaryRoomEvent(event, isRouteProtocolChunk = false) {
+  if (event.type === "user_message") {
+    return true;
   }
-  if (PROCESS_BUNDLE_TYPES.has(event.type)) {
-    return "process";
+  if (event.type !== "agent_message") {
+    return false;
   }
-  return null;
+  return !isRouteProtocolChunk && !isAgentLifecycleMessage(event);
+}
+
+function detailOwnerForEvent(event, items, itemByEventId) {
+  const content = event.content || {};
+  const anchorIds = [content.response_event_id, content.parent_event_id, content.source_event_id].filter(Boolean);
+  for (const eventId of anchorIds) {
+    const owner = itemByEventId.get(eventId);
+    if (owner) {
+      return owner;
+    }
+  }
+  return items
+    .slice()
+    .reverse()
+    .find((item) => item.kind === "message_item");
+}
+
+function isRouteProtocolStart(event) {
+  return isRouteProtocolBlockStart(event) || isRouteProtocolInline(event);
+}
+
+function isRouteProtocolBlockStart(event) {
+  const text = event.content?.text?.trim() || "";
+  return event.type === "agent_message" && /^```tendrilflow\.route\b/i.test(text);
+}
+
+function isRouteProtocolInline(event) {
+  const text = event.content?.text?.trim() || "";
+  return event.type === "agent_message" && /^TENDRILFLOW_ROUTE\s+\{/i.test(text);
+}
+
+function isRouteProtocolClose(event) {
+  return (event.content?.text?.trim() || "") === "```";
+}
+
+function isAgentLifecycleMessage(event) {
+  const text = event.content?.text?.trim() || "";
+  return (
+    /^[^:\r\n]{1,80}:\s*starting\s+(codex|claude|gemini|kimi)\s+headless turn\.?$/i.test(text) ||
+    /^[^:\r\n]{1,80}:\s*(codex|claude|gemini|kimi)\s+headless turn completed\.?$/i.test(text) ||
+    /^[^:\r\n]{1,80}\s+ready as .+ CLI adapter \((exec|acp)\)\.?$/i.test(text)
+  );
 }
 
 function eventActorKey(event) {
@@ -1404,7 +1492,20 @@ function renderAgentLog(log) {
 }
 
 function renderRoomItem(item) {
+  if (item.kind === "message_item") {
+    return renderMessageItem(item);
+  }
+  if (item.kind === "detail_bundle") {
+    return renderProcessBundle(item);
+  }
   return item.kind === "event_bundle" ? renderEventBundle(item) : renderEvent(item);
+}
+
+function renderMessageItem(item) {
+  if (item.bucket === "response") {
+    return renderResponseBundle(item);
+  }
+  return renderSingleMessageItem(item);
 }
 
 function renderEventBundle(bundle) {
@@ -1412,6 +1513,30 @@ function renderEventBundle(bundle) {
     return renderResponseBundle(bundle);
   }
   return renderProcessBundle(bundle);
+}
+
+function renderSingleMessageItem(item) {
+  const event = item.events[0];
+  const rowClass = eventRowClass(event);
+  const actor = actorLabel(event);
+  const initials = actorInitials(actor);
+  const time = timeRangeLabel(item.events);
+  return `
+    <article class="${rowClass}">
+      ${rowClass.includes("from-user") ? "" : `<div class="chat-avatar">${escapeHtml(initials)}</div>`}
+      <div class="chat-message">
+        <div class="chat-meta">
+          <span class="chat-author">${escapeHtml(actor)}</span>
+          <span>${escapeHtml(time)}</span>
+          <span class="event-type">${escapeHtml(event.type)}</span>
+        </div>
+        <div class="chat-bubble">
+          <div class="event-content">${renderEventContent(event.content, event)}</div>
+          ${renderMessageDetails(item)}
+        </div>
+      </div>
+      ${rowClass.includes("from-user") ? `<div class="chat-avatar user-avatar">${escapeHtml(initials)}</div>` : ""}
+    </article>`;
 }
 
 function renderResponseBundle(bundle) {
@@ -1430,6 +1555,7 @@ function renderResponseBundle(bundle) {
         </div>
         <div class="chat-bubble">
           <div class="event-content">${renderResponseBundleContent(bundle.events)}</div>
+          ${renderMessageDetails(bundle)}
         </div>
       </div>
     </article>`;
@@ -1455,6 +1581,57 @@ function renderProcessBundle(bundle) {
         <div class="bundle-event-list">${renderProcessBundleContent(bundle.events)}</div>
       </details>
     </article>`;
+}
+
+function renderMessageDetails(item) {
+  const details = item.details || [];
+  if (!details.length) {
+    return "";
+  }
+  const bundleId = item.messageId || bundleIdForEvent(details[0], "process", item.actorKey || "message", item.turn || 0);
+  const isOpen = state.expandedProcessBundles.has(bundleId);
+  return `
+    <details class="message-process-details process-details" data-process-bundle-id="${escapeHtml(bundleId)}" ${isOpen ? "open" : ""}>
+      <summary class="process-summary">
+        <span class="event-type">${escapeHtml(t("processTrace"))}</span>
+        <span>${escapeHtml(timeRangeLabel(details))}</span>
+        <span class="bundle-count">${escapeHtml(bundleCountLabel(details.length))}</span>
+        ${renderDetailSummaryTags(details)}
+        <span class="expand-label">
+          <span class="closed-label">${escapeHtml(t("expandTrace"))}</span>
+          <span class="open-label">${escapeHtml(t("collapseTrace"))}</span>
+        </span>
+      </summary>
+      <div class="bundle-event-list">${renderProcessBundleContent(details)}</div>
+    </details>`;
+}
+
+function renderDetailSummaryTags(events) {
+  const tags = detailSummaryTags(events);
+  if (!tags.length) {
+    return "";
+  }
+  return `<span class="message-detail-tags">${tags.map((tag) => `<span class="detail-tag">${escapeHtml(tag)}</span>`).join("")}</span>`;
+}
+
+function detailSummaryTags(events) {
+  const routeCount = events.filter(isRouteDetailEvent).length;
+  const systemCount = events.filter((event) => ["system_event", "status_change"].includes(event.type)).length;
+  const otherCount = events.length - routeCount - systemCount;
+  return [
+    routeCount ? `${t("routeTrace")} ${routeCount}` : "",
+    systemCount ? `${t("systemTrace")} ${systemCount}` : "",
+    otherCount ? `${t("processTrace")} ${otherCount}` : ""
+  ].filter(Boolean);
+}
+
+function isRouteDetailEvent(event) {
+  return (
+    event.type === "group_delegation_intent" ||
+    String(event.type || "").startsWith("group_route_") ||
+    event.content?.protocol === "tendrilflow.group_route.v1" ||
+    isRouteProtocolStart(event)
+  );
 }
 
 function renderResponseBundleContent(events) {

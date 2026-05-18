@@ -8,14 +8,21 @@ const { createAdapterSession, parseEnv } = require("./adapters");
 const { mapAcpUpdateToEvent } = require("./acpMapping");
 const { FileStore } = require("./storage");
 const { DEFAULT_GROUP_ID, makeId, normalizeStatus, nowIso, slugify } = require("./model");
-const { HOST_DEFAULT_PLAYBOOK, buildCommunicationExecutionProtocol, roleFocusFor } = require("./protocol");
+const {
+  GROUP_ROUTE_MAX_HOPS,
+  GROUP_ROUTE_PROTOCOL,
+  GROUP_ROUTE_TOOL_ID,
+  HOST_ROUTE_TOOL_ID,
+  HOST_DEFAULT_PLAYBOOK,
+  buildCommunicationExecutionProtocol,
+  buildGroupRouteToolContract,
+  roleFocusFor
+} = require("./protocol");
 
 const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000;
 const AGENT_STALE_AFTER_MS = 5 * 60 * 1000;
 const AGENT_INIT_PROFILE = "standard";
-const AGENT_INIT_PROFILE_VERSION = "tendrilflow.agent_init.v1";
-const GROUP_ROUTE_PROTOCOL = "tendrilflow.group_route.v1";
-const GROUP_ROUTE_MAX_HOPS = 2;
+const AGENT_INIT_PROFILE_VERSION = "tendrilflow.agent_init.v2";
 const execFileAsync = promisify(execFile);
 
 function spawnFileAsync(file, args, options = {}) {
@@ -2008,12 +2015,8 @@ class Orchestrator {
       "- Do not expose private chain-of-thought. Provide concise rationale, evidence, and results.",
       "- Do not create hidden side conversations. Ask the Host Agent when another member, review, debug help, or handoff is needed.",
       "- Do not auto-route based on another agent's natural-language output; wait for visible user or Host intent.",
-      "- If a visible user or Host asks you to coordinate another agent, do not claim you contacted them in prose.",
-      "- To delegate inside the Agent Room, emit exactly one structured route request block and keep the user-facing explanation short:",
-      '```tendrilflow.route',
-      '{"to":"agent name","message":"specific request for that agent","reason":"why this route is needed","expect_response":true}',
-      '```',
-      "- Plain @mentions in your own natural-language reply are visible text only and do not trigger routing.",
+      "",
+      buildGroupRouteToolContract(),
       "",
       ...roleContract,
       "",
@@ -3041,6 +3044,70 @@ class Orchestrator {
         (agent) => agent.workspace_id === workspaceId && agent.group_id === groupId
       );
       const explicitTargets = this.resolveExplicitMentionTargets(message, agents);
+      const routeRule = this.resolveBoundedRoundRobinRouteRule(message, agents, explicitTargets);
+      if (routeRule) {
+        await this.store.appendGroupEvent(workspaceId, groupId, {
+          type: "group_route_rule",
+          actor,
+          content: {
+            protocol: GROUP_ROUTE_PROTOCOL,
+            tool: GROUP_ROUTE_TOOL_ID,
+            skill: GROUP_ROUTE_TOOL_ID,
+            route_rule_id: routeRule.route_rule_id,
+            route_rule_kind: routeRule.route_rule_kind,
+            source_event_id: userEvent.event_id,
+            start_agent_id: routeRule.start_agent.id,
+            start_agent_name: routeRule.start_agent.name,
+            order_agent_ids: routeRule.order.map((agent) => agent.id),
+            order_agent_names: routeRule.order.map((agent) => agent.name),
+            max_hops: routeRule.max_hops,
+            status: "authorized",
+            text: `User authorized bounded ${routeRule.route_rule_kind} group routing for ${routeRule.order
+              .map((agent) => agent.name)
+              .join(" -> ")} with max ${routeRule.max_hops} hop(s).`
+          }
+        });
+        for (const delegation of routeRule.delegations) {
+          await this.store.appendGroupEvent(workspaceId, groupId, {
+            type: "group_delegation_intent",
+            actor,
+            content: {
+              protocol: GROUP_ROUTE_PROTOCOL,
+              delegation_id: delegation.delegation_id,
+              route_rule_id: routeRule.route_rule_id,
+              route_rule_kind: routeRule.route_rule_kind,
+              source_event_id: userEvent.event_id,
+              coordinator_agent_id: delegation.coordinator.id,
+              coordinator_agent_name: delegation.coordinator.name,
+              target_agent_id: delegation.target.id,
+              target_agent_name: delegation.target.name,
+              instruction: delegation.instruction,
+              original_message: message,
+              max_hops: routeRule.max_hops,
+              hop_count: 0,
+              status: "authorized",
+              text: `User authorized ${delegation.coordinator.name} to route to ${delegation.target.name} under ${routeRule.route_rule_kind} rule ${routeRule.route_rule_id}.`
+            }
+          });
+        }
+        const starterDelegations = routeRule.delegations.filter(
+          (delegation) => delegation.coordinator.id === routeRule.start_agent.id
+        );
+        await this.routeGroupMessageToAgent(workspaceId, groupId, group, routeRule.start_agent, message, {
+          route_kind: "delegation_intent",
+          delegation_intents: starterDelegations.map((delegation) => ({
+            delegation_id: delegation.delegation_id,
+            route_rule_id: routeRule.route_rule_id,
+            route_rule_kind: routeRule.route_rule_kind,
+            target_agent_id: delegation.target.id,
+            target_agent_name: delegation.target.name,
+            instruction: delegation.instruction,
+            max_hops: routeRule.max_hops
+          })),
+          max_hops: routeRule.max_hops
+        });
+        return this.groupRoom(workspaceId, groupId);
+      }
       const delegations = this.resolveGroupDelegationIntents(message, agents, explicitTargets);
       if (delegations.length) {
         for (const delegation of delegations) {
@@ -3098,8 +3165,8 @@ class Orchestrator {
       type: "tool_call_summary",
       actor: { kind: "system", id: "orchestrator" },
       content: {
-        tool: "group.route_to_agent",
-        skill: "group.room_message",
+        tool: GROUP_ROUTE_TOOL_ID,
+        skill: GROUP_ROUTE_TOOL_ID,
         text: `Routed group room message to ${agent.name}.`,
         target_agent_id: agent.id,
         target_agent_name: agent.name,
@@ -3176,6 +3243,67 @@ class Orchestrator {
     ];
   }
 
+  resolveBoundedRoundRobinRouteRule(message, agents, explicitTargets = []) {
+    const text = String(message || "");
+    if (!/GROUP_ROUTE_RULE\s*=\s*round_robin/iu.test(text)) {
+      return null;
+    }
+    const orderMatch = text.match(/GROUP_ROUTE_ORDER\s*=\s*([^\s,，;；]+)/iu);
+    const rawOrder = orderMatch?.[1] || "";
+    const references = rawOrder
+      .split(/(?:->|=>|>|→)/u)
+      .map((part) => part.trim().replace(/^@/, ""))
+      .filter(Boolean);
+    const order = [];
+    for (const reference of references) {
+      const agent = this.resolveAgentReference(reference, agents);
+      if (agent && !order.some((candidate) => candidate.id === agent.id)) {
+        order.push(agent);
+      }
+    }
+    if (order.length < 2) {
+      return null;
+    }
+
+    const maxHopsMatch = text.match(/GROUP_ROUTE_MAX_HOPS\s*=\s*(\d+)/iu) || text.match(/COUNT_RELAY_LIMIT\s*=\s*(\d+)/iu);
+    const requestedMaxHops = Number(maxHopsMatch?.[1] || GROUP_ROUTE_MAX_HOPS);
+    const maxHops = Math.max(1, Math.min(100, Number.isFinite(requestedMaxHops) ? requestedMaxHops : GROUP_ROUTE_MAX_HOPS));
+    const startMatch = text.match(/GROUP_ROUTE_START\s*=\s*([^\s,，;；]+)/iu);
+    const startAgent =
+      this.resolveAgentReference(startMatch?.[1], agents) ||
+      explicitTargets.find((agent) => order.some((candidate) => candidate.id === agent.id)) ||
+      order[0];
+    if (!startAgent || !order.some((agent) => agent.id === startAgent.id)) {
+      return null;
+    }
+
+    const routeRuleId = makeId("grule");
+    const delegations = order.map((coordinator, index) => {
+      const target = order[(index + 1) % order.length];
+      return {
+        delegation_id: makeId("gdel"),
+        route_rule_id: routeRuleId,
+        route_rule_kind: "round_robin",
+        coordinator,
+        target,
+        instruction: [
+          `Visible user rule: ${text}`,
+          `You may call ${GROUP_ROUTE_TOOL_ID} only to route from ${coordinator.name} to ${target.name} under this bounded round-robin rule.`,
+          `Max hops for the full rule: ${maxHops}. Stop routing when the visible task is complete or the max hop is reached.`
+        ].join("\n")
+      };
+    });
+
+    return {
+      route_rule_id: routeRuleId,
+      route_rule_kind: "round_robin",
+      order,
+      start_agent: startAgent,
+      max_hops: maxHops,
+      delegations
+    };
+  }
+
   resolveArrowGroupDelegation(message, agents) {
     const arrow = String(message || "").match(/@([^\s@,，.。:：;；!！?？)）\]]+)\s*(?:->|=>|→)\s*@?([^\s@,，.。:：;；!！?？)）\]]+)\s*[:：]?\s*([\s\S]*)$/u);
     if (!arrow) {
@@ -3230,7 +3358,7 @@ class Orchestrator {
       `Visible user request: ${originalMessage}`,
       `Coordinator agent: ${coordinator.name} (${coordinator.id}).`,
       `Target agent: ${target.name} (${target.id}).`,
-      "If you accept the coordination request, send one tendrilflow.route block to the target with the exact request you need answered."
+      `If you decide the target should be contacted now, invoke ${GROUP_ROUTE_TOOL_ID} with the exact request you need answered.`
     ].join("\n");
   }
 
@@ -3318,9 +3446,12 @@ class Orchestrator {
       actor: { kind: "agent", id: sourceAgent.id },
       content: {
         protocol: GROUP_ROUTE_PROTOCOL,
+        tool: GROUP_ROUTE_TOOL_ID,
+        skill: GROUP_ROUTE_TOOL_ID,
         source_agent_id: sourceAgent.id,
         source_agent_name: sourceAgent.name,
         parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        max_hops: GROUP_ROUTE_MAX_HOPS,
         raw: String(block.raw || "").slice(0, 4000),
         parsed: parsed.ok,
         text: parsed.ok
@@ -3385,22 +3516,31 @@ class Orchestrator {
       });
       return;
     }
-    const hopCount = Number(authorization.hop_count || 0) + 1;
-    if (hopCount > GROUP_ROUTE_MAX_HOPS) {
+    const events = await this.store.readGroupEvents(workspaceId, groupId);
+    const maxHops = Number(authorization.max_hops || GROUP_ROUTE_MAX_HOPS);
+    const hopCount = authorization.route_rule_id
+      ? events.filter(
+          (event) =>
+            event.type === "group_route_delivery" && event.content?.route_rule_id === authorization.route_rule_id
+        ).length + 1
+      : Number(authorization.hop_count || 0) + 1;
+    if (hopCount > maxHops) {
       await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
         reason: "max_hops_exceeded",
         target_agent_id: target.id,
         target_agent_name: target.name,
         request_event_id: requestEvent.event_id,
-        parent_event_id: block.parent_event_id || sourceEvent.event_id
+        parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        route_rule_id: authorization.route_rule_id || null,
+        hop_count: hopCount,
+        max_hops: maxHops
       });
       return;
     }
 
     const dedupeKey = hashText(
-      [authorization.delegation_id || "host", sourceAgent.id, target.id, message].join("\u0000")
+      [authorization.route_rule_id || authorization.delegation_id || "host", sourceAgent.id, target.id, message].join("\u0000")
     );
-    const events = await this.store.readGroupEvents(workspaceId, groupId);
     if (events.some((event) => event.type === "group_route_delivery" && event.content?.dedupe_key === dedupeKey)) {
       await this.blockGroupRoute(workspaceId, groupId, sourceAgent, {
         reason: "duplicate_route",
@@ -3419,8 +3559,12 @@ class Orchestrator {
       actor: { kind: "system", id: "orchestrator" },
       content: {
         protocol: GROUP_ROUTE_PROTOCOL,
+        tool: GROUP_ROUTE_TOOL_ID,
+        skill: GROUP_ROUTE_TOOL_ID,
         delivery_id: deliveryId,
         delegation_id: authorization.delegation_id || null,
+        route_rule_id: authorization.route_rule_id || null,
+        route_rule_kind: authorization.route_rule_kind || null,
         request_event_id: requestEvent.event_id,
         parent_event_id: block.parent_event_id || sourceEvent.event_id,
         source_agent_id: sourceAgent.id,
@@ -3433,7 +3577,7 @@ class Orchestrator {
         expect_response: request.expect_response !== false,
         return_to_agent_id: this.resolveAgentReference(request.return_to || request.return_to_agent_id, agents)?.id || sourceAgent.id,
         hop_count: hopCount,
-        max_hops: GROUP_ROUTE_MAX_HOPS,
+        max_hops: maxHops,
         dedupe_key: dedupeKey,
         message,
         text: `Delivered structured route from ${sourceAgent.name} to ${target.name}.`
@@ -3443,11 +3587,14 @@ class Orchestrator {
       route_kind: "agent_delegation",
       source_agent: sourceAgent,
       delegation_id: authorization.delegation_id || null,
+      route_rule_id: authorization.route_rule_id || null,
+      route_rule_kind: authorization.route_rule_kind || null,
       delivery_id: deliveryId,
       parent_event_id: block.parent_event_id || sourceEvent.event_id,
       route_reason: String(request.reason || "").trim(),
       expect_response: request.expect_response !== false,
-      hop_count: hopCount
+      hop_count: hopCount,
+      max_hops: maxHops
     });
   }
 
@@ -3457,6 +3604,8 @@ class Orchestrator {
       actor: { kind: "system", id: "orchestrator" },
       content: {
         protocol: GROUP_ROUTE_PROTOCOL,
+        tool: GROUP_ROUTE_TOOL_ID,
+        skill: GROUP_ROUTE_TOOL_ID,
         source_agent_id: sourceAgent.id,
         source_agent_name: sourceAgent.name,
         ...content,
@@ -3519,6 +3668,8 @@ class Orchestrator {
       actor: { kind: "system", id: "orchestrator" },
       content: {
         protocol: GROUP_ROUTE_PROTOCOL,
+        tool: GROUP_ROUTE_TOOL_ID,
+        skill: GROUP_ROUTE_TOOL_ID,
         delivery_id: delivery.content.delivery_id,
         delegation_id: delivery.content.delegation_id || null,
         responder_agent_id: responderAgent.id,
@@ -3784,8 +3935,8 @@ class Orchestrator {
       type: "tool_call_summary",
       actor: { kind: "agent", id: hostAgent.id },
       content: {
-        tool: "host.route_to_agent",
-        skill: "host.route_to_agent",
+        tool: HOST_ROUTE_TOOL_ID,
+        skill: HOST_ROUTE_TOOL_ID,
         text: `Host Agent called host.route_to_agent to ask ${delegation.target.name} to respond in the group.`,
         target_agent_id: delegation.target.id,
         target_agent_name: delegation.target.name,
@@ -3802,7 +3953,7 @@ class Orchestrator {
         next_owner: task.owner_agent_id || delegation.target.id,
         route_to_agent_id: delegation.target.id,
         route_kind: delegation.kind,
-        tool: "host.route_to_agent"
+        tool: HOST_ROUTE_TOOL_ID
       }
     });
     await this.routeToAgent(task, delegation.target, delegation.message);
@@ -3911,28 +4062,28 @@ class Orchestrator {
     const routeSections = [];
     if (options.delegation_intents?.length) {
       routeSections.push(
-        "Delegation intent:",
+        `Authorized ${GROUP_ROUTE_TOOL_ID} target(s):`,
         ...options.delegation_intents.flatMap((delegation) => [
           `- Delegation: ${delegation.delegation_id}`,
+          delegation.route_rule_id ? `  Route rule: ${delegation.route_rule_kind || "rule"} (${delegation.route_rule_id})` : "",
           `  Target: ${delegation.target_agent_name} (${delegation.target_agent_id})`,
+          delegation.max_hops ? `  Max hops: ${delegation.max_hops}` : "",
           `  Suggested instruction: ${delegation.instruction}`
-        ]),
-        "To contact a target agent, emit exactly one structured block:",
-        "```tendrilflow.route",
-        '{"to":"target agent name","message":"specific request","reason":"visible user asked me to coordinate this","expect_response":true}',
-        "```",
-        "Do not claim the target has been contacted unless TendrilFlow routes the block."
+        ]).filter(Boolean),
+        `Use ${GROUP_ROUTE_TOOL_ID} only if you decide the target should be contacted now.`,
+        "Do not claim the target has been contacted unless TendrilFlow records the route delivery."
       );
     }
     if (options.route_kind === "agent_delegation") {
-      routeSections.push(
+      routeSections.push(...[
         "Delegation delivery:",
         `- From: ${options.source_agent?.name || "unknown"} (${options.source_agent?.id || "unknown"})`,
         options.delegation_id ? `- Delegation: ${options.delegation_id}` : "- Delegation: host/direct",
+        options.route_rule_id ? `- Route rule: ${options.route_rule_kind || "rule"} (${options.route_rule_id})` : "",
         options.route_reason ? `- Reason: ${options.route_reason}` : "- Reason: (not provided)",
-        `- Hop: ${options.hop_count || 1}/${GROUP_ROUTE_MAX_HOPS}`,
+        `- Hop: ${options.hop_count || 1}/${options.max_hops || GROUP_ROUTE_MAX_HOPS}`,
         "- Reply visibly in the Agent Room. If the request asks you to report back to a coordinator, include that coordinator in your visible answer."
-      );
+      ].filter(Boolean));
     }
     if (options.route_kind === "delegation_result") {
       routeSections.push(

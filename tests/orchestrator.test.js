@@ -98,7 +98,7 @@ test("new groups create a Codex Host Agent with TendrilFlow init context prepare
   assert.match(host.command, /--name "host-agent"/);
   assert.equal(host.init_delivery, "codex_exec_session");
   assert.equal(host.init_status, "pending");
-  assert.equal(host.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.equal(host.init_profile_version, "tendrilflow.agent_init.v2");
   assert.match(host.init_prompt, /Agent: host-agent/);
   assert.match(host.init_prompt, /Provider: codex/);
   assert.match(host.init_prompt, /Role: host/);
@@ -132,7 +132,7 @@ test("startup migration upgrades generated mock group hosts to Codex CLI", async
   assert.match(migrated.command, /codex-agent\.js/);
   assert.equal(migrated.init_delivery, "codex_exec_session");
   assert.equal(migrated.init_status, "pending");
-  assert.equal(migrated.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.equal(migrated.init_profile_version, "tendrilflow.agent_init.v2");
 });
 
 test("startup migration keeps generated Host Agent command aligned with host-agent", async () => {
@@ -398,8 +398,8 @@ test("group delegation intent routes to coordinator before the target", async ()
 
   assert.equal(claudeDeliveries.length, 1);
   assert.equal(jennyDeliveries.length, 0);
-  assert.match(claudeDeliveries[0].text, /Delegation intent:/);
-  assert.match(claudeDeliveries[0].text, /tendrilflow\.route/);
+  assert.match(claudeDeliveries[0].text, /Authorized group\.route_to_agent target\(s\):/);
+  assert.match(claudeDeliveries[0].text, /group\.route_to_agent invocation:/);
   assert.ok(room.events.some((event) => event.type === "group_delegation_intent"));
 });
 
@@ -476,7 +476,7 @@ test("group delegation can use Host Agent as coordinator", async () => {
   let events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
   assert.equal(hostDeliveries.length, 1);
   assert.equal(jennyDeliveries.length, 0);
-  assert.match(hostDeliveries[0].text, /Delegation intent:/);
+  assert.match(hostDeliveries[0].text, /Authorized group\.route_to_agent target\(s\):/);
   assert.match(hostDeliveries[0].text, /Target: 珍妮/);
   assert.ok(
     events.some(
@@ -567,6 +567,10 @@ test("authorized group route block reaches target and reports result to coordina
   assert.equal(jennyDeliveries.length, 1);
   assert.match(jennyDeliveries[0].task.task_id, /^group_room:/);
   assert.match(jennyDeliveries[0].text, /Delegation delivery:/);
+  assert.match(jennyDeliveries[0].text, /Available TendrilFlow tools:/);
+  assert.match(jennyDeliveries[0].text, /group\.route_to_agent/);
+  assert.match(jennyDeliveries[0].text, /Recent group room events:/);
+  assert.match(jennyDeliveries[0].text, /group_route_delivery by orchestrator/);
   assert.match(jennyDeliveries[0].text, /provider/);
 
   await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, routeEvent);
@@ -744,6 +748,73 @@ test("unauthorized group route block is blocked", async () => {
   assert.ok(events.some((candidate) => candidate.type === "group_route_blocked" && candidate.content.reason === "not_authorized"));
 });
 
+test("group route tool blocks requests beyond the max hop guard", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Max Hop Route Workspace" });
+  const group = await orchestrator.createGroup({ name: "Max Hop Route Chat", workspace_id: workspace.workspace_id });
+  const coordinator = await createTestAgent(orchestrator, {
+    name: "coordinator",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const target = await createTestAgent(orchestrator, {
+    name: "target",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  let targetDeliveries = 0;
+  orchestrator.sessions.set(target.id, {
+    sendMessage: async () => {
+      targetDeliveries += 1;
+      return true;
+    }
+  });
+  await orchestrator.store.patchAgent(target.id, { status: "running" });
+  await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "group_delegation_intent",
+    actor: { kind: "user", id: "local_user" },
+    content: {
+      protocol: "tendrilflow.group_route.v1",
+      delegation_id: "delegation_max_hop",
+      coordinator_agent_id: coordinator.id,
+      coordinator_agent_name: coordinator.name,
+      target_agent_id: target.id,
+      target_agent_name: target.name,
+      instruction: "Ask target for one final check.",
+      max_hops: 2,
+      hop_count: 2,
+      status: "authorized",
+      text: "User authorized coordinator to contact target, but the chain is already at the max hop count."
+    }
+  });
+
+  const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: coordinator.id },
+    content: {
+      text: [
+        "```tendrilflow.route",
+        '{"to":"target","message":"Please do one final check.","reason":"visible delegation","expect_response":true}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(targetDeliveries, 0);
+  assert.ok(
+    events.some(
+      (candidate) =>
+        candidate.type === "group_route_blocked" &&
+        candidate.content.reason === "max_hops_exceeded" &&
+        candidate.content.tool === "group.route_to_agent"
+    )
+  );
+});
+
 test("arrow group delegation syntax authorizes coordinator route", async () => {
   const { orchestrator } = await makeOrchestrator();
   const workspace = await orchestrator.createWorkspace({ name: "Arrow Route Workspace" });
@@ -784,6 +855,127 @@ test("arrow group delegation syntax authorizes coordinator route", async () => {
         event.content.coordinator_agent_id === claude.id &&
         event.content.target_agent_id === jenny.id &&
         event.content.instruction === "请汇报当前 provider 和模型"
+    )
+  );
+});
+
+test("bounded round-robin group route rule authorizes listed edges and enforces max hops", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Round Robin Workspace" });
+  const group = await orchestrator.createGroup({ name: "Round Robin Chat", workspace_id: workspace.workspace_id });
+  const codex = await createTestAgent(orchestrator, {
+    name: "relay-codex",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const gemini = await createTestAgent(orchestrator, {
+    name: "relay-gemini",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const kimi = await createTestAgent(orchestrator, {
+    name: "relay-kimi",
+    role: "work",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const deliveries = {
+    [codex.id]: [],
+    [gemini.id]: [],
+    [kimi.id]: []
+  };
+  for (const agent of [codex, gemini, kimi]) {
+    orchestrator.sessions.set(agent.id, {
+      sendMessage: async (task, text) => {
+        deliveries[agent.id].push({ task, text });
+        return true;
+      }
+    });
+    await orchestrator.store.patchAgent(agent.id, { status: "running" });
+  }
+
+  await orchestrator.postGroupMessage(
+    workspace.workspace_id,
+    group.group_id,
+    [
+      "@relay-codex",
+      "GROUP_ROUTE_RULE=round_robin",
+      "GROUP_ROUTE_ORDER=relay-codex>relay-gemini>relay-kimi",
+      "GROUP_ROUTE_MAX_HOPS=2",
+      "COUNT_RELAY_LIMIT=2",
+      "User rule: agents take turns with group.route_to_agent; stop when the max hop is reached."
+    ].join(" ")
+  );
+
+  assert.equal(deliveries[codex.id].length, 1);
+  assert.equal(deliveries[gemini.id].length, 0);
+  assert.equal(deliveries[kimi.id].length, 0);
+  assert.match(deliveries[codex.id][0].text, /Route rule: round_robin/);
+  assert.match(deliveries[codex.id][0].text, /Max hops: 2/);
+
+  let events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  const rule = events.find((event) => event.type === "group_route_rule");
+  assert.ok(rule);
+  assert.equal(rule.content.max_hops, 2);
+  assert.deepEqual(rule.content.order_agent_ids, [codex.id, gemini.id, kimi.id]);
+  assert.equal(events.filter((event) => event.type === "group_delegation_intent").length, 3);
+
+  const codexRoute = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: codex.id },
+    content: {
+      text: [
+        "1",
+        "```tendrilflow.route",
+        '{"to":"relay-gemini","message":"COUNT_RELAY_EXPECTED=2","reason":"visible round-robin rule","expect_response":false}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, codexRoute);
+  assert.equal(deliveries[gemini.id].length, 1);
+  assert.match(deliveries[gemini.id][0].text, /Hop: 1\/2/);
+
+  const geminiRoute = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: gemini.id },
+    content: {
+      text: [
+        "2",
+        "```tendrilflow.route",
+        '{"to":"relay-kimi","message":"COUNT_RELAY_EXPECTED=3","reason":"visible round-robin rule","expect_response":false}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, geminiRoute);
+  assert.equal(deliveries[kimi.id].length, 1);
+  assert.match(deliveries[kimi.id][0].text, /Hop: 2\/2/);
+
+  const kimiRoute = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: kimi.id },
+    content: {
+      text: [
+        "3",
+        "```tendrilflow.route",
+        '{"to":"relay-codex","message":"COUNT_RELAY_EXPECTED=4","reason":"visible round-robin rule","expect_response":false}',
+        "```"
+      ].join("\n")
+    }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, kimiRoute);
+
+  events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(deliveries[codex.id].length, 1);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "group_route_blocked" &&
+        event.content.reason === "max_hops_exceeded" &&
+        event.content.route_rule_id === rule.content.route_rule_id
     )
   );
 });
@@ -883,17 +1075,54 @@ test("prepares a TendrilFlow initialization prompt for new Codex sessions", asyn
   assert.equal(init.dry_run, true);
   assert.match(init.command, /^codex exec -C /);
   assert.match(init.command, /--sandbox read-only/);
-  assert.equal(init.agent.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.equal(init.agent.init_profile_version, "tendrilflow.agent_init.v2");
   assert.match(init.prompt, new RegExp(`Agent: unicorn \\(${agent.id}\\)`));
   assert.match(init.prompt, /Runtime Envelope:/);
   assert.match(init.prompt, /Task transcript pattern: \.tendrilflow\/workspaces\//);
   assert.match(init.prompt, /TendrilFlow Architecture:/);
   assert.match(init.prompt, /TendrilFlow Core is the local orchestration layer/);
   assert.match(init.prompt, /Communication Protocol:/);
+  assert.match(init.prompt, /Available TendrilFlow tools:/);
+  assert.match(init.prompt, /group\.route_to_agent: ask another visible group member/);
+  assert.match(init.prompt, /Permission gate: non-Host agents can route only to a target authorized/);
+  assert.match(init.prompt, /Dedupe gate: the same authorized source, target, and message is delivered at most once/);
+  assert.match(init.prompt, /Default hop limit: a route chain stops after 2 hop\(s\)/);
+  assert.match(init.prompt, /Bounded visible route rules may authorize a specific finite max hop count/);
+  assert.match(init.prompt, /Visible transcript: route requests, deliveries, blocks, and results are recorded/);
   assert.match(init.prompt, /Role contract:/);
   assert.match(init.prompt, /Safety & Boundaries:/);
   assert.match(init.prompt, /Startup Acknowledgement:/);
   assert.match(init.prompt, /During this initialization, do not edit files, run shell commands, create commits/);
+});
+
+test("agent initialization refreshes legacy route prompts to the explicit tool contract", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const agent = await orchestrator.createAgent({
+    name: "legacy-route",
+    role: "work",
+    mode: "exec",
+    provider: "codex",
+    cwd: root,
+    command: `node scripts/codex-agent.js --name "legacy-route" --mode exec --cwd "${root}"`
+  });
+  await orchestrator.store.patchAgent(agent.id, {
+    init_profile_version: "tendrilflow.agent_init.v1",
+    init_prompt: [
+      "TendrilFlow Agent Initialization",
+      "```tendrilflow.route",
+      '{"to":"agent name","message":"legacy request","reason":"old prompt","expect_response":true}',
+      "```"
+    ].join("\n"),
+    initialized_at: null
+  });
+
+  const launch = await orchestrator.openAgentCli(agent.id, { dry_run: true, platform: "win32" });
+  const refreshed = await orchestrator.store.getAgent(agent.id);
+
+  assert.equal(launch.init_prompt_included, true);
+  assert.equal(refreshed.init_profile_version, "tendrilflow.agent_init.v2");
+  assert.match(refreshed.init_prompt, /group\.route_to_agent invocation:/);
+  assert.match(refreshed.init_prompt, /Core-enforced route guards:/);
 });
 
 test("records per-agent session logs for console inspection", async () => {
@@ -1533,7 +1762,7 @@ test("prepares provider-neutral TendrilFlow context for non-Codex CLIs", async (
   assert.match(preparedAgent.command, /provider-agent\.js/);
   assert.match(preparedAgent.command, /--provider "gemini"/);
   assert.equal(preparedAgent.init_status, "pending");
-  assert.equal(preparedAgent.init_profile_version, "tendrilflow.agent_init.v1");
+  assert.equal(preparedAgent.init_profile_version, "tendrilflow.agent_init.v2");
   assert.match(preparedAgent.provider_session_id, /^[0-9a-f-]{36}$/i);
   assert.match(preparedAgent.init_prompt, /Provider: gemini/);
   assert.match(preparedAgent.init_prompt, /Runtime Envelope:/);
@@ -1560,7 +1789,9 @@ test("all CLI provider init prompts include the group route protocol", async () 
     const prompt = await orchestrator.buildAgentInitializationPrompt(agent);
     assert.match(prompt, new RegExp(`Provider: ${provider}`));
     assert.match(prompt, /```tendrilflow\.route/);
-    assert.match(prompt, /Plain @mentions in your own natural-language reply are visible text only and do not trigger routing/);
+    assert.match(prompt, /group\.route_to_agent invocation:/);
+    assert.match(prompt, /Core-enforced route guards:/);
+    assert.match(prompt, /Plain natural-language @mentions in agent output are visible text only and never invoke the tool/);
   }
 });
 
@@ -1866,6 +2097,7 @@ test("skill layer creates editable workspace and group skills and injects role m
 
   assert.ok(skills.some((skill) => skill.scope === "workspace" && skill.skill_id === "workspace.context"));
   assert.ok(skills.some((skill) => skill.scope === "group" && skill.skill_id === "host.handoff_policy"));
+  assert.ok(skills.some((skill) => skill.scope === "group" && skill.skill_id === "group.route_to_agent"));
   assert.ok(skills.some((skill) => skill.scope === "group" && skill.skill_id === "review.evidence_check"));
   assert.ok(skills.some((skill) => skill.scope === "group" && skill.skill_id === "debug.recovery"));
 
@@ -1890,6 +2122,8 @@ test("skill layer creates editable workspace and group skills and injects role m
   const context = await orchestrator.buildAgentContextMessage(task, "Review the work.", review);
 
   assert.match(context, /review\.evidence_check/);
+  assert.match(context, /group\.route_to_agent/);
+  assert.match(context, /Use the explicit group\.route_to_agent tool/);
   assert.match(context, /Review must check screenshots, tests, and explicit acceptance evidence/);
   assert.doesNotMatch(context, /debug\.recovery/);
 });

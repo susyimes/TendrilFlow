@@ -716,6 +716,15 @@ function isProviderAdapterLifecycleLine(text) {
   );
 }
 
+function isProviderAdapterTurnCompletionLine(text) {
+  const value = String(text || "").trim();
+  return (
+    /^[^:]+:\s+codex exec exited with code\b/i.test(value) ||
+    /^[^:]+:\s+(?:claude|gemini|kimi)\s+headless turn completed\.$/i.test(value) ||
+    /^[^:]+:\s+(?:claude|gemini|kimi)\s+headless turn exited with code\b/i.test(value)
+  );
+}
+
 class Orchestrator {
   constructor(rootDir) {
     this.rootDir = path.resolve(rootDir);
@@ -2412,8 +2421,9 @@ class Orchestrator {
       onTaskEvent: async (taskId, event) => {
         const groupRoute = parseGroupRouteTaskId(taskId);
         if (groupRoute) {
+          const annotatedEvent = this.annotateRoundtableGroupEvent(groupRoute.workspace_id, groupRoute.group_id, event);
           const groupEvent = await this.store
-            .appendGroupEvent(groupRoute.workspace_id, groupRoute.group_id, event)
+            .appendGroupEvent(groupRoute.workspace_id, groupRoute.group_id, annotatedEvent)
             .catch(() => null);
           if (groupEvent) {
             await this.handleGroupAgentEvent(groupRoute.workspace_id, groupRoute.group_id, groupEvent).catch(() => undefined);
@@ -2425,6 +2435,12 @@ class Orchestrator {
       onSessionEvent: async (id, event) => {
         await this.captureProviderSessionMarker(id, event).catch(() => undefined);
         await this.markProviderInitFailed(id, event).catch(() => undefined);
+        const groupRoute = parseGroupRouteTaskId(event.task_id);
+        if (groupRoute) {
+          await this.observeRoundtableSessionEvent(groupRoute.workspace_id, groupRoute.group_id, id, event).catch(
+            () => undefined
+          );
+        }
         await logAgentEvent({ ...event, agent_id: id });
       },
       onExit: async (id, code) => {
@@ -2775,7 +2791,10 @@ class Orchestrator {
       started_at: nowIso(),
       started_event_id: startedEvent.event_id,
       next_agent_index: 0,
+      turn_index: 0,
       in_flight_agent_id: null,
+      in_flight_turn_id: null,
+      in_flight_turn_index: null,
       in_flight_since: null,
       synthesis_requested: false,
       synthesis_requested_at: null,
@@ -2864,16 +2883,12 @@ class Orchestrator {
           text: "Roundtable tick timed out; moving to the next participant."
         }
       });
-      session.in_flight_agent_id = null;
-      session.in_flight_since = null;
+      this.clearRoundtableInFlight(session);
     }
     const target = await this.nextRoundtableAgent(session, events);
     if (!target) {
       return this.completeRoundtable(session, events);
     }
-    session.in_flight_agent_id = target.id;
-    session.in_flight_since = nowIso();
-    session.last_tick_at = session.in_flight_since;
     await this.sendRoundtablePromptToAgent(session, target, events);
     return this.publicRoundtable(session, events);
   }
@@ -2909,6 +2924,18 @@ class Orchestrator {
 
   async sendRoundtablePromptToAgent(session, agent, events) {
     const adapterSession = this.sessions.get(agent.id);
+    let turnId = null;
+    let turnIndex = null;
+    if (adapterSession) {
+      turnId = makeId("rturn");
+      turnIndex = Number(session.turn_index || 0) + 1;
+      session.turn_index = turnIndex;
+      session.in_flight_agent_id = agent.id;
+      session.in_flight_turn_id = turnId;
+      session.in_flight_turn_index = turnIndex;
+      session.in_flight_since = nowIso();
+      session.last_tick_at = session.in_flight_since;
+    }
     await this.store.appendGroupEvent(session.workspace_id, session.group_id, {
       type: "tool_call_summary",
       actor: { kind: "system", id: "orchestrator" },
@@ -2916,6 +2943,8 @@ class Orchestrator {
         protocol: ROUNDTABLE_PROTOCOL,
         tool: "roundtable.tick",
         roundtable_id: session.roundtable_id,
+        roundtable_turn_id: turnId,
+        roundtable_turn_index: turnIndex,
         target_agent_id: agent.id,
         target_agent_name: agent.name,
         text: adapterSession
@@ -2924,8 +2953,7 @@ class Orchestrator {
       }
     });
     if (!adapterSession) {
-      session.in_flight_agent_id = null;
-      session.in_flight_since = null;
+      this.clearRoundtableInFlight(session);
       this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
       return false;
     }
@@ -2938,7 +2966,12 @@ class Orchestrator {
       description: "Autonomous roundtable watcher prompt.",
       participant_agent_ids: [agent.id]
     };
-    return adapterSession.sendMessage(syntheticTask, await this.buildRoundtableContextMessage(session, agent, events));
+    const sent = await adapterSession.sendMessage(syntheticTask, await this.buildRoundtableContextMessage(session, agent, events));
+    if (!sent) {
+      this.clearRoundtableInFlight(session);
+      this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
+    }
+    return sent;
   }
 
   async buildRoundtableContextMessage(session, agent, events) {
@@ -3008,12 +3041,81 @@ class Orchestrator {
       ) {
         continue;
       }
-      if (session.in_flight_agent_id === agent.id) {
-        session.in_flight_agent_id = null;
-        session.in_flight_since = null;
+      const eventTurnId = event.content?.roundtable_turn_id || null;
+      if (session.in_flight_agent_id === agent.id && eventTurnId && eventTurnId === session.in_flight_turn_id) {
+        continue;
       }
+
+      // Legacy/manual events do not carry a turn id. Keep supporting them for tests and hand-written transcripts,
+      // while provider-backed roundtables advance on explicit turn-completion lifecycle events.
+      if (session.in_flight_agent_id === agent.id && !eventTurnId) {
+        this.clearRoundtableInFlight(session);
+      }
+
       const events = await this.store.readGroupEvents(workspaceId, groupId);
       if (session.synthesis_requested && agent.id === session.final_agent_id) {
+        await this.completeRoundtable(session, events);
+      } else {
+        this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
+      }
+    }
+  }
+
+  annotateRoundtableGroupEvent(workspaceId, groupId, event) {
+    if (!event?.actor?.id || !["agent_message", "tool_call_summary"].includes(event.type)) {
+      return event;
+    }
+    const session = Array.from(this.roundtables.values()).find(
+      (candidate) =>
+        candidate.status === "active" &&
+        candidate.workspace_id === workspaceId &&
+        candidate.group_id === groupId &&
+        candidate.in_flight_agent_id === event.actor.id &&
+        candidate.in_flight_turn_id
+    );
+    if (!session) {
+      return event;
+    }
+    return {
+      ...event,
+      content: {
+        ...(event.content || {}),
+        roundtable_id: session.roundtable_id,
+        roundtable_turn_id: session.in_flight_turn_id,
+        roundtable_turn_index: session.in_flight_turn_index,
+        roundtable_turn_agent_id: session.in_flight_agent_id
+      }
+    };
+  }
+
+  clearRoundtableInFlight(session) {
+    session.in_flight_agent_id = null;
+    session.in_flight_turn_id = null;
+    session.in_flight_turn_index = null;
+    session.in_flight_since = null;
+  }
+
+  async observeRoundtableSessionEvent(workspaceId, groupId, agentId, event) {
+    if (!isProviderAdapterTurnCompletionLine(event.content?.text)) {
+      return;
+    }
+    for (const session of this.roundtables.values()) {
+      if (
+        session.status !== "active" ||
+        session.workspace_id !== workspaceId ||
+        session.group_id !== groupId ||
+        session.in_flight_agent_id !== agentId
+      ) {
+        continue;
+      }
+      const turnId = session.in_flight_turn_id;
+      const finalAgentCompleted = session.synthesis_requested && agentId === session.final_agent_id;
+      this.clearRoundtableInFlight(session);
+      const events = await this.store.readGroupEvents(workspaceId, groupId);
+      const turnContributed = this.roundtableContributionEvents(session, events).some(
+        (candidate) => candidate.content?.roundtable_turn_id === turnId
+      );
+      if (finalAgentCompleted && turnContributed) {
         await this.completeRoundtable(session, events);
       } else {
         this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
@@ -3027,8 +3129,7 @@ class Orchestrator {
     }
     session.status = "completed";
     session.completed_at = nowIso();
-    session.in_flight_agent_id = null;
-    session.in_flight_since = null;
+    this.clearRoundtableInFlight(session);
     if (session.timer) {
       clearTimeout(session.timer);
       session.timer = null;
@@ -3055,8 +3156,7 @@ class Orchestrator {
     }
     session.status = "stopped";
     session.completed_at = nowIso();
-    session.in_flight_agent_id = null;
-    session.in_flight_since = null;
+    this.clearRoundtableInFlight(session);
     if (session.timer) {
       clearTimeout(session.timer);
       session.timer = null;
@@ -3092,12 +3192,20 @@ class Orchestrator {
   roundtableContributionEvents(session, events = []) {
     const startIndex = events.findIndex((event) => event.event_id === session.started_event_id);
     const scoped = startIndex >= 0 ? events.slice(startIndex + 1) : events;
-    return scoped.filter(
-      (event) =>
+    const contributions = new Map();
+    for (const event of scoped) {
+      if (
         event.type === "agent_message" &&
         session.participant_agent_ids.includes(event.actor?.id) &&
         !isProviderAdapterLifecycleLine(event.content?.text)
-    );
+      ) {
+        const key = event.content?.roundtable_turn_id || event.event_id;
+        if (!contributions.has(key)) {
+          contributions.set(key, event);
+        }
+      }
+    }
+    return Array.from(contributions.values());
   }
 
   publicRoundtable(session, events = []) {

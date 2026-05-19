@@ -157,6 +157,42 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const groupRoundtablesRoute = pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/roundtables$/);
+      if (groupRoundtablesRoute && req.method === "GET") {
+        const [, workspaceId, groupId] = groupRoundtablesRoute.map(decodeURIComponent);
+        sendJson(res, 200, { roundtables: orchestrator.roundtablesForGroup(workspaceId, groupId) });
+        return;
+      }
+      if (groupRoundtablesRoute && req.method === "POST") {
+        const [, workspaceId, groupId] = groupRoundtablesRoute.map(decodeURIComponent);
+        sendJson(res, 201, { roundtable: await orchestrator.startRoundtable(workspaceId, groupId, await readJson(req)) });
+        return;
+      }
+
+      const roundtableRoute = pathname.match(/^\/api\/roundtables\/([^/]+)$/);
+      if (roundtableRoute && req.method === "GET") {
+        const roundtable = await orchestrator.roundtableStatus(decodeURIComponent(roundtableRoute[1]));
+        if (!roundtable) {
+          sendJson(res, 404, { error: "Roundtable not found" });
+          return;
+        }
+        sendJson(res, 200, { roundtable });
+        return;
+      }
+
+      const roundtableActionRoute = pathname.match(/^\/api\/roundtables\/([^/]+)\/(tick|stop)$/);
+      if (roundtableActionRoute && req.method === "POST") {
+        const [, roundtableId, action] = roundtableActionRoute.map(decodeURIComponent);
+        const roundtable =
+          action === "tick" ? await orchestrator.runRoundtableTick(roundtableId) : await orchestrator.stopRoundtable(roundtableId);
+        if (!roundtable) {
+          sendJson(res, 404, { error: "Roundtable not found" });
+          return;
+        }
+        sendJson(res, 200, { roundtable });
+        return;
+      }
+
       if (pathname === "/api/skills" && req.method === "GET") {
         sendJson(res, 200, {
           skills: await orchestrator.listSkills({

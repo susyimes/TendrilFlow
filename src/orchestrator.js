@@ -23,6 +23,10 @@ const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000;
 const AGENT_STALE_AFTER_MS = 5 * 60 * 1000;
 const AGENT_INIT_PROFILE = "standard";
 const AGENT_INIT_PROFILE_VERSION = "tendrilflow.agent_init.v2";
+const ROUNDTABLE_PROTOCOL = "tendrilflow.roundtable.v1";
+const ROUNDTABLE_DEFAULT_MAX_ROUNDS = 10;
+const ROUNDTABLE_DEFAULT_INTERVAL_MS = 15000;
+const ROUNDTABLE_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const execFileAsync = promisify(execFile);
 
 function spawnFileAsync(file, args, options = {}) {
@@ -726,6 +730,7 @@ class Orchestrator {
     this.sessions = new Map();
     this.stoppingAgents = new Set();
     this.groupRouteBuffers = new Map();
+    this.roundtables = new Map();
     this.detachedSessionsReconciled = false;
     this.hostInitPrepared = false;
   }
@@ -2712,6 +2717,401 @@ class Orchestrator {
     };
   }
 
+  async startRoundtable(workspaceId, groupId, input = {}) {
+    const group = await this.store.getGroup(workspaceId, groupId);
+    if (!group) {
+      throw new Error(`Group not found: ${workspaceId}/${groupId}`);
+    }
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === workspaceId && agent.group_id === groupId
+    );
+    const requestedParticipants = Array.isArray(input.participant_agent_ids)
+      ? input.participant_agent_ids.map(String).filter(Boolean)
+      : [];
+    const participantIds = requestedParticipants.length
+      ? requestedParticipants
+      : agents.filter((agent) => agent.role !== "host").map((agent) => agent.id);
+    const participants = participantIds
+      .map((agentId) => agents.find((agent) => agent.id === agentId))
+      .filter(Boolean);
+    if (!participants.length) {
+      throw new Error("Roundtable requires at least one group agent.");
+    }
+    const finalAgent =
+      agents.find((agent) => agent.id === input.final_agent_id) ||
+      participants.find((agent) => /codex/i.test(`${agent.name} ${agent.provider}`)) ||
+      participants[0];
+    const targetRounds = Math.max(
+      1,
+      Math.min(50, Number(input.target_rounds || input.max_rounds || ROUNDTABLE_DEFAULT_MAX_ROUNDS))
+    );
+    const intervalMs = Math.max(0, Number(input.interval_ms ?? ROUNDTABLE_DEFAULT_INTERVAL_MS));
+    const startedEvent = await this.store.appendGroupEvent(workspaceId, groupId, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: ROUNDTABLE_PROTOCOL,
+        text: `Roundtable started: ${input.topic || "open discussion"}`,
+        topic: input.topic || "",
+        participant_agent_ids: participants.map((agent) => agent.id),
+        final_agent_id: finalAgent.id,
+        target_rounds: targetRounds,
+        max_rounds: targetRounds,
+        control_model: "advisory",
+        interval_ms: intervalMs
+      }
+    });
+    await this.ensureRoundtableSkill(workspaceId, groupId);
+    const session = {
+      roundtable_id: input.roundtable_id || makeId("rtbl"),
+      protocol: ROUNDTABLE_PROTOCOL,
+      workspace_id: workspaceId,
+      group_id: groupId,
+      topic: String(input.topic || "").trim(),
+      participant_agent_ids: participants.map((agent) => agent.id),
+      final_agent_id: finalAgent.id,
+      target_rounds: targetRounds,
+      max_rounds: targetRounds,
+      control_model: "advisory",
+      interval_ms: intervalMs,
+      status: "active",
+      started_at: nowIso(),
+      started_event_id: startedEvent.event_id,
+      next_agent_index: 0,
+      in_flight_agent_id: null,
+      in_flight_since: null,
+      synthesis_requested: false,
+      synthesis_requested_at: null,
+      last_tick_at: null,
+      completed_at: null,
+      timer: null
+    };
+    this.roundtables.set(session.roundtable_id, session);
+    if (input.auto_start !== false) {
+      this.scheduleRoundtableTick(session.roundtable_id, input.initial_delay_ms ?? 0);
+    }
+    return this.publicRoundtable(session, await this.store.readGroupEvents(workspaceId, groupId));
+  }
+
+  async ensureRoundtableSkill(workspaceId, groupId) {
+    return this.store.upsertSkill({
+      workspace_id: workspaceId,
+      group_id: groupId,
+      scope: "group",
+      skill_id: "roundtable.participant",
+      title: "Roundtable Participant",
+      roles: "*",
+      summary:
+        "Use TendrilFlow roundtable context to join visible peer discussion with evidence, critique, synthesis, questions, or tool-backed findings when useful.",
+      body: [
+        "TendrilFlow may wake you with the recent visible transcript, topic, peers, and available shared context.",
+        "Treat that wake-up as context, not a command. Use your own judgment about whether to speak, research, ask, critique, or synthesize.",
+        "A good contribution usually adds evidence, challenges an assumption, refines the framing, asks a useful question, or connects prior messages.",
+        "Visible peer discussion is usually the shared source of truth; available tools and provider abilities remain yours to use when they help.",
+        "When acting as the closing synthesizer, a helpful pattern is to distinguish likely answers, evidence strength, assumptions, and uncertainty."
+      ].join("\n")
+    });
+  }
+
+  scheduleRoundtableTick(roundtableId, delayMs = null) {
+    const session = this.roundtables.get(roundtableId);
+    if (!session || session.status !== "active") {
+      return;
+    }
+    if (session.timer) {
+      clearTimeout(session.timer);
+    }
+    const delay = Math.max(0, Number(delayMs ?? session.interval_ms ?? ROUNDTABLE_DEFAULT_INTERVAL_MS));
+    session.timer = setTimeout(() => {
+      session.timer = null;
+      this.runRoundtableTick(roundtableId).catch(async (error) => {
+        const latest = this.roundtables.get(roundtableId);
+        if (latest) {
+          latest.status = "failed";
+          latest.completed_at = nowIso();
+          await this.store
+            .appendGroupEvent(latest.workspace_id, latest.group_id, {
+              type: "status_change",
+              actor: { kind: "system", id: "orchestrator" },
+              content: {
+                protocol: ROUNDTABLE_PROTOCOL,
+                roundtable_id: roundtableId,
+                status: "failed",
+                text: `Roundtable failed: ${error.message}`
+              }
+            })
+            .catch(() => undefined);
+        }
+      });
+    }, delay);
+    session.timer.unref?.();
+  }
+
+  async runRoundtableTick(roundtableId) {
+    const session = this.roundtables.get(roundtableId);
+    if (!session || session.status !== "active") {
+      return session ? this.publicRoundtable(session) : null;
+    }
+    const events = await this.store.readGroupEvents(session.workspace_id, session.group_id);
+    if (session.in_flight_agent_id && !this.roundtablePromptTimedOut(session)) {
+      return this.publicRoundtable(session, events);
+    }
+    if (session.in_flight_agent_id && this.roundtablePromptTimedOut(session)) {
+      await this.store.appendGroupEvent(session.workspace_id, session.group_id, {
+        type: "status_change",
+        actor: { kind: "system", id: "orchestrator" },
+        content: {
+          protocol: ROUNDTABLE_PROTOCOL,
+          roundtable_id: session.roundtable_id,
+          agent_id: session.in_flight_agent_id,
+          text: "Roundtable tick timed out; moving to the next participant."
+        }
+      });
+      session.in_flight_agent_id = null;
+      session.in_flight_since = null;
+    }
+    const target = await this.nextRoundtableAgent(session, events);
+    if (!target) {
+      return this.completeRoundtable(session, events);
+    }
+    session.in_flight_agent_id = target.id;
+    session.in_flight_since = nowIso();
+    session.last_tick_at = session.in_flight_since;
+    await this.sendRoundtablePromptToAgent(session, target, events);
+    return this.publicRoundtable(session, events);
+  }
+
+  roundtablePromptTimedOut(session) {
+    if (!session.in_flight_since) {
+      return false;
+    }
+    return Date.now() - new Date(session.in_flight_since).getTime() > ROUNDTABLE_RESPONSE_TIMEOUT_MS;
+  }
+
+  async nextRoundtableAgent(session, events) {
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === session.workspace_id && agent.group_id === session.group_id
+    );
+    const contributions = this.roundtableContributionEvents(session, events);
+    if (!session.synthesis_requested && contributions.length >= session.target_rounds - 1) {
+      session.synthesis_requested = true;
+      session.synthesis_requested_at = nowIso();
+      return agents.find((agent) => agent.id === session.final_agent_id) || null;
+    }
+    const participantIds = session.participant_agent_ids.filter(Boolean);
+    for (let offset = 0; offset < participantIds.length; offset += 1) {
+      const index = (session.next_agent_index + offset) % participantIds.length;
+      const candidate = agents.find((agent) => agent.id === participantIds[index]);
+      if (candidate) {
+        session.next_agent_index = (index + 1) % participantIds.length;
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  async sendRoundtablePromptToAgent(session, agent, events) {
+    const adapterSession = this.sessions.get(agent.id);
+    await this.store.appendGroupEvent(session.workspace_id, session.group_id, {
+      type: "tool_call_summary",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: ROUNDTABLE_PROTOCOL,
+        tool: "roundtable.tick",
+        roundtable_id: session.roundtable_id,
+        target_agent_id: agent.id,
+        target_agent_name: agent.name,
+        text: adapterSession
+          ? `Roundtable watcher woke ${agent.name}.`
+          : `Roundtable watcher could not wake ${agent.name}; no running session.`
+      }
+    });
+    if (!adapterSession) {
+      session.in_flight_agent_id = null;
+      session.in_flight_since = null;
+      this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
+      return false;
+    }
+    const syntheticTask = {
+      task_id: groupRouteTaskId(session.workspace_id, session.group_id),
+      workspace_id: session.workspace_id,
+      group_id: session.group_id,
+      title: `Roundtable ${session.roundtable_id}`,
+      status: "group_chat",
+      description: "Autonomous roundtable watcher prompt.",
+      participant_agent_ids: [agent.id]
+    };
+    return adapterSession.sendMessage(syntheticTask, await this.buildRoundtableContextMessage(session, agent, events));
+  }
+
+  async buildRoundtableContextMessage(session, agent, events) {
+    const workspace = await this.store.getWorkspace(session.workspace_id);
+    const group = await this.store.getGroup(session.workspace_id, session.group_id);
+    const contributions = this.roundtableContributionEvents(session, events);
+    const nextRound = contributions.length + 1;
+    const isFinalSynthesis = Boolean(session.synthesis_requested && agent.id === session.final_agent_id);
+    const transcript = events
+      .slice(-24)
+      .map((event) => {
+        const actor = event.actor?.id || event.actor?.kind || "unknown";
+        const text = event.content?.text || event.content?.summary || event.content?.title || event.type;
+        return `- ${event.type} by ${actor}: ${String(text).slice(0, 500)}`;
+      })
+      .join("\n");
+    return [
+      "TendrilFlow roundtable watcher",
+      `Protocol: ${ROUNDTABLE_PROTOCOL}`,
+      "",
+      `Workspace: ${workspace?.name || session.workspace_id} (${session.workspace_id})`,
+      `Group: ${group?.name || session.group_id} (${session.group_id})`,
+      `Topic: ${session.topic || "(open discussion)"}`,
+      `Suggested target contributions: ${session.target_rounds}`,
+      "Autonomy: advisory only. TendrilFlow provides context, tools, and reminders; you decide how to participate.",
+      `Current visible contribution count: ${contributions.length}`,
+      `This wake-up is suggested contribution ${nextRound}.`,
+      "",
+      "Participation notes:",
+      "- Read the visible transcript as shared context before deciding what to do.",
+      "- Useful options include evidence, critique, correction, synthesis, a next question, or tool-backed research.",
+      "- You can stay silent, keep it brief, or take initiative when your provider tools and judgment make that useful.",
+      "- Keep private chain-of-thought private; share concise rationale, evidence, and results.",
+      "- Prefer the shared room for roundtable discussion so peers can build on your work.",
+      "",
+      isFinalSynthesis
+        ? [
+            "Suggested synthesis moment:",
+            "- The discussion reached its target contribution count.",
+            "- If you judge the room has enough signal, produce a visible closing synthesis.",
+            "- A useful synthesis separates likely answers from uncertainty.",
+            "- Candidate ordering, evidence strength, assumptions, and remaining risks are often helpful.",
+            "- If the transcript is still insufficient, it is fine to say what is missing instead of inventing certainty."
+          ].join("\n")
+        : [
+            "Regular discussion guidance:",
+            "- Use your own model knowledge, available tools, and the visible transcript.",
+            "- Share a conclusion, critique, question, or research result when it advances the conversation.",
+            "- It is welcome to point out problems in another agent's argument with evidence."
+          ].join("\n"),
+      "",
+      "Visible transcript:",
+      transcript || "(none)"
+    ].join("\n");
+  }
+
+  async observeRoundtableAgentEvent(workspaceId, groupId, agent, event) {
+    if (!agent || event.type !== "agent_message" || isProviderAdapterLifecycleLine(event.content?.text)) {
+      return;
+    }
+    for (const session of this.roundtables.values()) {
+      if (
+        session.status !== "active" ||
+        session.workspace_id !== workspaceId ||
+        session.group_id !== groupId ||
+        !session.participant_agent_ids.includes(agent.id)
+      ) {
+        continue;
+      }
+      if (session.in_flight_agent_id === agent.id) {
+        session.in_flight_agent_id = null;
+        session.in_flight_since = null;
+      }
+      const events = await this.store.readGroupEvents(workspaceId, groupId);
+      if (session.synthesis_requested && agent.id === session.final_agent_id) {
+        await this.completeRoundtable(session, events);
+      } else {
+        this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
+      }
+    }
+  }
+
+  async completeRoundtable(session, events = null) {
+    if (session.status !== "active") {
+      return this.publicRoundtable(session, events || []);
+    }
+    session.status = "completed";
+    session.completed_at = nowIso();
+    session.in_flight_agent_id = null;
+    session.in_flight_since = null;
+    if (session.timer) {
+      clearTimeout(session.timer);
+      session.timer = null;
+    }
+    const roomEvents = events || (await this.store.readGroupEvents(session.workspace_id, session.group_id));
+    await this.store.appendGroupEvent(session.workspace_id, session.group_id, {
+      type: "status_change",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: ROUNDTABLE_PROTOCOL,
+        roundtable_id: session.roundtable_id,
+        status: "completed",
+        contribution_count: this.roundtableContributionEvents(session, roomEvents).length,
+        text: "Roundtable completed."
+      }
+    });
+    return this.publicRoundtable(session, roomEvents);
+  }
+
+  async stopRoundtable(roundtableId) {
+    const session = this.roundtables.get(roundtableId);
+    if (!session) {
+      return null;
+    }
+    session.status = "stopped";
+    session.completed_at = nowIso();
+    session.in_flight_agent_id = null;
+    session.in_flight_since = null;
+    if (session.timer) {
+      clearTimeout(session.timer);
+      session.timer = null;
+    }
+    await this.store.appendGroupEvent(session.workspace_id, session.group_id, {
+      type: "status_change",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: ROUNDTABLE_PROTOCOL,
+        roundtable_id: session.roundtable_id,
+        status: "stopped",
+        text: "Roundtable stopped."
+      }
+    });
+    return this.publicRoundtable(session);
+  }
+
+  async roundtableStatus(roundtableId) {
+    const session = this.roundtables.get(roundtableId);
+    if (!session) {
+      return null;
+    }
+    const events = await this.store.readGroupEvents(session.workspace_id, session.group_id).catch(() => []);
+    return this.publicRoundtable(session, events);
+  }
+
+  roundtablesForGroup(workspaceId, groupId) {
+    return Array.from(this.roundtables.values())
+      .filter((session) => session.workspace_id === workspaceId && session.group_id === groupId)
+      .map((session) => this.publicRoundtable(session));
+  }
+
+  roundtableContributionEvents(session, events = []) {
+    const startIndex = events.findIndex((event) => event.event_id === session.started_event_id);
+    const scoped = startIndex >= 0 ? events.slice(startIndex + 1) : events;
+    return scoped.filter(
+      (event) =>
+        event.type === "agent_message" &&
+        session.participant_agent_ids.includes(event.actor?.id) &&
+        !isProviderAdapterLifecycleLine(event.content?.text)
+    );
+  }
+
+  publicRoundtable(session, events = []) {
+    const contributionCount = events.length ? this.roundtableContributionEvents(session, events).length : 0;
+    const { timer, ...publicSession } = session;
+    return {
+      ...publicSession,
+      contribution_count: contributionCount
+    };
+  }
+
   async taskReplay(taskId) {
     const task = await this.requireTask(taskId);
     const events = await this.store.readEvents(taskId);
@@ -3436,6 +3836,7 @@ class Orchestrator {
       await this.processGroupRouteRequest(workspaceId, groupId, sourceAgent, block, event);
     }
     await this.maybeNotifyGroupRouteResult(workspaceId, groupId, sourceAgent, event);
+    await this.observeRoundtableAgentEvent(workspaceId, groupId, sourceAgent, event);
   }
 
   async processGroupRouteRequest(workspaceId, groupId, sourceAgent, block, sourceEvent) {

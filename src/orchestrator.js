@@ -2757,10 +2757,11 @@ class Orchestrator {
       agents.find((agent) => agent.id === input.final_agent_id) ||
       participants.find((agent) => /codex/i.test(`${agent.name} ${agent.provider}`)) ||
       participants[0];
-    const targetRounds = Math.max(
+    const maxRounds = Math.max(
       1,
       Math.min(50, Number(input.target_rounds || input.max_rounds || ROUNDTABLE_DEFAULT_MAX_ROUNDS))
     );
+    const turnsPerRound = participants.length;
     const intervalMs = Math.max(0, Number(input.interval_ms ?? ROUNDTABLE_DEFAULT_INTERVAL_MS));
     const startedEvent = await this.store.appendGroupEvent(workspaceId, groupId, {
       type: "system_event",
@@ -2771,8 +2772,10 @@ class Orchestrator {
         topic: input.topic || "",
         participant_agent_ids: participants.map((agent) => agent.id),
         final_agent_id: finalAgent.id,
-        target_rounds: targetRounds,
-        max_rounds: targetRounds,
+        target_rounds: maxRounds,
+        max_rounds: maxRounds,
+        turns_per_round: turnsPerRound,
+        round_model: "participant_cycle",
         control_model: "advisory",
         interval_ms: intervalMs
       }
@@ -2786,8 +2789,10 @@ class Orchestrator {
       topic: String(input.topic || "").trim(),
       participant_agent_ids: participants.map((agent) => agent.id),
       final_agent_id: finalAgent.id,
-      target_rounds: targetRounds,
-      max_rounds: targetRounds,
+      target_rounds: maxRounds,
+      max_rounds: maxRounds,
+      turns_per_round: turnsPerRound,
+      round_model: "participant_cycle",
       control_model: "advisory",
       interval_ms: intervalMs,
       status: "active",
@@ -2795,9 +2800,13 @@ class Orchestrator {
       started_event_id: startedEvent.event_id,
       next_agent_index: 0,
       turn_index: 0,
+      discussion_turn_index: 0,
       in_flight_agent_id: null,
       in_flight_turn_id: null,
       in_flight_turn_index: null,
+      in_flight_round_index: null,
+      in_flight_speaker_index: null,
+      in_flight_turn_kind: null,
       in_flight_since: null,
       synthesis_requested: false,
       synthesis_requested_at: null,
@@ -2907,13 +2916,13 @@ class Orchestrator {
     const agents = (await this.store.listAgents()).filter(
       (agent) => agent.workspace_id === session.workspace_id && agent.group_id === session.group_id
     );
-    const contributions = this.roundtableContributionEvents(session, events);
-    if (!session.synthesis_requested && contributions.length >= session.target_rounds - 1) {
+    const participantIds = session.participant_agent_ids.filter(Boolean);
+    const maxDiscussionTurns = Math.max(1, Number(session.max_rounds || session.target_rounds || 1)) * participantIds.length;
+    if (!session.synthesis_requested && Number(session.discussion_turn_index || 0) >= maxDiscussionTurns) {
       session.synthesis_requested = true;
       session.synthesis_requested_at = nowIso();
       return agents.find((agent) => agent.id === session.final_agent_id) || null;
     }
-    const participantIds = session.participant_agent_ids.filter(Boolean);
     for (let offset = 0; offset < participantIds.length; offset += 1) {
       const index = (session.next_agent_index + offset) % participantIds.length;
       const candidate = agents.find((agent) => agent.id === participantIds[index]);
@@ -2927,15 +2936,28 @@ class Orchestrator {
 
   async sendRoundtablePromptToAgent(session, agent, events) {
     const adapterSession = this.sessions.get(agent.id);
+    const participantCount = Math.max(1, session.participant_agent_ids.filter(Boolean).length);
+    const isSynthesisTurn = Boolean(session.synthesis_requested && agent.id === session.final_agent_id);
     let turnId = null;
     let turnIndex = null;
+    let roundIndex = null;
+    let speakerIndex = null;
+    if (adapterSession && !isSynthesisTurn) {
+      const discussionTurnIndex = Number(session.discussion_turn_index || 0) + 1;
+      session.discussion_turn_index = discussionTurnIndex;
+      roundIndex = Math.floor((discussionTurnIndex - 1) / participantCount) + 1;
+      speakerIndex = ((discussionTurnIndex - 1) % participantCount) + 1;
+    }
+    turnId = makeId("rturn");
+    turnIndex = Number(session.turn_index || 0) + 1;
+    session.turn_index = turnIndex;
+    session.in_flight_agent_id = adapterSession ? agent.id : null;
+    session.in_flight_turn_id = adapterSession ? turnId : null;
+    session.in_flight_turn_index = adapterSession ? turnIndex : null;
+    session.in_flight_round_index = adapterSession ? roundIndex : null;
+    session.in_flight_speaker_index = adapterSession ? speakerIndex : null;
+    session.in_flight_turn_kind = adapterSession ? (isSynthesisTurn ? "synthesis" : "discussion") : null;
     if (adapterSession) {
-      turnId = makeId("rturn");
-      turnIndex = Number(session.turn_index || 0) + 1;
-      session.turn_index = turnIndex;
-      session.in_flight_agent_id = agent.id;
-      session.in_flight_turn_id = turnId;
-      session.in_flight_turn_index = turnIndex;
       session.in_flight_since = nowIso();
       session.last_tick_at = session.in_flight_since;
     }
@@ -2948,6 +2970,10 @@ class Orchestrator {
         roundtable_id: session.roundtable_id,
         roundtable_turn_id: turnId,
         roundtable_turn_index: turnIndex,
+        roundtable_turn_kind: isSynthesisTurn ? "synthesis" : "discussion",
+        roundtable_round_index: roundIndex,
+        roundtable_speaker_index: speakerIndex,
+        roundtable_speaker_count: participantCount,
         target_agent_id: agent.id,
         target_agent_name: agent.name,
         text: adapterSession
@@ -2971,6 +2997,9 @@ class Orchestrator {
     };
     const sent = await adapterSession.sendMessage(syntheticTask, await this.buildRoundtableContextMessage(session, agent, events));
     if (!sent) {
+      if (session.in_flight_turn_kind === "discussion") {
+        session.discussion_turn_index = Math.max(0, Number(session.discussion_turn_index || 0) - 1);
+      }
       this.clearRoundtableInFlight(session);
       this.scheduleRoundtableTick(session.roundtable_id, session.interval_ms);
     }
@@ -2980,9 +3009,24 @@ class Orchestrator {
   async buildRoundtableContextMessage(session, agent, events) {
     const workspace = await this.store.getWorkspace(session.workspace_id);
     const group = await this.store.getGroup(session.workspace_id, session.group_id);
-    const contributions = this.roundtableContributionEvents(session, events);
-    const nextRound = contributions.length + 1;
+    const turns = this.roundtableTurnEvents(session, events);
+    const discussionTurns = turns.filter((turn) => turn.turn_kind !== "synthesis");
+    const currentRound = session.in_flight_round_index || Math.floor(Number(session.discussion_turn_index || 0) / Math.max(1, session.participant_agent_ids.length)) + 1;
+    const speakerIndex = session.in_flight_speaker_index || 1;
+    const participantCount = Math.max(1, session.participant_agent_ids.filter(Boolean).length);
+    const completedRounds = Math.floor(discussionTurns.length / participantCount);
+    const previousTurn = discussionTurns.at(-1) || null;
     const isFinalSynthesis = Boolean(session.synthesis_requested && agent.id === session.final_agent_id);
+    const groupedTranscript = turns
+      .slice(-12)
+      .map((turn) => {
+        const label =
+          turn.turn_kind === "synthesis"
+            ? "synthesis"
+            : `round ${turn.round_index || "?"}, speaker ${turn.speaker_index || "?"}/${participantCount}`;
+        return `- ${label} by ${turn.agent_id}: ${turn.text.slice(0, 800)}`;
+      })
+      .join("\n");
     const transcript = events
       .slice(-24)
       .map((event) => {
@@ -2998,10 +3042,22 @@ class Orchestrator {
       `Workspace: ${workspace?.name || session.workspace_id} (${session.workspace_id})`,
       `Group: ${group?.name || session.group_id} (${session.group_id})`,
       `Topic: ${session.topic || "(open discussion)"}`,
-      `Suggested target contributions: ${session.target_rounds}`,
+      `Suggested max discussion rounds: ${session.max_rounds || session.target_rounds}`,
+      `Round model: one round means each participant gets one speaking opportunity.`,
       "Autonomy: advisory only. TendrilFlow provides context, tools, and reminders; you decide how to participate.",
-      `Current visible contribution count: ${contributions.length}`,
-      `This wake-up is suggested contribution ${nextRound}.`,
+      `Completed discussion rounds: ${completedRounds}`,
+      isFinalSynthesis
+        ? "This wake-up is the suggested synthesis turn."
+        : `This wake-up is round ${currentRound}, speaker ${speakerIndex}/${participantCount}.`,
+      "",
+      "Reply context:",
+      previousTurn
+        ? `- Previous speaker: ${previousTurn.agent_id} in round ${previousTurn.round_index || "?"}.`
+        : "- Previous speaker: none yet.",
+      previousTurn
+        ? `- Previous contribution excerpt: ${previousTurn.text.slice(0, 1000)}`
+        : "- Previous contribution excerpt: none yet.",
+      "- You may respond directly to the previous speaker, challenge a claim, add evidence, shift the framing, ask a question, or keep your contribution brief if the room has converged.",
       "",
       "Participation notes:",
       "- Read the visible transcript as shared context before deciding what to do.",
@@ -3013,7 +3069,7 @@ class Orchestrator {
       isFinalSynthesis
         ? [
             "Suggested synthesis moment:",
-            "- The discussion reached its target contribution count.",
+            "- The discussion reached the suggested max round count.",
             "- If you judge the room has enough signal, produce a visible closing synthesis.",
             "- A useful synthesis separates likely answers from uncertainty.",
             "- Candidate ordering, evidence strength, assumptions, and remaining risks are often helpful.",
@@ -3025,6 +3081,9 @@ class Orchestrator {
             "- Share a conclusion, critique, question, or research result when it advances the conversation.",
             "- It is welcome to point out problems in another agent's argument with evidence."
           ].join("\n"),
+      "",
+      "Grouped discussion turns:",
+      groupedTranscript || "(none)",
       "",
       "Visible transcript:",
       transcript || "(none)"
@@ -3086,6 +3145,10 @@ class Orchestrator {
         roundtable_id: session.roundtable_id,
         roundtable_turn_id: session.in_flight_turn_id,
         roundtable_turn_index: session.in_flight_turn_index,
+        roundtable_turn_kind: session.in_flight_turn_kind || "discussion",
+        roundtable_round_index: session.in_flight_round_index,
+        roundtable_speaker_index: session.in_flight_speaker_index,
+        roundtable_speaker_count: session.participant_agent_ids.filter(Boolean).length,
         roundtable_turn_agent_id: session.in_flight_agent_id
       }
     };
@@ -3095,6 +3158,9 @@ class Orchestrator {
     session.in_flight_agent_id = null;
     session.in_flight_turn_id = null;
     session.in_flight_turn_index = null;
+    session.in_flight_round_index = null;
+    session.in_flight_speaker_index = null;
+    session.in_flight_turn_kind = null;
     session.in_flight_since = null;
   }
 
@@ -3192,10 +3258,10 @@ class Orchestrator {
       .map((session) => this.publicRoundtable(session));
   }
 
-  roundtableContributionEvents(session, events = []) {
+  roundtableTurnEvents(session, events = []) {
     const startIndex = events.findIndex((event) => event.event_id === session.started_event_id);
     const scoped = startIndex >= 0 ? events.slice(startIndex + 1) : events;
-    const contributions = new Map();
+    const turns = new Map();
     for (const event of scoped) {
       if (
         event.type === "agent_message" &&
@@ -3203,20 +3269,49 @@ class Orchestrator {
         !isProviderAdapterLifecycleLine(event.content?.text)
       ) {
         const key = event.content?.roundtable_turn_id || event.event_id;
-        if (!contributions.has(key)) {
-          contributions.set(key, event);
+        if (!turns.has(key)) {
+          turns.set(key, {
+            turn_id: key,
+            turn_index: event.content?.roundtable_turn_index || null,
+            turn_kind: event.content?.roundtable_turn_kind || "discussion",
+            round_index: event.content?.roundtable_round_index || null,
+            speaker_index: event.content?.roundtable_speaker_index || null,
+            agent_id: event.actor?.id,
+            event,
+            events: [],
+            text_lines: []
+          });
         }
+        const turn = turns.get(key);
+        turn.events.push(event);
+        turn.text_lines.push(String(event.content?.text || ""));
+        turn.text = turn.text_lines.join("\n").trim();
       }
     }
-    return Array.from(contributions.values());
+    return Array.from(turns.values());
+  }
+
+  roundtableContributionEvents(session, events = []) {
+    return this.roundtableTurnEvents(session, events).map((turn) => turn.event);
   }
 
   publicRoundtable(session, events = []) {
-    const contributionCount = events.length ? this.roundtableContributionEvents(session, events).length : 0;
+    const turns = events.length ? this.roundtableTurnEvents(session, events) : [];
+    const contributionCount = turns.length;
+    const participantCount = Math.max(1, session.participant_agent_ids.filter(Boolean).length);
+    const discussionTurnCount = turns.filter((turn) => turn.turn_kind !== "synthesis").length;
+    const completedRoundCount = Math.floor(discussionTurnCount / participantCount);
+    const opportunityTurnCount = Number(session.discussion_turn_index || 0);
     const { timer, ...publicSession } = session;
     return {
       ...publicSession,
-      contribution_count: contributionCount
+      contribution_count: contributionCount,
+      turn_count: contributionCount,
+      discussion_turn_count: discussionTurnCount,
+      completed_round_count: completedRoundCount,
+      opportunity_turn_count: opportunityTurnCount,
+      opportunity_round_count: Math.floor(opportunityTurnCount / participantCount),
+      max_discussion_turns: Number(session.max_rounds || session.target_rounds || 0) * participantCount
     };
   }
 

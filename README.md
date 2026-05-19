@@ -1,6 +1,6 @@
 # TendrilFlow
 
-[English README](./README.en.md) | [总设计](./docs/DESIGN.md) | [群聊 Agent 委派路由](./docs/GROUP_AGENT_ROUTING.md) | [AgentChat UI 改造计划](./docs/AGENTCHAT_UI_REDESIGN_PLAN.md) | [OMC Research 执行计划](./docs/OMC_RESEARCH_EXECUTION_PLAN.md)
+[English README](./README.en.md) | [总设计](./docs/DESIGN.md) | [群聊 Agent 委派路由](./docs/GROUP_AGENT_ROUTING.md) | [圆桌群聊机制](./docs/ROUNDTABLE_DISCUSSION.md) | [AgentChat UI 改造计划](./docs/AGENTCHAT_UI_REDESIGN_PLAN.md) | [OMC Research 执行计划](./docs/OMC_RESEARCH_EXECUTION_PLAN.md)
 
 TendrilFlow 是一个面向本地编码 Agent 的任务协作工作台。
 

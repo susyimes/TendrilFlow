@@ -2419,6 +2419,92 @@ test("agent discussion output does not auto-route into a loop storm", async () =
   assert.ok(loopMessages.length <= 4);
 });
 
+test("roundtable watcher provides advisory context and asks codex to synthesize after the target", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const workspace = await orchestrator.createWorkspace({ name: "Roundtable Workspace" });
+  const group = await orchestrator.createGroup({ name: "Roundtable Group", workspace_id: workspace.workspace_id });
+  const codex = await createTestAgent(orchestrator, {
+    name: "codex",
+    role: "work",
+    provider: "codex",
+    mode: "exec",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const gemini = await createTestAgent(orchestrator, {
+    name: "gemini",
+    role: "work",
+    provider: "gemini",
+    mode: "exec",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const kimi = await createTestAgent(orchestrator, {
+    name: "kimi",
+    role: "work",
+    provider: "kimi",
+    mode: "exec",
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id
+  });
+  const deliveries = [];
+  for (const agent of [codex, gemini, kimi]) {
+    orchestrator.sessions.set(agent.id, {
+      sendMessage: async (task, text) => {
+        deliveries.push({ agent_id: agent.id, task, text });
+        return true;
+      }
+    });
+    await orchestrator.store.patchAgent(agent.id, { status: "running" });
+  }
+
+  const roundtable = await orchestrator.startRoundtable(workspace.workspace_id, group.group_id, {
+    topic: "下一个发布的大模型是什么",
+    participant_agent_ids: [codex.id, gemini.id, kimi.id],
+    final_agent_id: codex.id,
+    target_rounds: 10,
+    interval_ms: 1000000,
+    auto_start: false
+  });
+
+  const skills = await orchestrator.listSkills({
+    workspace_id: workspace.workspace_id,
+    group_id: group.group_id,
+    scope: "group"
+  });
+  assert.ok(skills.some((skill) => skill.skill_id === "roundtable.participant"));
+
+  for (let index = 0; index < 9; index += 1) {
+    await orchestrator.runRoundtableTick(roundtable.roundtable_id);
+    const delivery = deliveries.at(-1);
+    assert.ok(delivery.text.includes("TendrilFlow roundtable watcher"));
+    assert.ok(delivery.text.includes("Autonomy: advisory only"));
+    const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+      type: "agent_message",
+      actor: { kind: "agent", id: delivery.agent_id },
+      content: { text: `第 ${index + 1} 回合观点：我补充一个证据或指出一个问题。` }
+    });
+    await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+  }
+
+  await orchestrator.runRoundtableTick(roundtable.roundtable_id);
+  const finalDelivery = deliveries.at(-1);
+  assert.equal(finalDelivery.agent_id, codex.id);
+  assert.match(finalDelivery.text, /Suggested synthesis moment/);
+  const finalEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: codex.id },
+    content: { text: "最终结论：无法确定唯一答案；按证据等级排序候选并标注推测。" }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, finalEvent);
+
+  const completed = await orchestrator.roundtableStatus(roundtable.roundtable_id);
+  const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.contribution_count, 10);
+  assert.ok(events.some((event) => event.content?.protocol === "tendrilflow.roundtable.v1" && event.content?.status === "completed"));
+});
+
 test("creates structured handoff cards and makes the receiver confirm context", async () => {
   const { orchestrator } = await makeOrchestrator();
   const worker = await createTestAgent(orchestrator, { name: "codex-worker", role: "work" });

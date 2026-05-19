@@ -2713,24 +2713,54 @@ test("roundtable watcher provides advisory context and asks codex to synthesize 
     const delivery = deliveries.at(-1);
     assert.ok(delivery.text.includes("TendrilFlow roundtable watcher"));
     assert.ok(delivery.text.includes("Autonomy: advisory only"));
+    const active = await orchestrator.roundtableStatus(roundtable.roundtable_id);
+    const turnId = active.in_flight_turn_id;
+    assert.ok(turnId);
     const event = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
       type: "agent_message",
       actor: { kind: "agent", id: delivery.agent_id },
-      content: { text: `第 ${index + 1} 回合观点：我补充一个证据或指出一个问题。` }
+      content: {
+        text: `第 ${index + 1} 回合观点：我补充一个证据或指出一个问题。`,
+        roundtable_turn_id: turnId
+      }
     });
     await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, event);
+    const secondLine = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+      type: "agent_message",
+      actor: { kind: "agent", id: delivery.agent_id },
+      content: { text: `第 ${index + 1} 回合第二行：同一轮补充说明。`, roundtable_turn_id: turnId }
+    });
+    await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, secondLine);
+    assert.equal((await orchestrator.roundtableStatus(roundtable.roundtable_id)).contribution_count, index + 1);
+    await orchestrator.observeRoundtableSessionEvent(workspace.workspace_id, group.group_id, delivery.agent_id, {
+      task_id: delivery.task.task_id,
+      content: { text: `${delivery.agent_id}: codex exec exited with code 0.` }
+    });
   }
 
   await orchestrator.runRoundtableTick(roundtable.roundtable_id);
   const finalDelivery = deliveries.at(-1);
   assert.equal(finalDelivery.agent_id, codex.id);
   assert.match(finalDelivery.text, /Suggested synthesis moment/);
+  const finalActive = await orchestrator.roundtableStatus(roundtable.roundtable_id);
+  const finalTurnId = finalActive.in_flight_turn_id;
+  assert.ok(finalTurnId);
   const finalEvent = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
     type: "agent_message",
     actor: { kind: "agent", id: codex.id },
-    content: { text: "最终结论：无法确定唯一答案；按证据等级排序候选并标注推测。" }
+    content: { text: "最终结论：无法确定唯一答案；按证据等级排序候选并标注推测。", roundtable_turn_id: finalTurnId }
   });
   await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, finalEvent);
+  const finalSecondLine = await orchestrator.store.appendGroupEvent(workspace.workspace_id, group.group_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: codex.id },
+    content: { text: "最终结论第二行：同一轮总结补充。", roundtable_turn_id: finalTurnId }
+  });
+  await orchestrator.handleGroupAgentEvent(workspace.workspace_id, group.group_id, finalSecondLine);
+  await orchestrator.observeRoundtableSessionEvent(workspace.workspace_id, group.group_id, codex.id, {
+    task_id: finalDelivery.task.task_id,
+    content: { text: `${codex.id}: codex exec exited with code 0.` }
+  });
 
   const completed = await orchestrator.roundtableStatus(roundtable.roundtable_id);
   const events = await orchestrator.store.readGroupEvents(workspace.workspace_id, group.group_id);

@@ -1563,6 +1563,7 @@ class FileStore {
       claim: input.claim || null,
       playbook_stage: input.playbook_stage || "intake",
       related_refs: Array.isArray(input.related_refs) ? input.related_refs : [],
+      watch_bindings: Array.isArray(input.watch_bindings) ? input.watch_bindings : [],
       created_at: timestamp,
       updated_at: timestamp,
       room_path: path

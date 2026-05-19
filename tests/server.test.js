@@ -377,6 +377,71 @@ test("HTTP API exposes task replay analytics", async (t) => {
   assert.ok(Array.isArray(replay.host_replay_suggestions));
 });
 
+test("HTTP API manages task observe watchers", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const worker = await fetch(`${baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "api-watch-worker",
+      role: "work",
+      mode: "mock",
+      provider: "mock",
+      command: "",
+      cwd: process.cwd()
+    })
+  }).then((response) => response.json());
+  const observer = await fetch(`${baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "api-watch-observer",
+      role: "observe",
+      mode: "mock",
+      provider: "mock",
+      command: "",
+      cwd: process.cwd()
+    })
+  }).then((response) => response.json());
+  const task = await fetch(`${baseUrl}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "Watch API",
+      owner_agent_id: worker.agent.id
+    })
+  }).then((response) => response.json());
+
+  const created = await fetch(`${baseUrl}/api/tasks/${task.task.task_id}/watchers`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      observer_agent_id: observer.agent.id,
+      target_agent_id: worker.agent.id,
+      auto_start: false
+    })
+  }).then((response) => response.json());
+  assert.equal(created.watcher.observer_agent_id, observer.agent.id);
+  assert.equal(created.watcher.target_agent_id, worker.agent.id);
+
+  const listed = await fetch(`${baseUrl}/api/tasks/${task.task.task_id}/watchers`).then((response) => response.json());
+  assert.equal(listed.watchers.length, 1);
+
+  const paused = await fetch(`${baseUrl}/api/tasks/${task.task.task_id}/watchers/${created.watcher.watch_id}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "paused" })
+  }).then((response) => response.json());
+  assert.equal(paused.watcher.status, "paused");
+
+  const deleted = await fetch(`${baseUrl}/api/tasks/${task.task.task_id}/watchers/${created.watcher.watch_id}`, {
+    method: "DELETE"
+  }).then((response) => response.json());
+  assert.equal(deleted.deleted, true);
+});
+
 test("HTTP API exposes agent detail and session logs", async (t) => {
   const { baseUrl, server } = await startTestServer();
   t.after(() => server.close());

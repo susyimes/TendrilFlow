@@ -343,6 +343,9 @@ ACP Adapter 应把 `initialize`、`newSession`、`prompt`、`cancel`、session u
 - 判断是否需要协助
 - 为其他 agent 准备上下文
 - 维护跨任务和跨房间的全局视图
+- 可被用户显式配对为某个执行 agent 的 watcher，持续接收增量 trace 和心跳上下文
+- 发现明确失控、漂移或违反约束时，可通过 `tendrilflow.observe_control` 结构化请求自动打断配对目标
+- 打断后进入恢复观察：目标被重新恢复执行后，Core 会区分写入/验证等真实进展和只读搜索/复述；持续只读或停滞会标记为 `stalled`
 
 ### Debug Agent
 
@@ -546,6 +549,7 @@ Local Web App
 - 任务房间 transcript
 - 结构化交接卡片
 - review 和 debug 作为可配置 agent profiles
+- Observe watcher：任务内显式配对观察、增量唤醒、结构化自动打断和打断后的恢复停滞检测
 - workspace/group skill 文件和匹配摘要注入
 - 可选 per-agent Git worktree 隔离
 - 任务级 replay analytics

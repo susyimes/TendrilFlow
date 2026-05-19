@@ -22,6 +22,7 @@ const cwd = process.env.TENDRILFLOW_CODEX_CWD || arg("cwd", process.cwd());
 const sandbox = arg("sandbox", process.env.TENDRILFLOW_CODEX_SANDBOX || "workspace-write");
 const model = arg("model", process.env.TENDRILFLOW_CODEX_MODEL || "");
 const enableSearch = hasFlag("search") || process.env.TENDRILFLOW_CODEX_SEARCH === "1";
+const ignoreUserConfig = hasFlag("ignore-user-config") || process.env.TENDRILFLOW_CODEX_IGNORE_USER_CONFIG === "1";
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 let busy = false;
@@ -147,6 +148,36 @@ function codexLaunch(command, commandArgs) {
   return { file: resolved.file, args: [...resolved.argsPrefix, ...commandArgs] };
 }
 
+function shouldSuppressCodexStderr(line) {
+  const text = String(line || "");
+  const trimmed = text.trim();
+  return (
+    /codex_core_plugins|chatgpt\.com\/backend-api\/plugins|challenge-platform|cf_chl|Cloudflare/i.test(text) ||
+    /^<\/?(?:html|head|body|div|script|style|meta|svg|path)\b/i.test(trimmed) ||
+    /^window\._cf_chl_opt\b/i.test(trimmed)
+  );
+}
+
+function forwardCodexStderr(stream) {
+  let buffer = "";
+  stream.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!shouldSuppressCodexStderr(line)) {
+        process.stderr.write(`${line}\n`);
+      }
+    }
+  });
+  stream.on("end", () => {
+    if (buffer && !shouldSuppressCodexStderr(buffer)) {
+      process.stderr.write(buffer);
+    }
+    buffer = "";
+  });
+}
+
 async function runPrompt(prompt) {
   if (mode !== "exec") {
     console.log(
@@ -161,6 +192,9 @@ async function runPrompt(prompt) {
   }
   if (enableSearch) {
     execArgs.push("--search");
+  }
+  if (ignoreUserConfig) {
+    execArgs.push("--ignore-user-config");
   }
   execArgs.push("-");
 
@@ -178,7 +212,7 @@ async function runPrompt(prompt) {
 
     child.stdin.end(`${prompt}\n`);
     child.stdout.on("data", (chunk) => process.stdout.write(chunk));
-    child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    forwardCodexStderr(child.stderr);
     child.on("error", (error) => {
       if (activeChild === child) {
         activeChild = null;

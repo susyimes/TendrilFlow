@@ -2381,6 +2381,23 @@ test("host control broadcast records a Host tool call and reaches running member
   assert.ok(events.some((event) => event.actor?.id === worker.id && event.type === "agent_message"));
 });
 
+test("broadcast instructions with stop-like content do not stop the target", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "particle-worker", role: "work" });
+  const task = await orchestrator.createTask({
+    title: "Broadcast stop-like wording",
+    owner_agent_id: worker.id
+  });
+
+  await orchestrator.startAgent(worker.id);
+  await orchestrator.postRoomMessage(task.task_id, "@particle-worker 广播: 页面隐藏时停止动画，但继续完成实现");
+
+  const events = await orchestrator.store.readEvents(task.task_id);
+  assert.equal((await orchestrator.store.getAgent(worker.id)).status, "running");
+  assert.ok(events.some((event) => event.content?.tool === "user.broadcast_instruction"));
+  assert.ok(!events.some((event) => event.content?.tool === "user.stop_agents"));
+});
+
 test("agent discussion output does not auto-route into a loop storm", async () => {
   const { orchestrator } = await makeOrchestrator();
   const scriptPath = path.resolve(__dirname, "..", "scripts", "mock-agent.js");
@@ -2417,6 +2434,342 @@ test("agent discussion output does not auto-route into a loop storm", async () =
   );
   assert.ok(loopMessages.length >= 2);
   assert.ok(loopMessages.length <= 4);
+});
+
+test("observe watcher wakes observer and can automatically interrupt its paired target", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "watched-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "observe-agent", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Watch target",
+    owner_agent_id: worker.id
+  });
+  let deliveredContext = "";
+  let stopped = false;
+  orchestrator.sessions.set(observer.id, {
+    sendMessage: async (deliveredTask, text) => {
+      deliveredContext = text;
+      const event = await orchestrator.store.appendEvent(deliveredTask.task_id, {
+        type: "agent_message",
+        actor: { kind: "agent", id: observer.id },
+        content: {
+          text: [
+            "I see a critical drift.",
+            "```tendrilflow.observe_control",
+            JSON.stringify({
+              action: "interrupt",
+              target_agent_id: worker.id,
+              severity: "critical",
+              reason: "Target is ignoring the latest visible constraint.",
+              evidence_event_ids: [],
+              confidence: 0.91
+            }),
+            "```"
+          ].join("\n")
+        }
+      });
+      await orchestrator.handleTaskAgentEvent(deliveredTask.task_id, event);
+      return true;
+    }
+  });
+  orchestrator.sessions.set(worker.id, {
+    stop: async () => {
+      stopped = true;
+    }
+  });
+  await orchestrator.store.patchAgent(observer.id, { status: "running" });
+  await orchestrator.store.patchAgent(worker.id, { status: "running", current_task_id: task.task_id });
+
+  const watcher = await orchestrator.startTaskWatcher(task.task_id, {
+    observer_agent_id: observer.id,
+    target_agent_id: worker.id,
+    auto_start: false,
+    heartbeat_ms: 1000,
+    debounce_ms: 0
+  });
+  const targetEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: worker.id },
+    content: { text: "I will continue with the old direction." }
+  });
+
+  await orchestrator.observeTaskWatchEvent(task.task_id, targetEvent);
+  await orchestrator.runTaskWatchTick(task.task_id, watcher.watch_id, { reason: "test" });
+
+  const updatedTask = await orchestrator.store.getTask(task.task_id);
+  const updatedWorker = await orchestrator.store.getAgent(worker.id);
+  const events = await orchestrator.store.readEvents(task.task_id);
+
+  assert.match(deliveredContext, /TendrilFlow observe watcher/);
+  assert.match(deliveredContext, new RegExp(worker.id));
+  assert.equal(stopped, true);
+  assert.equal(updatedWorker.status, "stopped");
+  assert.equal(updatedTask.status, "blocked");
+  assert.equal(updatedTask.watch_bindings[0].status, "interrupted");
+  assert.equal(updatedTask.watch_bindings[0].interrupt_reason, "Target is ignoring the latest visible constraint.");
+  assert.ok(events.some((event) => event.content?.tool === "observe.watch_tick"));
+  assert.ok(events.some((event) => event.content?.tool === "observe.interrupt_agent"));
+  assert.ok(events.some((event) => event.content?.stopped_agent_ids?.includes(worker.id)));
+});
+
+test("observe watcher does not reuse broadcast instructions from before the last control event", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "watched-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "observe-agent", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Watch broadcast scope",
+    owner_agent_id: worker.id
+  });
+  await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "system", id: "orchestrator" },
+    content: {
+      tool: "user.broadcast_instruction",
+      instruction: "one-shot interrupt drill",
+      text: "User broadcast a high-priority group instruction."
+    }
+  });
+  const controlEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "agent", id: observer.id },
+    content: {
+      tool: "observe.interrupt_agent",
+      reason: "checkpoint completed",
+      text: "Observer interrupted the target once."
+    }
+  });
+  await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "system", id: "orchestrator" },
+    content: {
+      tool: "user.broadcast_instruction",
+      instruction: "post-control constraint",
+      text: "User broadcast a high-priority group instruction."
+    }
+  });
+
+  const watcher = await orchestrator.startTaskWatcher(task.task_id, {
+    observer_agent_id: observer.id,
+    target_agent_id: worker.id,
+    auto_start: false
+  });
+  const binding = await orchestrator.patchTaskWatchBinding(task.task_id, watcher.watch_id, {
+    last_control_event_id: controlEvent.event_id
+  });
+  const context = await orchestrator.buildTaskWatchContextMessage(
+    await orchestrator.store.getTask(task.task_id),
+    binding,
+    observer,
+    worker,
+    {
+      events: await orchestrator.store.readEvents(task.task_id),
+      newEvents: [],
+      targetLogs: [],
+      newTargetLogs: [],
+      targetHealth: { status: "running" },
+      reason: "test"
+    }
+  );
+
+  assert.doesNotMatch(context, /one-shot interrupt drill/);
+  assert.match(context, /post-control constraint/);
+});
+
+test("observe watcher automatically resumes recovery monitoring when interrupted target becomes active again", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "resumed-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "observe-agent", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Auto resume recovery watch",
+    owner_agent_id: worker.id
+  });
+  const watcher = await orchestrator.startTaskWatcher(task.task_id, {
+    observer_agent_id: observer.id,
+    target_agent_id: worker.id,
+    auto_start: false
+  });
+  const controlEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "agent", id: observer.id },
+    content: {
+      protocol: "tendrilflow.observe_control.v1",
+      tool: "observe.interrupt_agent",
+      reason: "needs guided repair",
+      text: "Observer interrupted the target."
+    }
+  });
+  await orchestrator.patchTaskWatchBinding(task.task_id, watcher.watch_id, {
+    status: "interrupted",
+    last_control_event_id: controlEvent.event_id,
+    recovery_status: "awaiting_resume"
+  });
+  const targetEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: worker.id },
+    content: { text: "I am starting the guided fix." }
+  });
+
+  await orchestrator.observeTaskWatchEvent(task.task_id, targetEvent);
+  orchestrator.clearTaskWatchTimer(task.task_id, watcher.watch_id);
+
+  const updatedTask = await orchestrator.store.getTask(task.task_id);
+  const binding = updatedTask.watch_bindings.find((candidate) => candidate.watch_id === watcher.watch_id);
+  const events = await orchestrator.store.readEvents(task.task_id);
+
+  assert.equal(binding.status, "active");
+  assert.equal(binding.recovery_status, "awaiting_progress");
+  assert.equal(binding.recovery_since_event_id, controlEvent.event_id);
+  assert.ok(events.some((event) => event.content?.recovery_status === "awaiting_progress"));
+});
+
+test("observe watcher marks post-interrupt recovery stalled when target only reads then stops", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "read-only-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "observe-agent", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Watch read-only recovery",
+    owner_agent_id: worker.id
+  });
+  const watcher = await orchestrator.startTaskWatcher(task.task_id, {
+    observer_agent_id: observer.id,
+    target_agent_id: worker.id,
+    auto_start: false,
+    recovery_timeout_ms: 0
+  });
+  const controlEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "agent", id: observer.id },
+    content: {
+      protocol: "tendrilflow.observe_control.v1",
+      tool: "observe.interrupt_agent",
+      reason: "needs guided repair",
+      text: "Observer interrupted the target."
+    }
+  });
+  await orchestrator.patchTaskWatchBinding(task.task_id, watcher.watch_id, {
+    status: "interrupted",
+    last_control_event_id: controlEvent.event_id,
+    recovery_status: "awaiting_resume"
+  });
+  await orchestrator.updateTaskWatcher(task.task_id, watcher.watch_id, {
+    status: "active",
+    recovery_timeout_ms: 0
+  });
+  orchestrator.clearTaskWatchTimer(task.task_id, watcher.watch_id);
+  await orchestrator.store.patchAgent(worker.id, { status: "stopped", current_task_id: null });
+  await orchestrator.store.appendAgentLog(worker, {
+    type: "tool_call_summary",
+    task_id: task.task_id,
+    content: { title: "ReadFile scripts/particles.js", text: "Read particle implementation." }
+  });
+  await orchestrator.store.appendAgentLog(worker, {
+    type: "tool_call_summary",
+    task_id: task.task_id,
+    content: { title: "ReadFile styles.css", text: "Read styles." }
+  });
+
+  await orchestrator.runTaskWatchTick(task.task_id, watcher.watch_id, { reason: "test" });
+
+  const updatedTask = await orchestrator.store.getTask(task.task_id);
+  const binding = updatedTask.watch_bindings.find((candidate) => candidate.watch_id === watcher.watch_id);
+  const events = await orchestrator.store.readEvents(task.task_id);
+
+  assert.equal(updatedTask.status, "blocked");
+  assert.equal(binding.status, "stalled");
+  assert.equal(binding.recovery_status, "stalled");
+  assert.equal(binding.recovery_reason, "stalled_after_guidance_read_only");
+  assert.equal(binding.recovery_read_only_count, 2);
+  assert.ok(events.some((event) => event.content?.tool === "observe.recovery_stalled"));
+});
+
+test("observe watcher clears post-interrupt recovery when target produces write progress", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "repair-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "observe-agent", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Watch write recovery",
+    owner_agent_id: worker.id
+  });
+  const watcher = await orchestrator.startTaskWatcher(task.task_id, {
+    observer_agent_id: observer.id,
+    target_agent_id: worker.id,
+    auto_start: false,
+    recovery_timeout_ms: 0
+  });
+  const controlEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "agent", id: observer.id },
+    content: {
+      protocol: "tendrilflow.observe_control.v1",
+      tool: "observe.interrupt_agent",
+      reason: "needs guided repair",
+      text: "Observer interrupted the target."
+    }
+  });
+  await orchestrator.patchTaskWatchBinding(task.task_id, watcher.watch_id, {
+    status: "interrupted",
+    last_control_event_id: controlEvent.event_id,
+    recovery_status: "awaiting_resume"
+  });
+  await orchestrator.updateTaskWatcher(task.task_id, watcher.watch_id, {
+    status: "active",
+    recovery_timeout_ms: 0
+  });
+  orchestrator.clearTaskWatchTimer(task.task_id, watcher.watch_id);
+  await orchestrator.store.patchAgent(worker.id, { status: "running", current_task_id: task.task_id });
+  const progressEvent = await orchestrator.store.appendEvent(task.task_id, {
+    type: "tool_call_summary",
+    actor: { kind: "agent", id: worker.id },
+    content: {
+      title: "StrReplaceFile scripts/particles.js",
+      text: "Patched particle canvas id and z-index."
+    }
+  });
+
+  await orchestrator.runTaskWatchTick(task.task_id, watcher.watch_id, { reason: "test" });
+  orchestrator.clearTaskWatchTimer(task.task_id, watcher.watch_id);
+
+  const updatedTask = await orchestrator.store.getTask(task.task_id);
+  const binding = updatedTask.watch_bindings.find((candidate) => candidate.watch_id === watcher.watch_id);
+  const events = await orchestrator.store.readEvents(task.task_id);
+
+  assert.equal(updatedTask.status, "in_progress");
+  assert.equal(binding.status, "active");
+  assert.equal(binding.recovery_status, "recovered");
+  assert.equal(binding.recovery_progress_event_id, progressEvent.event_id);
+  assert.ok(events.some((event) => event.content?.tool === "observe.recovery_progress"));
+});
+
+test("observe control is blocked when the observer is not paired with the target", async () => {
+  const { orchestrator } = await makeOrchestrator();
+  const worker = await createTestAgent(orchestrator, { name: "unpaired-worker", role: "work" });
+  const observer = await createTestAgent(orchestrator, { name: "unpaired-observer", role: "observe" });
+  const task = await orchestrator.createTask({
+    title: "Unauthorized observe control",
+    owner_agent_id: worker.id
+  });
+  await orchestrator.store.patchAgent(worker.id, { status: "running", current_task_id: task.task_id });
+  const event = await orchestrator.store.appendEvent(task.task_id, {
+    type: "agent_message",
+    actor: { kind: "agent", id: observer.id },
+    content: {
+      text: [
+        "```tendrilflow.observe_control",
+        JSON.stringify({
+          action: "interrupt",
+          target_agent_id: worker.id,
+          reason: "No active watch binding should allow this."
+        }),
+        "```"
+      ].join("\n")
+    }
+  });
+
+  await orchestrator.handleTaskAgentEvent(task.task_id, event);
+
+  const events = await orchestrator.store.readEvents(task.task_id);
+  assert.equal((await orchestrator.store.getAgent(worker.id)).status, "running");
+  assert.ok(events.some((candidate) => candidate.type === "observe_control_blocked" && candidate.content.reason === "not_authorized"));
 });
 
 test("roundtable watcher treats a round as one speaking opportunity per participant", async () => {
@@ -2737,6 +3090,102 @@ rl.on("line", (line) => {
   const events = await orchestrator.store.readEvents(task.task_id);
   assert.ok(events.some((event) => event.type === "agent_message" && event.content.text === "prompt used ready session"));
   assert.ok(!events.some((event) => event.content?.text === "prompt was sent before session"));
+});
+
+test("Kimi ACP sessions use session/new and session/prompt", async () => {
+  const { root, orchestrator } = await makeOrchestrator();
+  const scriptPath = path.join(root, "kimi-acp-agent.js");
+  await fs.writeFile(
+    scriptPath,
+    `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+const sessionId = "kimi-session";
+let pendingPrompt = null;
+function write(payload) { process.stdout.write(JSON.stringify(payload) + "\\n"); }
+function finishPrompt() {
+  const text = pendingPrompt?.text || "";
+  const id = pendingPrompt?.id;
+  pendingPrompt = null;
+  write({
+    method: "session/update",
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        title: "Edit styles",
+        content: { type: "text", text: "editing styles" }
+      }
+    }
+  });
+  write({
+    method: "session/update",
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "kimi saw " + text.slice(0, 24) }
+      }
+    }
+  });
+  write({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+}
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    write({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1 } });
+  } else if (message.method === "session/new") {
+    write({ jsonrpc: "2.0", id: message.id, result: { sessionId } });
+  } else if (message.method === "session/prompt") {
+    pendingPrompt = { id: message.id, text: message.params.prompt?.[0]?.text || "" };
+    write({
+      jsonrpc: "2.0",
+      id: 0,
+      method: "session/request_permission",
+      params: {
+        options: [
+          { kind: "allow_once", name: "Approve once", optionId: "approve" },
+          { kind: "reject_once", name: "Reject", optionId: "reject" }
+        ],
+        sessionId
+      }
+    });
+  } else if (message.id === 0 && message.result?.outcome?.optionId === "approve") {
+    finishPrompt();
+  } else if (message.method === "session/cancel") {
+    write({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else {
+    write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "unexpected " + message.method } });
+  }
+});
+`,
+    "utf8"
+  );
+  const agent = await createTestAgent(orchestrator, {
+    name: "kimi-acp",
+    role: "work",
+    mode: "acp",
+    provider: "kimi",
+    command: `node "${scriptPath}"`
+  });
+  const task = await orchestrator.createTask({
+    title: "Kimi ACP",
+    owner_agent_id: agent.id
+  });
+
+  await orchestrator.startAgent(agent.id);
+  await orchestrator.postRoomMessage(task.task_id, "@kimi-acp run streamed update");
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  await orchestrator.stopAgent(agent.id);
+
+  const events = await orchestrator.store.readEvents(task.task_id);
+  const logs = await orchestrator.store.readAgentLogs(agent.id);
+  assert.ok(events.some((event) => event.type === "tool_call_summary" && event.content.title === "Edit styles"));
+  assert.ok(events.some((event) => event.type === "agent_message" && /kimi saw/.test(event.content.text)));
+  assert.ok(logs.some((event) => event.content?.method === "session/new"));
+  assert.ok(logs.some((event) => event.content?.method === "session/prompt"));
+  assert.ok(!logs.some((event) => event.content?.method === "newSession"));
+  assert.ok(!logs.some((event) => event.content?.method === "prompt"));
 });
 
 test("ACP sessions fail closed when newSession is not ready", async () => {

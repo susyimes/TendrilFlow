@@ -33,12 +33,21 @@ function classifyAcpUpdate(update) {
   const kind = String(
     normalized.kind ||
       normalized.type ||
+      normalized.sessionUpdate ||
       normalized.event ||
       normalized.status ||
       normalized.phase ||
       ""
   ).toLowerCase();
-  const text = extractText(normalized.text || normalized.message || normalized.content || normalized.delta || normalized);
+  const text = extractText(
+    normalized.text ||
+      normalized.message ||
+      normalized.content ||
+      normalized.delta ||
+      normalized.summary ||
+      normalized.title ||
+      normalized
+  );
 
   if (kind.includes("tool") || kind.includes("terminal") || kind.includes("command")) {
     return {

@@ -738,6 +738,52 @@ body.inspector-collapsed .inspector {
   background: var(--surface-muted);
 }
 
+.watch-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+}
+
+.watch-form {
+  display: grid;
+  grid-template-columns: minmax(140px, 180px) minmax(140px, 180px) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.watch-list {
+  display: grid;
+  gap: 6px;
+}
+
+.watch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.watch-row strong,
+.watch-row span {
+  display: block;
+}
+
+.watch-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.watch-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .event-stream {
   flex: 1;
   display: flex;
@@ -1808,6 +1854,8 @@ body.inspector-collapsed .inspector {
   .message-form,
   .room-controls,
   .room-action-bar,
+  .watch-form,
+  .watch-row,
   .handoff-rules-layout,
   .console-grid,
   .replay-summary-grid,

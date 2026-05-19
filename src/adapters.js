@@ -233,6 +233,7 @@ class AcpSession {
       this.resolveSessionReady = resolve;
     });
     this.nextMessageId = 1;
+    this.usesKimiAcp = String(agent.provider || "").toLowerCase() === "kimi";
   }
 
   emitSessionEvent(event) {
@@ -273,15 +274,68 @@ class AcpSession {
     this.watchStderr();
     this.process.on("exit", (code) => this.callbacks.onExit?.(this.agent.id, code));
     this.process.on("error", (error) => this.callbacks.onError?.(this.agent.id, error));
-    this.sendRpc("initialize", {
+    this.sendRpc("initialize", this.initializeParams());
+    this.sendRpc(this.newSessionMethod(), this.newSessionParams());
+    return { status: "running", detail: `Started ACP agent ${this.agent.command}` };
+  }
+
+  initializeParams() {
+    if (this.usesKimiAcp) {
+      return {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false
+        },
+        clientInfo: {
+          name: "TendrilFlow",
+          title: "TendrilFlow",
+          version: "0.1.0"
+        }
+      };
+    }
+    return {
       client: "TendrilFlow",
       clientVersion: "0.1.0"
-    });
-    this.sendRpc("newSession", {
+    };
+  }
+
+  newSessionMethod() {
+    return this.usesKimiAcp ? "session/new" : "newSession";
+  }
+
+  newSessionParams() {
+    if (this.usesKimiAcp) {
+      return {
+        cwd: this.agent.cwd,
+        mcpServers: []
+      };
+    }
+    return {
       cwd: this.agent.cwd,
       agent: this.agent.name
-    });
-    return { status: "running", detail: `Started ACP agent ${this.agent.command}` };
+    };
+  }
+
+  promptMethod() {
+    return this.usesKimiAcp ? "session/prompt" : "prompt";
+  }
+
+  promptParams(text) {
+    if (this.usesKimiAcp) {
+      return {
+        sessionId: this.sessionId,
+        prompt: [{ type: "text", text }]
+      };
+    }
+    return {
+      sessionId: this.sessionId,
+      prompt: text
+    };
+  }
+
+  cancelMethod() {
+    return this.usesKimiAcp ? "" : "cancel";
   }
 
   watchStdout() {
@@ -316,6 +370,16 @@ class AcpSession {
       if (sessionId) {
         this.sessionId = sessionId;
         this.resolveSessionReady?.(sessionId);
+      }
+      if (payload.error) {
+        this.emitSessionEvent({
+          type: "error",
+          task_id: this.currentTaskId,
+          content: { text: JSON.stringify(payload.error) }
+        });
+      }
+      if (payload.id !== undefined && payload.method === "session/request_permission") {
+        this.respondToPermissionRequest(payload);
       }
       if (this.currentTaskId && (payload.method || payload.update || payload.type || payload.kind)) {
         this.callbacks.onTaskEvent?.(
@@ -370,11 +434,56 @@ class AcpSession {
           text: JSON.stringify(message)
         }
       });
-      return true;
+      return message.id;
     } catch (error) {
       this.callbacks.onError?.(this.agent.id, error);
       return false;
     }
+  }
+
+  respondRpc(id, result = {}, error = null) {
+    if (!this.process || this.process.killed || !this.process.stdin.writable) {
+      return false;
+    }
+    const message = { jsonrpc: "2.0", id };
+    if (error) {
+      message.error = error;
+    } else {
+      message.result = result;
+    }
+    try {
+      this.process.stdin.write(`${JSON.stringify(message)}\n`);
+      this.emitSessionEvent({
+        type: "stdin",
+        task_id: this.currentTaskId,
+        content: {
+          method: "rpc_response",
+          text: JSON.stringify(message)
+        }
+      });
+      return true;
+    } catch (responseError) {
+      this.callbacks.onError?.(this.agent.id, responseError);
+      return false;
+    }
+  }
+
+  respondToPermissionRequest(message) {
+    const options = message.params?.options || [];
+    const chosen =
+      options.find((option) => option.kind === "allow_once") ||
+      options.find((option) => option.kind === "allow_always") ||
+      options[0];
+    if (!chosen?.optionId) {
+      this.respondRpc(message.id, { outcome: { outcome: "cancelled" } });
+      return;
+    }
+    this.respondRpc(message.id, {
+      outcome: {
+        outcome: "selected",
+        optionId: chosen.optionId
+      }
+    });
   }
 
   async sendMessage(task, text) {
@@ -392,10 +501,7 @@ class AcpSession {
       });
       return false;
     }
-    return this.sendRpc("prompt", {
-      sessionId,
-      prompt: text
-    });
+    return Boolean(this.sendRpc(this.promptMethod(), this.promptParams(text)));
   }
 
   async waitForSessionReady(timeoutMs = 1500) {
@@ -410,7 +516,10 @@ class AcpSession {
 
   async stop() {
     if (this.process && !this.process.killed) {
-      this.sendRpc("cancel", { sessionId: this.sessionId });
+      const cancelMethod = this.cancelMethod();
+      if (this.sessionId && cancelMethod) {
+        this.sendRpc(cancelMethod, { sessionId: this.sessionId });
+      }
       this.process.kill();
     }
   }

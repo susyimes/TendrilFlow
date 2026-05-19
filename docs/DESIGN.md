@@ -409,6 +409,9 @@ Worker Isolation 的目标是降低多个 coding agents 并行修改同一仓库
 - 发现阻塞
 - 为其他 agent 准备上下文
 - 帮助用户理解系统整体状态
+- 可通过任务级 watch binding 显式观察某个目标 agent
+- 当目标明显失控、漂移、违反最新约束或处于不可恢复异常时，通过 `tendrilflow.observe_control` 请求 Core 自动停止目标
+- 打断后进入恢复观察窗口；目标恢复执行后，Core 需要看到写入、验证或有证据的完成报告，否则只读/空转会把 watcher 标记为 `stalled`
 
 ### Debug Agent
 
@@ -692,4 +695,5 @@ TendrilFlow 的重点不是创建通用 AI 应用，而是管理本地 coding ag
 - 接手 agent 能基于 handoff card 继续执行。
 - 任务完成后能生成 final report。
 - 用户能打开任务复盘，看到任务摘要、贡献、风险、timeline、指标和 Host 建议。
+- 用户能把 Observe Agent 和目标 agent 配对成任务 watcher，在明确风险时自动打断目标，并在恢复阶段识别只读空转。
 - Replay 不展示原始 chain-of-thought。

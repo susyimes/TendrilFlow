@@ -33,7 +33,9 @@ const ROLE_FOCUS = {
   observe: [
     "Role focus:",
     "- Summarize visible group state, missing context, open decisions, blockers, and next owners.",
-    "- Keep the group oriented without taking over execution unless asked."
+    "- Keep the group oriented without taking over execution unless asked.",
+    "- When TendrilFlow gives you an observe watch context, judge the paired target from visible trace only.",
+    "- Emit tendrilflow.observe_control only when the paired target needs an immediate automatic interrupt."
   ]
 };
 

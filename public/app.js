@@ -188,6 +188,22 @@ const i18n = {
     actionPlan: "拆分计划",
     actionReview: "请求审查",
     actionDebug: "排查阻塞",
+    watchObserver: "观察者",
+    watchTarget: "目标",
+    createWatch: "开始观察",
+    noWatchers: "还没有观察配对",
+    pauseWatch: "暂停",
+    resumeWatch: "恢复",
+    deleteWatch: "删除",
+    watch_active: "观察中",
+    watch_paused: "已暂停",
+    watch_interrupted: "已打断",
+    watch_stalled: "恢复停滞",
+    watch_stopped: "已停止",
+    recovery_awaiting_resume: "等待恢复",
+    recovery_awaiting_progress: "等待修复进展",
+    recovery_stalled: "只读/空转",
+    recovery_recovered: "已见进展",
     next_todo: "创建后先启动负责人，再让负责人继续",
     next_in_progress: "让负责人继续执行，并在房间里沉淀进展",
     next_blocked: "请求排障，整理阻塞证据",
@@ -384,6 +400,22 @@ const i18n = {
     actionPlan: "Plan",
     actionReview: "Review",
     actionDebug: "Debug",
+    watchObserver: "Observer",
+    watchTarget: "Target",
+    createWatch: "Start Watch",
+    noWatchers: "No watch pairs yet",
+    pauseWatch: "Pause",
+    resumeWatch: "Resume",
+    deleteWatch: "Delete",
+    watch_active: "Active",
+    watch_paused: "Paused",
+    watch_interrupted: "Interrupted",
+    watch_stalled: "Stalled",
+    watch_stopped: "Stopped",
+    recovery_awaiting_resume: "Awaiting resume",
+    recovery_awaiting_progress: "Awaiting progress",
+    recovery_stalled: "Read-only/stalled",
+    recovery_recovered: "Progress seen",
     next_todo: "Start the owner, then continue the task",
     next_in_progress: "Let the owner continue and keep progress in the room",
     next_blocked: "Ask debug to inspect the visible trace",
@@ -914,6 +946,7 @@ function renderRoom() {
   qsa("#messageForm textarea, #messageForm button").forEach((node) => {
     node.disabled = !task && !group;
   });
+  renderWatchPanel(task);
 
   const stream = qs("#eventStream");
   const previousTaskId = state.lastRenderedTaskId;
@@ -943,6 +976,68 @@ function renderRoom() {
   state.shouldStickToBottom = false;
   state.lastRenderedTaskId = roomKey;
   state.lastRenderedEventId = nextEventId;
+}
+
+function renderWatchPanel(task) {
+  const panel = qs("#watchPanel");
+  panel.classList.toggle("hidden", !task);
+  if (!task) {
+    return;
+  }
+  const agents = groupAgents();
+  const observers = agents.filter((agent) => agent.role === "observe");
+  const selectedObserver = qs("#watchObserverSelect").value || observers[0]?.id || "";
+  const targets = agents.filter((agent) => agent.id !== selectedObserver && agent.role !== "observe");
+  const selectedTarget =
+    qs("#watchTargetSelect").value ||
+    targets.find((agent) => agent.id === task.owner_agent_id)?.id ||
+    targets[0]?.id ||
+    "";
+  fillSelect(
+    qs("#watchObserverSelect"),
+    observers.map((agent) => [agent.id, `${agent.name} (${labelFor("role", agent.role)})`]),
+    selectedObserver
+  );
+  fillSelect(
+    qs("#watchTargetSelect"),
+    targets.map((agent) => [agent.id, `${agent.name} (${labelFor("role", agent.role)})`]),
+    selectedTarget
+  );
+  qs("#createWatchButton").disabled = !observers.length || !targets.length;
+  qs("#watchList").innerHTML = renderWatchList(task.watch_bindings || []);
+}
+
+function renderWatchList(watchers) {
+  if (!watchers.length) {
+    return `<div class="empty-state">${escapeHtml(t("noWatchers"))}</div>`;
+  }
+  return watchers
+    .map((watcher) => {
+      const isActive = watcher.status === "active";
+      const canResume = ["paused", "interrupted", "stalled"].includes(watcher.status);
+      const recoveryLabel =
+        watcher.recovery_status && watcher.recovery_status !== "idle"
+          ? ` · ${t(`recovery_${watcher.recovery_status}`) || watcher.recovery_status}`
+          : "";
+      return `
+        <article class="watch-row">
+          <div>
+            <strong>${escapeHtml(agentName(watcher.observer_agent_id))} -> ${escapeHtml(agentName(watcher.target_agent_id))}</strong>
+            <span>${escapeHtml(`${t(`watch_${watcher.status}`) || watcher.status}${recoveryLabel}`)}</span>
+          </div>
+          <div class="watch-actions">
+            ${
+              isActive
+                ? `<button type="button" class="ghost-button" data-watch-pause="${escapeHtml(watcher.watch_id)}">${escapeHtml(t("pauseWatch"))}</button>`
+                : canResume
+                  ? `<button type="button" class="ghost-button" data-watch-resume="${escapeHtml(watcher.watch_id)}">${escapeHtml(t("resumeWatch"))}</button>`
+                  : ""
+            }
+            <button type="button" class="ghost-button" data-watch-delete="${escapeHtml(watcher.watch_id)}">${escapeHtml(t("deleteWatch"))}</button>
+          </div>
+        </article>`;
+    })
+    .join("");
 }
 
 function roomTimelineItems(events) {
@@ -2083,6 +2178,46 @@ async function stopAgent(agentId) {
   await loadState();
 }
 
+async function createTaskWatcher() {
+  if (!state.selectedTaskId) {
+    return;
+  }
+  const observerId = qs("#watchObserverSelect").value;
+  const targetId = qs("#watchTargetSelect").value;
+  if (!observerId || !targetId) {
+    return;
+  }
+  await api(`/api/tasks/${encodeURIComponent(state.selectedTaskId)}/watchers`, {
+    method: "POST",
+    body: JSON.stringify({
+      observer_agent_id: observerId,
+      target_agent_id: targetId
+    })
+  });
+  await loadState();
+}
+
+async function updateTaskWatcher(watchId, status) {
+  if (!state.selectedTaskId || !watchId) {
+    return;
+  }
+  await api(`/api/tasks/${encodeURIComponent(state.selectedTaskId)}/watchers/${encodeURIComponent(watchId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ status })
+  });
+  await loadState();
+}
+
+async function deleteTaskWatcher(watchId) {
+  if (!state.selectedTaskId || !watchId) {
+    return;
+  }
+  await api(`/api/tasks/${encodeURIComponent(state.selectedTaskId)}/watchers/${encodeURIComponent(watchId)}`, {
+    method: "DELETE"
+  });
+  await loadState();
+}
+
 async function sendRoomMessage(text) {
   if (!text.trim()) {
     return;
@@ -2598,6 +2733,30 @@ function bindEvents() {
     openReplay();
     await loadReplay();
     render();
+  });
+  qs("#watchObserverSelect").addEventListener("change", () => renderWatchPanel(state.selectedTask));
+  qs("#createWatchButton").addEventListener("click", async () => {
+    try {
+      await createTaskWatcher();
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+  qs("#watchList").addEventListener("click", async (event) => {
+    const pause = event.target.closest("[data-watch-pause]");
+    const resume = event.target.closest("[data-watch-resume]");
+    const remove = event.target.closest("[data-watch-delete]");
+    try {
+      if (pause) {
+        await updateTaskWatcher(pause.dataset.watchPause, "paused");
+      } else if (resume) {
+        await updateTaskWatcher(resume.dataset.watchResume, "active");
+      } else if (remove) {
+        await deleteTaskWatcher(remove.dataset.watchDelete);
+      }
+    } catch (error) {
+      alert(error.message);
+    }
   });
 
   qs("#eventStream").addEventListener("scroll", (event) => {

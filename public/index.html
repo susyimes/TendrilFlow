@@ -92,6 +92,21 @@
               <button id="finalReportButton" type="button" data-i18n="finalReport">最终报告</button>
             </div>
 
+            <div id="watchPanel" class="watch-panel hidden">
+              <div class="watch-form">
+                <label>
+                  <span data-i18n="watchObserver">观察者</span>
+                  <select id="watchObserverSelect"></select>
+                </label>
+                <label>
+                  <span data-i18n="watchTarget">目标</span>
+                  <select id="watchTargetSelect"></select>
+                </label>
+                <button id="createWatchButton" type="button" data-i18n="createWatch">开始观察</button>
+              </div>
+              <div id="watchList" class="watch-list"></div>
+            </div>
+
             <div id="eventStream" class="event-stream"></div>
 
             <form id="messageForm" class="message-form">

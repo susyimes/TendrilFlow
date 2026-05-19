@@ -318,6 +318,30 @@ function createHttpServer(orchestrator) {
         return;
       }
 
+      const watchersRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/watchers$/);
+      if (watchersRoute && req.method === "GET") {
+        sendJson(res, 200, { watchers: await orchestrator.taskWatchers(decodeURIComponent(watchersRoute[1])) });
+        return;
+      }
+      if (watchersRoute && req.method === "POST") {
+        sendJson(res, 201, {
+          watcher: await orchestrator.startTaskWatcher(decodeURIComponent(watchersRoute[1]), await readJson(req))
+        });
+        return;
+      }
+
+      const watcherRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/watchers\/([^/]+)$/);
+      if (watcherRoute && req.method === "PATCH") {
+        const [, taskId, watchId] = watcherRoute.map(decodeURIComponent);
+        sendJson(res, 200, { watcher: await orchestrator.updateTaskWatcher(taskId, watchId, await readJson(req)) });
+        return;
+      }
+      if (watcherRoute && req.method === "DELETE") {
+        const [, taskId, watchId] = watcherRoute.map(decodeURIComponent);
+        sendJson(res, 200, { deleted: await orchestrator.deleteTaskWatcher(taskId, watchId) });
+        return;
+      }
+
       const messageRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageRoute && req.method === "POST") {
         const body = await readJson(req);

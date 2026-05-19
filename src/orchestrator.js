@@ -20,6 +20,15 @@ const ROUNDTABLE_PROTOCOL = "tendrilflow.roundtable.v1";
 const ROUNDTABLE_DEFAULT_MAX_ROUNDS = 10;
 const ROUNDTABLE_DEFAULT_INTERVAL_MS = 15000;
 const ROUNDTABLE_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+const OBSERVE_CONTROL_PROTOCOL = "tendrilflow.observe_control.v1";
+const OBSERVE_WATCH_DEFAULT_DEBOUNCE_MS = 1000;
+const OBSERVE_WATCH_DEFAULT_HEARTBEAT_MS = 30000;
+const OBSERVE_WATCH_DEFAULT_RECOVERY_TIMEOUT_MS = 2 * 60 * 1000;
+const OBSERVE_RECOVERY_READ_ONLY_STALL_COUNT = 2;
+const OBSERVE_RECOVERY_PROGRESS_PATTERN =
+  /\b(writefile|strreplacefile|strreplace|editfile|edit|apply_patch|patch|createfile|create|created|modify|modified|update|updated|save|saved|wrote|rewrite|replacefile|replace|rename|move|delete|npm\s+(test|run)|pnpm\s+(test|run)|yarn\s+(test|run)|node\s+--check|pytest|vitest|playwright|eslint|tsc)\b|写入|修改|创建|更新|保存|替换|删除|修复|验证|测试|通过/iu;
+const OBSERVE_RECOVERY_READ_ONLY_PATTERN =
+  /\b(readfile|read_file|view|open|list|glob|grep|search|find|cat|sed|head|tail|ls|dir|get-content|select-string|rg)\b|读取|查看|搜索|列出|浏览|只读/iu;
 const execFileAsync = promisify(execFile);
 
 function spawnFileAsync(file, args, options = {}) {
@@ -667,6 +676,29 @@ function eventText(event) {
   );
 }
 
+function observeActivityText(record) {
+  const content = record?.content || {};
+  if (typeof content === "string") {
+    return content;
+  }
+  return [
+    record?.type,
+    content.tool,
+    content.skill,
+    content.title,
+    content.command,
+    content.path,
+    content.summary,
+    content.text,
+    content.outcome,
+    content.verdict,
+    content.reason
+  ]
+    .filter(Boolean)
+    .map(String)
+    .join(" ");
+}
+
 function increment(map, key, amount = 1) {
   map[key] = (map[key] || 0) + amount;
 }
@@ -704,6 +736,21 @@ function extractGroupRouteBlockTexts(text) {
   return blocks;
 }
 
+function extractObserveControlBlockTexts(text) {
+  const value = String(text || "");
+  const blocks = [];
+  const fencePattern = /```(?:tendrilflow[._-]?observe_control|tendrilflow\.observe_control)\s*([\s\S]*?)```/giu;
+  let match = null;
+  while ((match = fencePattern.exec(value))) {
+    blocks.push(match[1].trim());
+  }
+  const markerPattern = /(?:^|\n)\s*TENDRILFLOW_OBSERVE_CONTROL\s+(\{[^\r\n]+\})/giu;
+  while ((match = markerPattern.exec(value))) {
+    blocks.push(match[1].trim());
+  }
+  return blocks;
+}
+
 function isProviderAdapterLifecycleLine(text) {
   const value = String(text || "").trim();
   return (
@@ -733,8 +780,11 @@ class Orchestrator {
     this.stoppingAgents = new Set();
     this.groupRouteBuffers = new Map();
     this.roundtables = new Map();
+    this.taskWatchTimers = new Map();
+    this.observeControlBuffers = new Map();
     this.detachedSessionsReconciled = false;
     this.hostInitPrepared = false;
+    this.taskWatchersRestored = false;
   }
 
   async init() {
@@ -747,6 +797,10 @@ class Orchestrator {
     if (!this.detachedSessionsReconciled) {
       await this.reconcileDetachedAgentSessions();
       this.detachedSessionsReconciled = true;
+    }
+    if (!this.taskWatchersRestored) {
+      await this.restoreTaskWatchers();
+      this.taskWatchersRestored = true;
     }
   }
 
@@ -2414,9 +2468,7 @@ class Orchestrator {
         backgroundInitPrompt = agent.init_prompt;
       }
     }
-    const logAgentEvent = async (event) => {
-      await this.store.appendAgentLog(agent, event).catch(() => undefined);
-    };
+    const logAgentEvent = async (event) => this.store.appendAgentLog(agent, event).catch(() => null);
     const session = createAdapterSession(agent, {
       onTaskEvent: async (taskId, event) => {
         const groupRoute = parseGroupRouteTaskId(taskId);
@@ -2430,7 +2482,11 @@ class Orchestrator {
           }
           return;
         }
-        await this.store.appendEvent(taskId, event).catch(() => undefined);
+        const taskEvent = await this.store.appendEvent(taskId, event).catch(() => null);
+        if (taskEvent) {
+          await this.handleTaskAgentEvent(taskId, taskEvent).catch(() => undefined);
+          await this.observeTaskWatchEvent(taskId, taskEvent).catch(() => undefined);
+        }
       },
       onSessionEvent: async (id, event) => {
         await this.captureProviderSessionMarker(id, event).catch(() => undefined);
@@ -2441,7 +2497,10 @@ class Orchestrator {
             () => undefined
           );
         }
-        await logAgentEvent({ ...event, agent_id: id });
+        const loggedEvent = await logAgentEvent({ ...event, agent_id: id });
+        if (loggedEvent) {
+          await this.observeTaskWatchAgentLog(id, loggedEvent).catch(() => undefined);
+        }
       },
       onExit: async (id, code) => {
         const expectedStop = this.stoppingAgents.delete(id);
@@ -2524,14 +2583,23 @@ class Orchestrator {
     }
   }
 
-  async stopAgent(agentId) {
+  async stopAgent(agentId, options = {}) {
     const agent = await this.store.getAgent(agentId);
     const session = this.sessions.get(agentId);
     if (agent) {
       await this.store.appendAgentLog(agent, {
         type: "status_change",
+        task_id: options.task_id || agent.current_task_id || null,
         content: {
-          text: session ? "Stop requested." : "Marked stopped without a running CLI session."
+          text: options.reason
+            ? `${session ? "Stop requested" : "Marked stopped without a running CLI session"}: ${options.reason}`
+            : session
+              ? "Stop requested."
+              : "Marked stopped without a running CLI session.",
+          source: options.source || null,
+          reason: options.reason || null,
+          watch_id: options.watch_id || null,
+          observer_agent_id: options.observer_agent_id || null
         }
       });
     }
@@ -3312,6 +3380,820 @@ class Orchestrator {
     };
   }
 
+  async restoreTaskWatchers() {
+    const tasks = await this.store.listTasks().catch(() => []);
+    for (const task of tasks) {
+      for (const binding of task.watch_bindings || []) {
+        if (binding.status === "active") {
+          this.scheduleTaskWatchTick(task.task_id, binding.watch_id, binding.heartbeat_ms);
+        }
+      }
+    }
+  }
+
+  async taskWatchers(taskId) {
+    const task = await this.requireTask(taskId);
+    return (task.watch_bindings || []).map((binding) => this.publicTaskWatcher(binding));
+  }
+
+  async startTaskWatcher(taskId, input = {}) {
+    const task = await this.requireTask(taskId);
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === task.workspace_id && agent.group_id === task.group_id
+    );
+    const observer = this.resolveAgentReference(input.observer_agent_id || input.observer || input.observer_agent_name, agents);
+    const target = this.resolveAgentReference(input.target_agent_id || input.target || input.target_agent_name, agents);
+    if (!observer) {
+      throw new Error("Observer agent not found.");
+    }
+    if (!target) {
+      throw new Error("Target agent not found.");
+    }
+    if (observer.id === target.id) {
+      throw new Error("Observer and target agent must be different.");
+    }
+    if (observer.role !== "observe") {
+      throw new Error("Observer agent must use the observe role.");
+    }
+    const existing = (task.watch_bindings || []).find(
+      (binding) =>
+        ["active", "paused"].includes(binding.status) &&
+        binding.observer_agent_id === observer.id &&
+        binding.target_agent_id === target.id
+    );
+    if (existing) {
+      throw new Error("A watch binding for this observer and target already exists.");
+    }
+
+    await this.ensureObserveWatchSkill(task.workspace_id, task.group_id);
+    const timestamp = nowIso();
+    const binding = {
+      watch_id: input.watch_id || makeId("watch"),
+      protocol: OBSERVE_CONTROL_PROTOCOL,
+      status: "active",
+      observer_agent_id: observer.id,
+      observer_agent_name: observer.name,
+      target_agent_id: target.id,
+      target_agent_name: target.name,
+      auto_interrupt: input.auto_interrupt !== false,
+      debounce_ms: Math.max(0, Number(input.debounce_ms ?? OBSERVE_WATCH_DEFAULT_DEBOUNCE_MS)),
+      heartbeat_ms: Math.max(1000, Number(input.heartbeat_ms ?? OBSERVE_WATCH_DEFAULT_HEARTBEAT_MS)),
+      recovery_timeout_ms: Math.max(
+        0,
+        Number(input.recovery_timeout_ms ?? OBSERVE_WATCH_DEFAULT_RECOVERY_TIMEOUT_MS)
+      ),
+      recovery_status: "idle",
+      recovery_since_event_id: null,
+      recovery_started_at: null,
+      recovery_deadline_at: null,
+      recovery_progress_event_id: null,
+      recovery_progress_at: null,
+      recovery_stalled_at: null,
+      recovery_reason: null,
+      recovery_read_only_count: 0,
+      last_delivered_event_id: null,
+      last_observed_log_event_id: null,
+      last_observation_at: null,
+      last_interrupt_at: null,
+      interrupt_reason: null,
+      created_at: timestamp,
+      updated_at: timestamp,
+      started_event_id: null
+    };
+    const participants = Array.from(new Set([...(task.participant_agent_ids || []), observer.id, target.id].filter(Boolean)));
+    let updated = await this.store.patchTask(taskId, {
+      participant_agent_ids: participants,
+      watch_bindings: [...(task.watch_bindings || []), binding]
+    });
+    const event = await this.store.appendEvent(taskId, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        watch_id: binding.watch_id,
+        status: "active",
+        observer_agent_id: observer.id,
+        observer_agent_name: observer.name,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        auto_interrupt: binding.auto_interrupt,
+        heartbeat_ms: binding.heartbeat_ms,
+        text: `${observer.name} is now watching ${target.name}.`
+      }
+    });
+    updated = await this.store.getTask(taskId);
+    const nextBindings = (updated.watch_bindings || []).map((candidate) =>
+      candidate.watch_id === binding.watch_id ? { ...candidate, started_event_id: event.event_id, updated_at: nowIso() } : candidate
+    );
+    await this.store.patchTask(taskId, { watch_bindings: nextBindings });
+    if (input.auto_start !== false) {
+      this.scheduleTaskWatchTick(taskId, binding.watch_id, input.initial_delay_ms ?? 0);
+    }
+    return this.publicTaskWatcher({ ...binding, started_event_id: event.event_id });
+  }
+
+  async ensureObserveWatchSkill(workspaceId, groupId) {
+    return this.store.upsertSkill({
+      workspace_id: workspaceId,
+      group_id: groupId,
+      scope: "group",
+      skill_id: "observe.watch",
+      title: "Observe Watch",
+      roles: ["observe"],
+      summary:
+        "Continuously watch a paired target agent from visible task trace, interrupt clear failures, and verify post-guidance recovery progress.",
+      body: [
+        "# Observe Watch",
+        "",
+        "Use this skill when TendrilFlow wakes you as an Observe Agent for a paired target agent.",
+        "",
+        "- Judge only from visible task events, target logs, task metadata, health, and latest shared instructions.",
+        "- Do not take over implementation. Report concise observation notes when useful.",
+        "- After an interrupt and resume, Core tracks recovery progress. Treat writes, patches, verification commands, or a grounded completion report as concrete progress.",
+        "- If the target keeps only reading, searching, or restating after guidance, call that out clearly; Core may mark the watch stalled.",
+        "- If the target should be stopped immediately, emit one structured control block:",
+        "```tendrilflow.observe_control",
+        '{"action":"interrupt","target_agent_id":"target id","severity":"critical","reason":"short evidence-backed reason","evidence_event_ids":["evt_..."],"confidence":0.8}',
+        "```",
+        "- Use interrupt only for clear loops, unsafe/destructive drift, explicit constraint violations, severe task drift, or unrecoverable stale/failure signals.",
+        "- The Core validates the active watch binding before stopping anything."
+      ].join("\n")
+    });
+  }
+
+  publicTaskWatcher(binding) {
+    if (!binding) {
+      return null;
+    }
+    const { timer, ...publicBinding } = binding;
+    return publicBinding;
+  }
+
+  async updateTaskWatcher(taskId, watchId, input = {}) {
+    const task = await this.requireTask(taskId);
+    const current = (task.watch_bindings || []).find((binding) => binding.watch_id === watchId);
+    if (!current) {
+      throw new Error(`Task watch binding not found: ${watchId}`);
+    }
+    const patch = {};
+    if (input.status) {
+      const status = String(input.status);
+      if (!["active", "paused", "interrupted", "stalled", "stopped"].includes(status)) {
+        throw new Error(`Unsupported watch status: ${status}`);
+      }
+      patch.status = status;
+      if (status === "active" && current.last_control_event_id && ["interrupted", "stalled"].includes(current.status)) {
+        const timestamp = nowIso();
+        const timeoutMs = Math.max(
+          0,
+          Number(input.recovery_timeout_ms ?? current.recovery_timeout_ms ?? OBSERVE_WATCH_DEFAULT_RECOVERY_TIMEOUT_MS)
+        );
+        patch.recovery_status = "awaiting_progress";
+        patch.recovery_since_event_id = current.last_control_event_id;
+        patch.recovery_started_at = timestamp;
+        patch.recovery_deadline_at = new Date(Date.parse(timestamp) + timeoutMs).toISOString();
+        patch.recovery_progress_event_id = null;
+        patch.recovery_progress_at = null;
+        patch.recovery_stalled_at = null;
+        patch.recovery_reason = null;
+        patch.recovery_read_only_count = 0;
+        patch.recovery_timeout_ms = timeoutMs;
+      }
+    }
+    if (input.auto_interrupt !== undefined) {
+      patch.auto_interrupt = Boolean(input.auto_interrupt);
+    }
+    if (input.debounce_ms !== undefined) {
+      patch.debounce_ms = Math.max(0, Number(input.debounce_ms));
+    }
+    if (input.heartbeat_ms !== undefined) {
+      patch.heartbeat_ms = Math.max(1000, Number(input.heartbeat_ms));
+    }
+    if (input.recovery_timeout_ms !== undefined) {
+      patch.recovery_timeout_ms = Math.max(0, Number(input.recovery_timeout_ms));
+    }
+    const binding = await this.patchTaskWatchBinding(taskId, watchId, patch);
+    if (binding.status === "active") {
+      this.scheduleTaskWatchTick(taskId, watchId, 0);
+    } else {
+      this.clearTaskWatchTimer(taskId, watchId);
+    }
+    return this.publicTaskWatcher(binding);
+  }
+
+  async deleteTaskWatcher(taskId, watchId) {
+    const task = await this.requireTask(taskId);
+    const bindings = task.watch_bindings || [];
+    const exists = bindings.some((binding) => binding.watch_id === watchId);
+    if (!exists) {
+      return false;
+    }
+    this.clearTaskWatchTimer(taskId, watchId);
+    await this.store.patchTask(taskId, {
+      watch_bindings: bindings.filter((binding) => binding.watch_id !== watchId)
+    });
+    await this.store.appendEvent(taskId, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        watch_id: watchId,
+        status: "stopped",
+        text: "Task watch binding removed."
+      }
+    });
+    return true;
+  }
+
+  async patchTaskWatchBinding(taskId, watchId, patch) {
+    const task = await this.requireTask(taskId);
+    let nextBinding = null;
+    const nextBindings = (task.watch_bindings || []).map((binding) => {
+      if (binding.watch_id !== watchId) {
+        return binding;
+      }
+      nextBinding = {
+        ...binding,
+        ...patch,
+        updated_at: nowIso()
+      };
+      return nextBinding;
+    });
+    if (!nextBinding) {
+      throw new Error(`Task watch binding not found: ${watchId}`);
+    }
+    await this.store.patchTask(taskId, { watch_bindings: nextBindings });
+    return nextBinding;
+  }
+
+  taskWatchTimerKey(taskId, watchId) {
+    return `${taskId}:${watchId}`;
+  }
+
+  clearTaskWatchTimer(taskId, watchId) {
+    const key = this.taskWatchTimerKey(taskId, watchId);
+    const timer = this.taskWatchTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      this.taskWatchTimers.delete(key);
+    }
+  }
+
+  scheduleTaskWatchTick(taskId, watchId, delayMs = null) {
+    this.clearTaskWatchTimer(taskId, watchId);
+    const delay = Math.max(0, Number(delayMs ?? OBSERVE_WATCH_DEFAULT_HEARTBEAT_MS));
+    const key = this.taskWatchTimerKey(taskId, watchId);
+    const timer = setTimeout(() => {
+      this.taskWatchTimers.delete(key);
+      this.runTaskWatchTick(taskId, watchId).catch(() => undefined);
+    }, delay);
+    timer.unref?.();
+    this.taskWatchTimers.set(key, timer);
+  }
+
+  async runTaskWatchTick(taskId, watchId, options = {}) {
+    const task = await this.requireTask(taskId);
+    let binding = (task.watch_bindings || []).find((candidate) => candidate.watch_id === watchId);
+    if (!binding || binding.status !== "active") {
+      return binding ? this.publicTaskWatcher(binding) : null;
+    }
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === task.workspace_id && agent.group_id === task.group_id
+    );
+    const observer = agents.find((agent) => agent.id === binding.observer_agent_id);
+    const target = agents.find((agent) => agent.id === binding.target_agent_id);
+    if (!observer || !target) {
+      const next = await this.patchTaskWatchBinding(taskId, watchId, {
+        status: "stopped",
+        interrupt_reason: "Observer or target agent no longer exists."
+      });
+      this.clearTaskWatchTimer(taskId, watchId);
+      return this.publicTaskWatcher(next);
+    }
+
+    const observerSession = this.sessions.get(observer.id);
+    const events = await this.store.readEvents(taskId);
+    const targetLogs = await this.store.readAgentLogs(target.id, { limit: 50 }).catch(() => []);
+    const targetHealth = await this.agentHealth(target);
+    const newEvents = this.watchNewEvents(binding, events);
+    const newTargetLogs = this.watchNewLogs(binding, targetLogs);
+    const tickEvent = await this.store.appendEvent(taskId, {
+      type: "tool_call_summary",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.watch_tick",
+        skill: "observe.watch",
+        watch_id: watchId,
+        observer_agent_id: observer.id,
+        observer_agent_name: observer.name,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        reason: options.reason || "watch_tick",
+        new_event_count: newEvents.length,
+        new_log_count: newTargetLogs.length,
+        target_health: targetHealth.status,
+        text: observerSession
+          ? `Observe watcher woke ${observer.name} for ${target.name}.`
+          : `Observe watcher could not wake ${observer.name}; no running session.`
+      }
+    });
+    const recovery = await this.updateObserveRecovery(task, binding, target, {
+      events,
+      targetLogs,
+      targetHealth
+    });
+    if (recovery?.binding) {
+      binding = recovery.binding;
+    }
+    if (recovery?.terminal) {
+      return this.publicTaskWatcher(binding);
+    }
+
+    if (!observerSession) {
+      await this.store.appendAgentLog(observer, {
+        type: "status_change",
+        task_id: taskId,
+        content: {
+          protocol: OBSERVE_CONTROL_PROTOCOL,
+          watch_id: watchId,
+          text: "Watch context is pending; observer agent is not running."
+        }
+      });
+      this.scheduleTaskWatchTick(taskId, watchId, binding.heartbeat_ms);
+      return this.publicTaskWatcher(binding);
+    }
+
+    const participants = Array.from(new Set([...(task.participant_agent_ids || []), observer.id, target.id]));
+    await this.store.patchTask(taskId, { participant_agent_ids: participants });
+    await this.store.patchAgent(observer.id, { current_task_id: taskId });
+    const sent = await observerSession.sendMessage(
+      task,
+      await this.buildTaskWatchContextMessage(task, binding, observer, target, {
+        events,
+        newEvents,
+        targetLogs,
+        newTargetLogs,
+        targetHealth,
+        reason: options.reason || "watch_tick"
+      })
+    );
+    if (!sent) {
+      await this.store.appendAgentLog(observer, {
+        type: "error",
+        task_id: taskId,
+        content: {
+          protocol: OBSERVE_CONTROL_PROTOCOL,
+          watch_id: watchId,
+          text: "Could not deliver watch context to observer session."
+        }
+      });
+      this.scheduleTaskWatchTick(taskId, watchId, binding.heartbeat_ms);
+      return this.publicTaskWatcher(binding);
+    }
+    const next = await this.patchTaskWatchBinding(taskId, watchId, {
+      last_delivered_event_id: tickEvent.event_id || events.at(-1)?.event_id || binding.last_delivered_event_id || null,
+      last_observed_log_event_id: targetLogs.at(-1)?.event_id || binding.last_observed_log_event_id || null,
+      last_observation_at: nowIso()
+    });
+    this.scheduleTaskWatchTick(taskId, watchId, next.heartbeat_ms);
+    return this.publicTaskWatcher(next);
+  }
+
+  watchNewEvents(binding, events) {
+    const startId = binding.last_delivered_event_id || binding.started_event_id || null;
+    if (!startId) {
+      return events.slice(-12);
+    }
+    const index = events.findIndex((event) => event.event_id === startId);
+    return index >= 0 ? events.slice(index + 1) : events.slice(-12);
+  }
+
+  watchNewLogs(binding, logs) {
+    const startId = binding.last_observed_log_event_id || null;
+    if (!startId) {
+      return logs.slice(-12);
+    }
+    const index = logs.findIndex((event) => event.event_id === startId);
+    return index >= 0 ? logs.slice(index + 1) : logs.slice(-12);
+  }
+
+  observeRecoveryProgress(binding, events = [], targetLogs = [], target) {
+    const controlIndex = binding.recovery_since_event_id
+      ? events.findIndex((event) => event.event_id === binding.recovery_since_event_id)
+      : -1;
+    const eventCandidates = (controlIndex >= 0 ? events.slice(controlIndex + 1) : events).filter((event) =>
+      this.isObserveRecoveryTargetRecord(event, target.id, "event")
+    );
+    const sinceMs = Date.parse(binding.recovery_started_at || binding.last_interrupt_at || binding.updated_at || "");
+    const logCandidates = targetLogs.filter((log) => {
+      if (!this.isObserveRecoveryTargetRecord(log, target.id, "log")) {
+        return false;
+      }
+      if (!Number.isFinite(sinceMs)) {
+        return true;
+      }
+      const logMs = Date.parse(log.timestamp || "");
+      return Number.isFinite(logMs) ? logMs >= sinceMs : true;
+    });
+    const activityRecords = [...eventCandidates, ...logCandidates].sort((a, b) =>
+      String(a.timestamp || "").localeCompare(String(b.timestamp || ""))
+    );
+    const progressRecords = activityRecords.filter((record) => this.isObserveRecoveryProgressRecord(record));
+    const readOnlyRecords = activityRecords.filter((record) => this.isObserveRecoveryReadOnlyRecord(record));
+    return {
+      activityRecords,
+      progressRecords,
+      progressRecord: progressRecords[0] || null,
+      readOnlyRecords
+    };
+  }
+
+  isObserveRecoveryTargetRecord(record, targetId, source) {
+    if (!record || !targetId) {
+      return false;
+    }
+    if (record.content?.protocol === OBSERVE_CONTROL_PROTOCOL) {
+      return false;
+    }
+    if (source === "log") {
+      return record.agent_id === targetId || record.agent?.id === targetId;
+    }
+    if (record.actor?.id === targetId) {
+      return true;
+    }
+    return record.content?.agent_id === targetId;
+  }
+
+  isObserveRecoveryProgressRecord(record) {
+    if (!record) {
+      return false;
+    }
+    const content = record.content || {};
+    const text = observeActivityText(record);
+    if (/未(修改|写入|创建|更新|保存|替换|修复|验证|测试)|没有(修改|写入|创建|更新|保存)|no changes?|did not write|read-?only|只读/iu.test(text)) {
+      return false;
+    }
+    if (record.type === "final_report") {
+      return true;
+    }
+    if (record.type === "status_change" && ["review", "done"].includes(content.to)) {
+      return true;
+    }
+    const strongFields = [
+      record.type,
+      content.tool,
+      content.title,
+      content.command,
+      content.path,
+      content.summary,
+      content.outcome,
+      content.verdict
+    ]
+      .filter(Boolean)
+      .map(String)
+      .join(" ");
+    if (OBSERVE_RECOVERY_PROGRESS_PATTERN.test(strongFields)) {
+      return true;
+    }
+    if (
+      record.type === "agent_message" &&
+      /\b(changed|modified|updated|created|wrote|fixed|verified|tests?\s+pass(?:ed)?|checks?\s+pass(?:ed)?)\b|已(修改|写入|创建|更新|修复|验证)|测试通过|验证通过/iu.test(
+        String(content.text || "")
+      )
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  isObserveRecoveryReadOnlyRecord(record) {
+    if (!record || this.isObserveRecoveryProgressRecord(record)) {
+      return false;
+    }
+    return OBSERVE_RECOVERY_READ_ONLY_PATTERN.test(observeActivityText(record));
+  }
+
+  async updateObserveRecovery(task, binding, target, context) {
+    if (binding.recovery_status !== "awaiting_progress" || !binding.recovery_since_event_id) {
+      return { binding };
+    }
+    const recovery = this.observeRecoveryProgress(binding, context.events, context.targetLogs, target);
+    if (recovery.progressRecord) {
+      const next = await this.markObserveRecoveryRecovered(task, binding, target, recovery);
+      return { binding: next };
+    }
+    const startedMs = Date.parse(binding.recovery_started_at || binding.last_interrupt_at || binding.updated_at || "");
+    const elapsedMs = Number.isFinite(startedMs) ? Date.now() - startedMs : 0;
+    const timeoutMs = Math.max(
+      0,
+      Number(binding.recovery_timeout_ms ?? OBSERVE_WATCH_DEFAULT_RECOVERY_TIMEOUT_MS)
+    );
+    const targetHealth = context.targetHealth?.status || "unknown";
+    const targetStopped = ["stopped", "failed", "detached"].includes(targetHealth) || ["stopped", "failed"].includes(target.status);
+    const hasActivity = recovery.activityRecords.length > 0;
+    const timedOut = hasActivity && elapsedMs >= timeoutMs;
+    const readOnlyStalled =
+      recovery.readOnlyRecords.length >= OBSERVE_RECOVERY_READ_ONLY_STALL_COUNT &&
+      (targetStopped || timedOut || timeoutMs === 0);
+    if (!readOnlyStalled && !(timedOut && targetStopped)) {
+      if (recovery.readOnlyRecords.length !== Number(binding.recovery_read_only_count || 0)) {
+        const next = await this.patchTaskWatchBinding(task.task_id, binding.watch_id, {
+          recovery_read_only_count: recovery.readOnlyRecords.length
+        });
+        return { binding: next };
+      }
+      return { binding };
+    }
+    const next = await this.markObserveRecoveryStalled(task, binding, target, recovery, {
+      target_health: targetHealth,
+      elapsed_ms: elapsedMs,
+      timeout_ms: timeoutMs
+    });
+    return { binding: next, terminal: true };
+  }
+
+  async markObserveRecoveryRecovered(task, binding, target, recovery) {
+    const timestamp = nowIso();
+    const progressRecord = recovery.progressRecord;
+    const next = await this.patchTaskWatchBinding(task.task_id, binding.watch_id, {
+      recovery_status: "recovered",
+      recovery_progress_event_id: progressRecord.event_id || null,
+      recovery_progress_at: timestamp,
+      recovery_stalled_at: null,
+      recovery_reason: null,
+      recovery_read_only_count: recovery.readOnlyRecords.length
+    });
+    await this.store.appendEvent(task.task_id, {
+      type: "tool_call_summary",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.recovery_progress",
+        skill: "observe.watch",
+        watch_id: binding.watch_id,
+        recovery_status: "recovered",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        progress_event_id: progressRecord.event_id || null,
+        read_only_count: recovery.readOnlyRecords.length,
+        text: `Observe recovery saw concrete progress from ${target.name}.`
+      }
+    });
+    return next;
+  }
+
+  async markObserveRecoveryStalled(task, binding, target, recovery, context = {}) {
+    const reason =
+      recovery.readOnlyRecords.length >= OBSERVE_RECOVERY_READ_ONLY_STALL_COUNT
+        ? "stalled_after_guidance_read_only"
+        : "stalled_after_guidance";
+    const stopped = ["stopped", "failed", "detached"].includes(context.target_health);
+    if (!stopped) {
+      await this.stopAgent(target.id, {
+        source: "observe.recovery",
+        reason,
+        task_id: task.task_id,
+        watch_id: binding.watch_id
+      });
+    }
+    const latestTask = (await this.store.getTask(task.task_id)) || task;
+    const targetOwnsCurrentWork = latestTask.owner_agent_id === target.id || latestTask.claim?.agent_id === target.id;
+    if (targetOwnsCurrentWork && !["done", "failed", "blocked"].includes(latestTask.status)) {
+      await this.store.patchTask(task.task_id, { status: "blocked" });
+      await this.store.appendEvent(task.task_id, {
+        type: "status_change",
+        actor: { kind: "system", id: "orchestrator" },
+        content: {
+          protocol: OBSERVE_CONTROL_PROTOCOL,
+          watch_id: binding.watch_id,
+          field: "status",
+          from: latestTask.status,
+          to: "blocked",
+          reason,
+          text: `Task blocked because ${target.name} stalled after observe guidance.`
+        }
+      });
+    }
+    const timestamp = nowIso();
+    const evidenceEventIds = recovery.activityRecords
+      .map((record) => record.event_id)
+      .filter(Boolean)
+      .slice(-12);
+    const next = await this.patchTaskWatchBinding(task.task_id, binding.watch_id, {
+      status: "stalled",
+      recovery_status: "stalled",
+      recovery_stalled_at: timestamp,
+      recovery_reason: reason,
+      recovery_read_only_count: recovery.readOnlyRecords.length,
+      interrupt_reason: reason
+    });
+    this.clearTaskWatchTimer(task.task_id, binding.watch_id);
+    await this.store.appendEvent(task.task_id, {
+      type: "tool_call_summary",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.recovery_stalled",
+        skill: "observe.watch",
+        watch_id: binding.watch_id,
+        recovery_status: "stalled",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        reason,
+        target_health: context.target_health || null,
+        elapsed_ms: context.elapsed_ms || 0,
+        timeout_ms: context.timeout_ms || 0,
+        activity_count: recovery.activityRecords.length,
+        read_only_count: recovery.readOnlyRecords.length,
+        evidence_event_ids: evidenceEventIds,
+        text: `Observe recovery marked ${target.name} stalled after guidance; no concrete write, verification, or completion progress was observed.`
+      }
+    });
+    return next;
+  }
+
+  async buildTaskWatchContextMessage(task, binding, observer, target, context) {
+    const workspace = await this.store.getWorkspace(task.workspace_id);
+    const group = await this.store.getGroup(task.workspace_id, task.group_id);
+    const allEvents = context.events || [];
+    const lastControlIndex = binding.last_control_event_id
+      ? allEvents.findIndex((event) => event.event_id === binding.last_control_event_id)
+      : -1;
+    const instructionEvents = lastControlIndex >= 0 ? allEvents.slice(lastControlIndex + 1) : allEvents;
+    const latestInstructions = instructionEvents
+      .filter((event) => event.content?.tool === "user.broadcast_instruction" || event.content?.tool === "host.broadcast_instruction")
+      .slice(-3)
+      .map((event) => `- ${event.content?.instruction || eventText(event)}`)
+      .join("\n");
+    const formatEvent = (event) => {
+      const actor = event.actor?.id || event.actor?.kind || "unknown";
+      return `- ${event.event_id || "event"} ${event.type} by ${actor}: ${String(eventText(event)).slice(0, 500)}`;
+    };
+    const formatLog = (log) =>
+      `- ${log.event_id || "log"} ${log.type || "log"}: ${String(eventText(log)).slice(0, 500)}`;
+    return [
+      "TendrilFlow observe watcher",
+      `Protocol: ${OBSERVE_CONTROL_PROTOCOL}`,
+      "",
+      `Workspace: ${workspace?.name || task.workspace_id} (${task.workspace_id})`,
+      `Group: ${group?.name || task.group_id} (${task.group_id})`,
+      `Task: ${task.title} (${task.task_id})`,
+      `Task status: ${task.status}`,
+      `Task description: ${task.description || "(none)"}`,
+      `Watch: ${binding.watch_id}`,
+      `Observer: ${observer.name} (${observer.id})`,
+      `Target: ${target.name} (${target.id})`,
+      `Auto interrupt: ${binding.auto_interrupt ? "enabled" : "disabled"}`,
+      `Trigger reason: ${context.reason || "watch_tick"}`,
+      `Target health: ${context.targetHealth?.status || "unknown"}`,
+      `Target current task: ${target.current_task_id || "(none)"}`,
+      `Recovery status: ${binding.recovery_status || "idle"}`,
+      binding.recovery_status === "awaiting_progress"
+        ? `Recovery deadline: ${binding.recovery_deadline_at || "(none)"}`
+        : null,
+      "",
+      "Your job:",
+      "- Continuously judge whether the target agent is still safe and aligned with the task.",
+      "- Use only visible task events, target logs, target health, and latest broadcast instructions.",
+      "- Do not implement, review, or debug on behalf of the target unless the user separately asks.",
+      "- During post-interrupt recovery, distinguish concrete progress from read-only activity. Concrete progress means a write/edit/patch, verification command, or evidence-backed completion report.",
+      "- If no interruption is justified, reply with a concise observation or stay brief.",
+      "- If the target must be stopped immediately, emit exactly one structured block:",
+      "```tendrilflow.observe_control",
+      `{"action":"interrupt","target_agent_id":"${target.id}","severity":"critical","reason":"short evidence-backed reason","evidence_event_ids":["evt_..."],"confidence":0.8}`,
+      "```",
+      "",
+      "Interrupt threshold:",
+      "- Clear unsafe/destructive action without visible approval.",
+      "- Severe task drift or violation of the latest broadcast instruction.",
+      "- Looping, escalating privileges, exfiltration, or repeated unrecoverable failures.",
+      "- Stale/detached/failed target state where continued execution would mislead the room.",
+      "",
+      "Latest broadcast instructions:",
+      latestInstructions || "(none)",
+      "",
+      "New task events since last watch:",
+      (context.newEvents || []).slice(-12).map(formatEvent).join("\n") || "(none)",
+      "",
+      "Recent task events:",
+      (context.events || []).slice(-16).map(formatEvent).join("\n") || "(none)",
+      "",
+      "New target logs since last watch:",
+      (context.newTargetLogs || []).slice(-12).map(formatLog).join("\n") || "(none)",
+      "",
+      "Recent target logs:",
+      (context.targetLogs || []).slice(-16).map(formatLog).join("\n") || "(none)"
+    ].join("\n");
+  }
+
+  async observeTaskWatchEvent(taskId, event) {
+    const task = await this.store.getTask(taskId);
+    if (!task?.watch_bindings?.length) {
+      return;
+    }
+    for (const binding of task.watch_bindings) {
+      if (binding.status !== "active") {
+        if (
+          this.watchEventMatchesTarget(binding, event) &&
+          this.shouldArmObserveRecoveryFromRecord(binding, event, "event")
+        ) {
+          await this.armObserveRecoveryMonitoring(task, binding, "target_activity");
+          this.scheduleTaskWatchTick(taskId, binding.watch_id, binding.debounce_ms);
+        }
+        continue;
+      }
+      if (this.watchEventMatchesTarget(binding, event)) {
+        this.scheduleTaskWatchTick(taskId, binding.watch_id, binding.debounce_ms);
+      }
+    }
+  }
+
+  watchEventMatchesTarget(binding, event) {
+    const targetId = binding.target_agent_id;
+    const content = event.content || {};
+    return (
+      event.actor?.id === targetId ||
+      content.target_agent_id === targetId ||
+      content.target_agent_ids?.includes?.(targetId) ||
+      content.stopped_agent_ids?.includes?.(targetId) ||
+      content.agent_id === targetId ||
+      content.route_to_agent_id === targetId
+    );
+  }
+
+  async observeTaskWatchAgentLog(agentId, log) {
+    const taskId = log.task_id || (await this.store.getAgent(agentId))?.current_task_id || null;
+    if (!taskId || parseGroupRouteTaskId(taskId)) {
+      return;
+    }
+    const task = await this.store.getTask(taskId);
+    if (!task?.watch_bindings?.length) {
+      return;
+    }
+    for (const binding of task.watch_bindings) {
+      if (binding.target_agent_id !== agentId) {
+        continue;
+      }
+      if (binding.status === "active") {
+        this.scheduleTaskWatchTick(taskId, binding.watch_id, binding.debounce_ms);
+      } else if (this.shouldArmObserveRecoveryFromRecord(binding, log, "log")) {
+        await this.armObserveRecoveryMonitoring(task, binding, "target_log_activity");
+        this.scheduleTaskWatchTick(taskId, binding.watch_id, binding.debounce_ms);
+      }
+    }
+  }
+
+  shouldArmObserveRecoveryFromRecord(binding, record, source) {
+    if (
+      binding.status !== "interrupted" ||
+      binding.recovery_status !== "awaiting_resume" ||
+      !binding.last_control_event_id ||
+      record?.content?.protocol === OBSERVE_CONTROL_PROTOCOL
+    ) {
+      return false;
+    }
+    if (source === "log" && ["status_change", "process_exit", "process_started", "stderr", "error"].includes(record.type)) {
+      return false;
+    }
+    return true;
+  }
+
+  async armObserveRecoveryMonitoring(task, binding, reason) {
+    const timestamp = nowIso();
+    const timeoutMs = Math.max(
+      0,
+      Number(binding.recovery_timeout_ms ?? OBSERVE_WATCH_DEFAULT_RECOVERY_TIMEOUT_MS)
+    );
+    const next = await this.patchTaskWatchBinding(task.task_id, binding.watch_id, {
+      status: "active",
+      recovery_status: "awaiting_progress",
+      recovery_since_event_id: binding.last_control_event_id,
+      recovery_started_at: timestamp,
+      recovery_deadline_at: new Date(Date.parse(timestamp) + timeoutMs).toISOString(),
+      recovery_progress_event_id: null,
+      recovery_progress_at: null,
+      recovery_stalled_at: null,
+      recovery_reason: null,
+      recovery_read_only_count: 0
+    });
+    await this.store.appendEvent(task.task_id, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        watch_id: binding.watch_id,
+        status: "active",
+        recovery_status: "awaiting_progress",
+        reason,
+        target_agent_id: binding.target_agent_id,
+        target_agent_name: binding.target_agent_name,
+        text: `Observe watcher resumed recovery monitoring for ${binding.target_agent_name || binding.target_agent_id}.`
+      }
+    });
+    return next;
+  }
+
   async taskReplay(taskId) {
     const task = await this.requireTask(taskId);
     const events = await this.store.readEvents(taskId);
@@ -3837,6 +4719,278 @@ class Orchestrator {
     ].join("\n");
   }
 
+  async handleTaskAgentEvent(taskId, event) {
+    if (event.type !== "agent_message" || event.actor?.kind !== "agent") {
+      return;
+    }
+    const sourceAgent = await this.store.getAgent(event.actor.id);
+    const task = await this.store.getTask(taskId);
+    if (!sourceAgent || !task || sourceAgent.workspace_id !== task.workspace_id || sourceAgent.group_id !== task.group_id) {
+      return;
+    }
+    for (const block of this.collectObserveControlBlocks(taskId, event)) {
+      await this.processObserveControlRequest(task, sourceAgent, block, event);
+    }
+  }
+
+  collectObserveControlBlocks(taskId, event) {
+    const text = String(event.content?.text || "");
+    const directBlocks = extractObserveControlBlockTexts(text).map((raw) => ({
+      raw,
+      parent_event_id: event.event_id
+    }));
+    if (directBlocks.length) {
+      return directBlocks;
+    }
+    const sourceId = event.actor?.id;
+    if (!sourceId) {
+      return [];
+    }
+    const key = `${taskId}:${sourceId}`;
+    const trimmed = text.trim();
+    const openMatch = trimmed.match(/^```(?:tendrilflow[._-]?observe_control|tendrilflow\.observe_control)\s*(.*)$/iu);
+    if (openMatch) {
+      const rest = openMatch[1]?.trim();
+      this.observeControlBuffers.set(key, {
+        lines: rest ? [rest] : [],
+        parent_event_id: event.event_id
+      });
+      return [];
+    }
+    const buffer = this.observeControlBuffers.get(key);
+    if (!buffer) {
+      return [];
+    }
+    if (/^```/.test(trimmed)) {
+      this.observeControlBuffers.delete(key);
+      return [{ raw: buffer.lines.join("\n").trim(), parent_event_id: buffer.parent_event_id || event.event_id }];
+    }
+    buffer.lines.push(text);
+    if (buffer.lines.length > 80) {
+      this.observeControlBuffers.delete(key);
+    }
+    return [];
+  }
+
+  parseObserveControlBlock(raw) {
+    try {
+      const parsed = JSON.parse(String(raw || "").trim());
+      return { ok: true, request: parsed };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+  }
+
+  async processObserveControlRequest(task, sourceAgent, block, sourceEvent) {
+    const parsed = this.parseObserveControlBlock(block.raw);
+    const requestEvent = await this.store.appendEvent(task.task_id, {
+      type: "observe_control_request",
+      actor: { kind: "agent", id: sourceAgent.id },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.interrupt_agent",
+        skill: "observe.watch",
+        source_agent_id: sourceAgent.id,
+        source_agent_name: sourceAgent.name,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id,
+        raw: String(block.raw || "").slice(0, 4000),
+        parsed: parsed.ok,
+        text: parsed.ok
+          ? `${sourceAgent.name} requested observe control.`
+          : `${sourceAgent.name} emitted invalid observe control.`
+      }
+    });
+    if (!parsed.ok) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "invalid_observe_control_json",
+        detail: parsed.error,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+
+    const request = parsed.request || {};
+    const action = String(request.action || request.kind || "").trim().toLowerCase();
+    if (!["interrupt", "stop", "stop_agent"].includes(action)) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "unsupported_action",
+        detail: action || "(empty)",
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    const agents = (await this.store.listAgents()).filter(
+      (agent) => agent.workspace_id === task.workspace_id && agent.group_id === task.group_id
+    );
+    const target = this.resolveAgentReference(request.target_agent_id || request.target || request.to, agents);
+    if (!target) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "target_not_found",
+        detail: String(request.target_agent_id || request.target || request.to || ""),
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    if (target.id === sourceAgent.id) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "self_interrupt_blocked",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    const reason = String(request.reason || request.summary || request.text || "").trim();
+    if (!reason) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "missing_interrupt_reason",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    const binding = (task.watch_bindings || []).find(
+      (candidate) =>
+        candidate.status === "active" &&
+        candidate.observer_agent_id === sourceAgent.id &&
+        candidate.target_agent_id === target.id
+    );
+    if (!binding) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "not_authorized",
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    if (!binding.auto_interrupt) {
+      await this.blockObserveControl(task, sourceAgent, {
+        reason: "auto_interrupt_disabled",
+        watch_id: binding.watch_id,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        request_event_id: requestEvent.event_id,
+        parent_event_id: block.parent_event_id || sourceEvent.event_id
+      });
+      return;
+    }
+    await this.executeObserveInterrupt(task, binding, sourceAgent, target, request, {
+      request_event_id: requestEvent.event_id,
+      parent_event_id: block.parent_event_id || sourceEvent.event_id,
+      reason
+    });
+  }
+
+  async blockObserveControl(task, sourceAgent, content) {
+    await this.store.appendEvent(task.task_id, {
+      type: "observe_control_blocked",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.interrupt_agent",
+        skill: "observe.watch",
+        source_agent_id: sourceAgent.id,
+        source_agent_name: sourceAgent.name,
+        ...content,
+        text: `Blocked observe control from ${sourceAgent.name}: ${content.reason}.`
+      }
+    });
+  }
+
+  async executeObserveInterrupt(task, binding, sourceAgent, target, request, context) {
+    const evidenceEventIds = Array.isArray(request.evidence_event_ids)
+      ? request.evidence_event_ids.map(String).filter(Boolean).slice(0, 12)
+      : [];
+    const severity = String(request.severity || "critical").trim() || "critical";
+    const confidence = Number(request.confidence);
+    const controlEvent = await this.store.appendEvent(task.task_id, {
+      type: "tool_call_summary",
+      actor: { kind: "agent", id: sourceAgent.id },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        tool: "observe.interrupt_agent",
+        skill: "observe.watch",
+        watch_id: binding.watch_id,
+        request_event_id: context.request_event_id,
+        parent_event_id: context.parent_event_id,
+        observer_agent_id: sourceAgent.id,
+        observer_agent_name: sourceAgent.name,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        severity,
+        confidence: Number.isFinite(confidence) ? confidence : null,
+        reason: context.reason,
+        evidence_event_ids: evidenceEventIds,
+        text: `${sourceAgent.name} requested an automatic interrupt for ${target.name}: ${context.reason}`
+      }
+    });
+    await this.stopAgent(target.id, {
+      source: "observe.watch",
+      reason: context.reason,
+      task_id: task.task_id,
+      watch_id: binding.watch_id,
+      observer_agent_id: sourceAgent.id
+    });
+    const latestTask = (await this.store.getTask(task.task_id)) || task;
+    const targetOwnsCurrentWork = latestTask.owner_agent_id === target.id || latestTask.claim?.agent_id === target.id;
+    if (targetOwnsCurrentWork && !["done", "failed", "blocked"].includes(latestTask.status)) {
+      await this.store.patchTask(task.task_id, { status: "blocked" });
+      await this.store.appendEvent(task.task_id, {
+        type: "status_change",
+        actor: { kind: "system", id: "orchestrator" },
+        content: {
+          protocol: OBSERVE_CONTROL_PROTOCOL,
+          watch_id: binding.watch_id,
+          field: "status",
+          from: latestTask.status,
+          to: "blocked",
+          reason: context.reason,
+          text: `Task blocked because ${sourceAgent.name} interrupted ${target.name}.`
+        }
+      });
+    }
+    const next = await this.patchTaskWatchBinding(task.task_id, binding.watch_id, {
+      status: "interrupted",
+      last_interrupt_at: nowIso(),
+      interrupt_reason: context.reason,
+      last_control_event_id: controlEvent.event_id,
+      recovery_status: "awaiting_resume",
+      recovery_since_event_id: controlEvent.event_id,
+      recovery_started_at: null,
+      recovery_deadline_at: null,
+      recovery_progress_event_id: null,
+      recovery_progress_at: null,
+      recovery_stalled_at: null,
+      recovery_reason: null,
+      recovery_read_only_count: 0
+    });
+    this.clearTaskWatchTimer(task.task_id, binding.watch_id);
+    await this.store.appendEvent(task.task_id, {
+      type: "system_event",
+      actor: { kind: "system", id: "orchestrator" },
+      content: {
+        protocol: OBSERVE_CONTROL_PROTOCOL,
+        watch_id: next.watch_id,
+        status: "interrupted",
+        observer_agent_id: sourceAgent.id,
+        observer_agent_name: sourceAgent.name,
+        target_agent_id: target.id,
+        target_agent_name: target.name,
+        stopped_agent_ids: [target.id],
+        reason: context.reason,
+        text: `Observe watcher stopped ${target.name}.`
+      }
+    });
+  }
+
   resolveAgentReference(reference, agents) {
     const token = routeComparable(String(reference || "").replace(/^@/, ""));
     if (!token) {
@@ -4164,18 +5318,6 @@ class Orchestrator {
       return null;
     }
 
-    const stopIntent = /(停止|制止|中止|暂停|刹车|终止|stop|halt|pause|cancel|interrupt)/iu.test(message);
-    const stopScope = /(全部|所有|全体|群组|成员|agents?|执行|运行|任务|all|group|members?)/iu.test(message);
-    if (stopIntent && (stopScope || explicitTargets.some((agent) => agent.role !== "host"))) {
-      return {
-        kind: "stop_agents",
-        authority: hostAuthority ? "host" : "user",
-        actor: hostAuthority ? { kind: "agent", id: hostAuthority.id } : actor,
-        host_agent: hostAuthority || null,
-        targets: this.resolveControlTargets(agents, stopScope ? [] : explicitTargets, hostAuthority)
-      };
-    }
-
     const broadcastIntent = /(广播|通知全体|告诉全体|全体注意|announce|broadcast)/iu.test(message);
     const broadcastScope = /(全体|全部|所有|群组|成员|agents?|all|group|members?)/iu.test(message);
     if (broadcastIntent) {
@@ -4186,6 +5328,18 @@ class Orchestrator {
         host_agent: hostAuthority || null,
         targets: this.resolveControlTargets(agents, broadcastScope ? [] : explicitTargets, hostAuthority),
         instruction: this.extractBroadcastInstruction(message)
+      };
+    }
+
+    const stopIntent = /(停止|制止|中止|暂停|刹车|终止|stop|halt|pause|cancel|interrupt)/iu.test(message);
+    const stopScope = /(全部|所有|全体|群组|成员|agents?|执行|运行|任务|all|group|members?)/iu.test(message);
+    if (stopIntent && (stopScope || explicitTargets.some((agent) => agent.role !== "host"))) {
+      return {
+        kind: "stop_agents",
+        authority: hostAuthority ? "host" : "user",
+        actor: hostAuthority ? { kind: "agent", id: hostAuthority.id } : actor,
+        host_agent: hostAuthority || null,
+        targets: this.resolveControlTargets(agents, stopScope ? [] : explicitTargets, hostAuthority)
       };
     }
 

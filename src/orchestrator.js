@@ -2799,13 +2799,13 @@ class Orchestrator {
       title: "Roundtable Participant",
       roles: "*",
       summary:
-        "Participate in TendrilFlow roundtable discussions by periodically reading the visible room and contributing concise evidence, critique, synthesis, or questions when useful.",
+        "Use TendrilFlow roundtable context to join visible peer discussion with evidence, critique, synthesis, questions, or tool-backed findings when useful.",
       body: [
-        "When TendrilFlow wakes you for a roundtable tick, read the visible transcript first.",
-        "Contribute only when you can add evidence, challenge an assumption, refine the framing, or synthesize progress.",
-        "You are not required to answer every tick. If your interface requires text and you have nothing useful to add, keep it brief.",
-        "Prefer visible peer discussion over command-style delegation. You may still use available tools when the visible context genuinely calls for them.",
-        "The final synthesizer should separate verified facts, assumptions, likely candidates, and remaining uncertainty."
+        "TendrilFlow may wake you with the recent visible transcript, topic, peers, and available shared context.",
+        "Treat that wake-up as context, not a command. Use your own judgment about whether to speak, research, ask, critique, or synthesize.",
+        "A good contribution usually adds evidence, challenges an assumption, refines the framing, asks a useful question, or connects prior messages.",
+        "Visible peer discussion is usually the shared source of truth; available tools and provider abilities remain yours to use when they help.",
+        "When acting as the closing synthesizer, a helpful pattern is to distinguish likely answers, evidence strength, assumptions, and uncertainty."
       ].join("\n")
     });
   }
@@ -2963,32 +2963,31 @@ class Orchestrator {
       `Group: ${group?.name || session.group_id} (${session.group_id})`,
       `Topic: ${session.topic || "(open discussion)"}`,
       `Suggested target contributions: ${session.target_rounds}`,
-      "Autonomy: advisory only. TendrilFlow provides context and reminders; you decide how to participate.",
+      "Autonomy: advisory only. TendrilFlow provides context, tools, and reminders; you decide how to participate.",
       `Current visible contribution count: ${contributions.length}`,
       `This wake-up is suggested contribution ${nextRound}.`,
       "",
-      "How to participate:",
-      "- Read the visible transcript before answering.",
-      "- Add one concise, useful message if you can contribute evidence, a critique, a correction, a synthesis, or a next question.",
-      "- You are free to stay silent or keep the response minimal if there is nothing materially new.",
-      "- Do not mention private chain-of-thought. Use concise rationale and evidence.",
-      "- Do not run commands or edit files unless the visible user explicitly asks for repository work.",
-      "- Prefer talking in the shared room for ordinary roundtable discussion.",
+      "Participation notes:",
+      "- Read the visible transcript as shared context before deciding what to do.",
+      "- Useful options include evidence, critique, correction, synthesis, a next question, or tool-backed research.",
+      "- You can stay silent, keep it brief, or take initiative when your provider tools and judgment make that useful.",
+      "- Keep private chain-of-thought private; share concise rationale, evidence, and results.",
+      "- Prefer the shared room for roundtable discussion so peers can build on your work.",
       "",
       isFinalSynthesis
         ? [
             "Suggested synthesis moment:",
             "- The discussion reached its target contribution count.",
-            "- If you have enough evidence, produce the visible closing synthesis.",
-            "- Separate the most likely answer from uncertainty.",
-            "- Include candidate ordering, evidence strength, assumptions, and remaining risks.",
-            "- If the transcript is still insufficient, say what is missing instead of inventing certainty."
+            "- If you judge the room has enough signal, produce a visible closing synthesis.",
+            "- A useful synthesis separates likely answers from uncertainty.",
+            "- Candidate ordering, evidence strength, assumptions, and remaining risks are often helpful.",
+            "- If the transcript is still insufficient, it is fine to say what is missing instead of inventing certainty."
           ].join("\n")
         : [
             "Regular discussion guidance:",
-            "- First research/think from your own model knowledge and visible transcript.",
-            "- Then state your conclusion or critique in the room.",
-            "- You may explicitly point out problems in another agent's argument."
+            "- Use your own model knowledge, available tools, and the visible transcript.",
+            "- Share a conclusion, critique, question, or research result when it advances the conversation.",
+            "- It is welcome to point out problems in another agent's argument with evidence."
           ].join("\n"),
       "",
       "Visible transcript:",

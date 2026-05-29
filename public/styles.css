@@ -882,10 +882,49 @@ body.inspector-collapsed .inspector {
   overflow: hidden;
 }
 
+.chat-bubble:has(.copy-message-button) {
+  padding-top: 28px;
+}
+
 .from-user .chat-bubble {
   border-color: #b7dad5;
   border-radius: 8px 8px 2px 8px;
   background: #e3f4f1;
+}
+
+.copy-message-button {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  min-width: 36px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid #d6e0ea;
+  border-radius: 5px;
+  background: rgba(248, 251, 253, 0.94);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 18px;
+  cursor: pointer;
+  opacity: 0.72;
+  transition: opacity 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.chat-bubble:hover .copy-message-button,
+.copy-message-button:focus-visible {
+  opacity: 1;
+}
+
+.copy-message-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.from-user .copy-message-button {
+  border-color: #b9d8d3;
+  background: rgba(255, 255, 255, 0.58);
+  color: #3c6864;
 }
 
 .system-message {

@@ -181,6 +181,9 @@ const i18n = {
     routeTrace: "Route",
     systemTrace: "系统",
     agentReply: "回复",
+    copyMessage: "复制",
+    copiedMessage: "已复制",
+    copyFailed: "复制失败",
     expandTrace: "展开",
     collapseTrace: "收起",
     startOwner: "启动负责人",
@@ -393,6 +396,9 @@ const i18n = {
     routeTrace: "Route",
     systemTrace: "System",
     agentReply: "Reply",
+    copyMessage: "Copy",
+    copiedMessage: "Copied",
+    copyFailed: "Copy failed",
     expandTrace: "Expand",
     collapseTrace: "Collapse",
     startOwner: "Start owner",
@@ -525,6 +531,42 @@ function showToast(message) {
   toastTimer = setTimeout(() => {
     toast.classList.add("hidden");
   }, 5000);
+}
+
+async function copyMessageBubble(button) {
+  const bubble = button.closest(".chat-bubble");
+  const content = bubble?.querySelector(":scope > .event-content");
+  const text = content?.textContent?.trim() || "";
+  if (!text) {
+    return;
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      fallbackCopyText(text);
+    }
+    showToast(t("copiedMessage"));
+  } catch (_error) {
+    try {
+      fallbackCopyText(text);
+      showToast(t("copiedMessage"));
+    } catch (_nestedError) {
+      showToast(t("copyFailed"));
+    }
+  }
+}
+
+function fallbackCopyText(text) {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
 }
 
 async function api(path, options = {}) {
@@ -1626,6 +1668,7 @@ function renderSingleMessageItem(item) {
           <span class="event-type">${escapeHtml(event.type)}</span>
         </div>
         <div class="chat-bubble">
+          ${renderCopyMessageButton()}
           <div class="event-content">${renderEventContent(event.content, event)}</div>
           ${renderMessageDetails(item)}
         </div>
@@ -1649,6 +1692,7 @@ function renderResponseBundle(bundle) {
           ${bundle.events.length > 1 ? `<span class="bundle-count">${escapeHtml(bundleCountLabel(bundle.events.length))}</span>` : ""}
         </div>
         <div class="chat-bubble">
+          ${renderCopyMessageButton()}
           <div class="event-content">${renderResponseBundleContent(bundle.events)}</div>
           ${renderMessageDetails(bundle)}
         </div>
@@ -1759,7 +1803,11 @@ function isSimpleTextContent(content) {
   if (!content || typeof content !== "object" || !content.text) {
     return false;
   }
-  return Object.keys(content).every((key) => ["text", "source"].includes(key));
+  return Object.keys(content).every((key) => ["text", "source"].includes(key) || key.startsWith("roundtable_"));
+}
+
+function renderCopyMessageButton() {
+  return `<button type="button" class="copy-message-button" data-copy-message title="${escapeHtml(t("copyMessage"))}" aria-label="${escapeHtml(t("copyMessage"))}">${escapeHtml(t("copyMessage"))}</button>`;
 }
 
 function contentWithoutKeys(content, keys) {
@@ -1825,6 +1873,7 @@ function renderEvent(event) {
           <span class="event-type">${escapeHtml(event.type)}</span>
         </div>
         <div class="chat-bubble">
+          ${renderCopyMessageButton()}
           <div class="event-content">${renderEventContent(event.content, event)}</div>
         </div>
       </div>
@@ -1950,7 +1999,7 @@ function renderEventContent(content, event = null) {
   }
   if (content.text) {
     const extra = Object.entries(content)
-      .filter(([key]) => !["text", "source"].includes(key))
+      .filter(([key]) => !["text", "source"].includes(key) && !key.startsWith("roundtable_"))
       .map(([key, value]) => [key, value])
       .filter(([, value]) => value !== null && value !== undefined && value !== "");
     if (!extra.length) {
@@ -2763,6 +2812,11 @@ function bindEvents() {
     state.userPinnedHistory = !isNearBottom(event.currentTarget);
   });
   qs("#eventStream").addEventListener("click", (event) => {
+    const copyButton = event.target.closest("[data-copy-message]");
+    if (copyButton) {
+      copyMessageBubble(copyButton);
+      return;
+    }
     const graphButton = event.target.closest("[data-task-graph-apply]");
     if (graphButton) {
       const graphEvent = state.events.find((candidate) => candidate.event_id === graphButton.dataset.taskGraphApply);

@@ -111,7 +111,13 @@ function createHttpServer(orchestrator) {
       }
 
       if ((pathname === "/a2a" || pathname === "/a2a/jsonrpc") && req.method === "POST") {
-        sendJson(res, 200, await handleJsonRpc(orchestrator, await readJson(req)));
+        const body = await readJson(req);
+        const response = await handleJsonRpc(orchestrator, body);
+        if (String(req.headers.accept || "").includes("text/event-stream")) {
+          sendEventStream(res, [response]);
+          return;
+        }
+        sendJson(res, 200, response);
         return;
       }
 

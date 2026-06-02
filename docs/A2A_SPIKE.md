@@ -33,3 +33,15 @@ npm test
 ```
 
 The server test covers Agent Card discovery, JSON-RPC send/get/cancel, and REST streaming smoke behavior.
+
+## SDK interop
+
+Verified against `@a2a-js/sdk@1.0.0-alpha.0` with `ClientFactory.createFromUrl()`:
+
+- Agent Card discovery through `/.well-known/agent-card.json`.
+- JSON-RPC `sendMessage()` creates a TendrilFlow task room and returns `TASK_STATE_WORKING`.
+- JSON-RPC `getTask()` reads the same task and transcript-backed history.
+- JSON-RPC `sendMessageStream()` receives a one-shot SSE event with a task payload.
+- JSON-RPC `cancelTask()` marks the TendrilFlow task as canceled and returns `TASK_STATE_CANCELED`.
+
+The adapter keeps REST send/stream endpoints for manual smoke checks, but the SDK path uses `supportedInterfaces[].protocolBinding` and generated SDK response wrappers such as `{ "task": ... }` for `SendMessage`.

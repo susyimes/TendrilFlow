@@ -75,7 +75,7 @@ test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
   const card = await fetch(`${baseUrl}/.well-known/agent-card.json`).then((response) => response.json());
   assert.equal(card.name, "TendrilFlow");
   assert.equal(card.protocolVersion, "1.0.0");
-  assert.ok(card.supportedInterfaces.some((entry) => entry.transport === "JSONRPC"));
+  assert.ok(card.supportedInterfaces.some((entry) => entry.protocolBinding === "JSONRPC"));
 
   const sent = await fetch(`${baseUrl}/a2a/jsonrpc`, {
     method: "POST",
@@ -96,11 +96,11 @@ test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
   }).then((response) => response.json());
 
   assert.equal(sent.id, "send-1");
-  assert.equal(sent.result.kind, "task");
-  assert.equal(sent.result.status.state, "working");
-  assert.ok(sent.result.history.some((message) => /A2A smoke/.test(message.parts[0].text)));
+  assert.equal(sent.result.task.kind, "task");
+  assert.equal(sent.result.task.status.state, "TASK_STATE_WORKING");
+  assert.ok(sent.result.task.history.some((message) => /A2A smoke/.test(message.parts[0].text)));
 
-  const taskId = sent.result.id;
+  const taskId = sent.result.task.id;
   const fetched = await fetch(`${baseUrl}/tasks/${taskId}`).then((response) => response.json());
   assert.equal(fetched.id, taskId);
   assert.equal(fetched.metadata.source, "tendrilflow");
@@ -116,6 +116,7 @@ test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
     })
   }).then((response) => response.json());
   assert.equal(fetchedRpc.result.id, taskId);
+  assert.equal(fetchedRpc.result.status.state, "TASK_STATE_WORKING");
 
   const canceled = await fetch(`${baseUrl}/a2a/jsonrpc`, {
     method: "POST",
@@ -127,7 +128,7 @@ test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
       params: { id: taskId }
     })
   }).then((response) => response.json());
-  assert.equal(canceled.result.status.state, "canceled");
+  assert.equal(canceled.result.status.state, "TASK_STATE_CANCELED");
 
   const streamResponse = await fetch(`${baseUrl}/message:stream`, {
     method: "POST",
@@ -144,6 +145,27 @@ test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
   assert.equal(streamResponse.headers.get("content-type").split(";")[0], "text/event-stream");
   assert.match(streamText, /^data: /);
   assert.match(streamText, /Stream one TendrilFlow A2A event/);
+
+  const rpcStream = await fetch(`${baseUrl}/a2a/jsonrpc`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "stream-1",
+      method: "SendStreamingMessage",
+      params: {
+        message: {
+          messageId: "msg-a2a-rpc-stream",
+          role: "ROLE_USER",
+          parts: [{ text: "JSON-RPC stream a TendrilFlow A2A event." }]
+        }
+      }
+    })
+  });
+  const rpcStreamText = await rpcStream.text();
+  assert.equal(rpcStream.headers.get("content-type").split(";")[0], "text/event-stream");
+  assert.match(rpcStreamText, /"id":"stream-1"/);
+  assert.match(rpcStreamText, /"task"/);
 });
 
 test("HTTP API supports group chat before any task exists", async (t) => {

@@ -14,10 +14,16 @@ function buildAgentCard(baseUrl) {
     preferredTransport: "JSONRPC",
     supportedInterfaces: [
       {
+        protocolBinding: "JSONRPC",
+        protocolVersion: "1.0",
+        tenant: "",
         transport: "JSONRPC",
         url: `${root}/a2a/jsonrpc`
       },
       {
+        protocolBinding: "HTTP+JSON",
+        protocolVersion: "1.0",
+        tenant: "",
         transport: "HTTP+JSON",
         url: `${root}/a2a`
       }
@@ -25,8 +31,11 @@ function buildAgentCard(baseUrl) {
     capabilities: {
       streaming: true,
       pushNotifications: false,
-      stateTransitionHistory: true
+      stateTransitionHistory: true,
+      extensions: []
     },
+    securitySchemes: {},
+    securityRequirements: [],
     defaultInputModes: ["text"],
     defaultOutputModes: ["text"],
     skills: [
@@ -34,9 +43,14 @@ function buildAgentCard(baseUrl) {
         id: "tendrilflow.task-room.delegate",
         name: "Delegate to a TendrilFlow task room",
         description: "Create a local TendrilFlow task room, route the message to the room owner, and expose the transcript as an A2A task.",
-        tags: ["task-room", "delegation", "local-agents"]
+        tags: ["task-room", "delegation", "local-agents"],
+        examples: ["Ask TendrilFlow to delegate a coding task to the group Host Agent."],
+        inputModes: ["text"],
+        outputModes: ["text"],
+        securityRequirements: []
       }
-    ]
+    ],
+    signatures: []
   };
 }
 
@@ -61,6 +75,9 @@ function extractTextPart(part) {
   }
   if (typeof part.text === "string") {
     return part.text;
+  }
+  if (part.content?.$case === "text") {
+    return String(part.content.value || "");
   }
   if (part.kind === "text" && part.value) {
     return String(part.value);
@@ -149,8 +166,8 @@ function eventToA2aMessage(event) {
   return {
     kind: "message",
     messageId: event.event_id,
-    role: event.actor?.kind === "user" ? "user" : "agent",
-    parts: [{ kind: "text", text }],
+    role: event.actor?.kind === "user" ? "ROLE_USER" : "ROLE_AGENT",
+    parts: [{ text, mediaType: "text/plain" }],
     metadata: {
       source: "tendrilflow",
       event_type: event.type,
@@ -162,17 +179,17 @@ function eventToA2aMessage(event) {
 
 function taskStatusState(task) {
   if (task.a2a_status === "canceled") {
-    return "canceled";
+    return "TASK_STATE_CANCELED";
   }
   return (
     {
-      todo: "submitted",
-      in_progress: "working",
-      blocked: "input-required",
-      review: "working",
-      done: "completed",
-      failed: "failed"
-    }[task.status] || "unknown"
+      todo: "TASK_STATE_SUBMITTED",
+      in_progress: "TASK_STATE_WORKING",
+      blocked: "TASK_STATE_INPUT_REQUIRED",
+      review: "TASK_STATE_WORKING",
+      done: "TASK_STATE_COMPLETED",
+      failed: "TASK_STATE_FAILED"
+    }[task.status] || "TASK_STATE_UNSPECIFIED"
   );
 }
 
@@ -184,7 +201,7 @@ function latestReportArtifact(events) {
   return {
     artifactId: finalReport.event_id,
     name: "final_report",
-    parts: [{ kind: "text", text: eventText(finalReport) }],
+    parts: [{ text: eventText(finalReport), mediaType: "text/plain" }],
     metadata: {
       source: "tendrilflow",
       event_type: "final_report"
@@ -214,6 +231,10 @@ function toA2aTask(task, events = []) {
       a2a_status: task.a2a_status || null
     }
   };
+}
+
+function sendMessageResponse(task) {
+  return { task };
 }
 
 async function sendA2aMessage(orchestrator, params = {}) {
@@ -288,10 +309,10 @@ async function handleJsonRpc(orchestrator, envelope) {
   const method = String(envelope.method);
   try {
     if (["SendMessage", "message/send", "tasks/send"].includes(method)) {
-      return jsonRpcSuccess(id, await sendA2aMessage(orchestrator, envelope.params || {}));
+      return jsonRpcSuccess(id, sendMessageResponse(await sendA2aMessage(orchestrator, envelope.params || {})));
     }
     if (["SendStreamingMessage", "message/stream", "tasks/sendSubscribe"].includes(method)) {
-      return jsonRpcSuccess(id, await sendA2aMessage(orchestrator, envelope.params || {}));
+      return jsonRpcSuccess(id, sendMessageResponse(await sendA2aMessage(orchestrator, envelope.params || {})));
     }
     if (["GetTask", "tasks/get"].includes(method)) {
       return jsonRpcSuccess(id, await getA2aTask(orchestrator, taskIdFromParams(envelope.params)));

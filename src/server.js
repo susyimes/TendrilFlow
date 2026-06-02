@@ -1,6 +1,14 @@
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
+const {
+  buildAgentCard,
+  cancelA2aTask,
+  getA2aTask,
+  handleJsonRpc,
+  listA2aTasks,
+  sendA2aMessage
+} = require("./a2a");
 const { Orchestrator } = require("./orchestrator");
 const {
   AGENT_ISOLATION_MODES,
@@ -29,6 +37,23 @@ function sendText(res, status, text, contentType = "text/plain; charset=utf-8") 
     "content-length": Buffer.byteLength(text)
   });
   res.end(text);
+}
+
+function requestBaseUrl(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || "http").split(",")[0].trim() || "http";
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "127.0.0.1").split(",")[0].trim();
+  return `${proto}://${host}`;
+}
+
+function sendEventStream(res, payloads) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  for (const payload of payloads) {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+  res.end();
 }
 
 async function readJson(req) {
@@ -80,6 +105,43 @@ function createHttpServer(orchestrator) {
     const url = new URL(req.url, "http://localhost");
     const pathname = url.pathname;
     try {
+      if (pathname === "/.well-known/agent-card.json" && req.method === "GET") {
+        sendJson(res, 200, buildAgentCard(requestBaseUrl(req)));
+        return;
+      }
+
+      if ((pathname === "/a2a" || pathname === "/a2a/jsonrpc") && req.method === "POST") {
+        sendJson(res, 200, await handleJsonRpc(orchestrator, await readJson(req)));
+        return;
+      }
+
+      if ((pathname === "/message:send" || pathname === "/a2a/message:send") && req.method === "POST") {
+        sendJson(res, 200, await sendA2aMessage(orchestrator, await readJson(req)));
+        return;
+      }
+
+      if ((pathname === "/message:stream" || pathname === "/a2a/message:stream") && req.method === "POST") {
+        sendEventStream(res, [await sendA2aMessage(orchestrator, await readJson(req))]);
+        return;
+      }
+
+      if ((pathname === "/tasks" || pathname === "/a2a/tasks") && req.method === "GET") {
+        sendJson(res, 200, await listA2aTasks(orchestrator));
+        return;
+      }
+
+      const a2aTaskRoute = pathname.match(/^\/(?:a2a\/)?tasks\/([^/:]+)$/);
+      if (a2aTaskRoute && req.method === "GET") {
+        sendJson(res, 200, await getA2aTask(orchestrator, decodeURIComponent(a2aTaskRoute[1])));
+        return;
+      }
+
+      const a2aCancelRoute = pathname.match(/^\/(?:a2a\/)?tasks\/([^/:]+):cancel$/);
+      if (a2aCancelRoute && req.method === "POST") {
+        sendJson(res, 200, await cancelA2aTask(orchestrator, decodeURIComponent(a2aCancelRoute[1])));
+        return;
+      }
+
       if (pathname === "/api/meta" && req.method === "GET") {
         sendJson(res, 200, {
           roles: AGENT_ROLES,

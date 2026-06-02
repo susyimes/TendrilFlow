@@ -68,6 +68,84 @@ test("HTTP API supports the core task room flow", async (t) => {
   assert.equal(applied.parent_task.child_task_ids.length, applied.tasks.length);
 });
 
+test("HTTP API exposes a minimal A2A discovery and task adapter", async (t) => {
+  const { baseUrl, server } = await startTestServer();
+  t.after(() => server.close());
+
+  const card = await fetch(`${baseUrl}/.well-known/agent-card.json`).then((response) => response.json());
+  assert.equal(card.name, "TendrilFlow");
+  assert.equal(card.protocolVersion, "1.0.0");
+  assert.ok(card.supportedInterfaces.some((entry) => entry.transport === "JSONRPC"));
+
+  const sent = await fetch(`${baseUrl}/a2a/jsonrpc`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "send-1",
+      method: "SendMessage",
+      params: {
+        message: {
+          messageId: "msg-a2a-1",
+          role: "user",
+          parts: [{ kind: "text", text: "Create a short TendrilFlow A2A smoke note." }],
+          kind: "message"
+        }
+      }
+    })
+  }).then((response) => response.json());
+
+  assert.equal(sent.id, "send-1");
+  assert.equal(sent.result.kind, "task");
+  assert.equal(sent.result.status.state, "working");
+  assert.ok(sent.result.history.some((message) => /A2A smoke/.test(message.parts[0].text)));
+
+  const taskId = sent.result.id;
+  const fetched = await fetch(`${baseUrl}/tasks/${taskId}`).then((response) => response.json());
+  assert.equal(fetched.id, taskId);
+  assert.equal(fetched.metadata.source, "tendrilflow");
+
+  const fetchedRpc = await fetch(`${baseUrl}/a2a/jsonrpc`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "get-1",
+      method: "GetTask",
+      params: { id: taskId }
+    })
+  }).then((response) => response.json());
+  assert.equal(fetchedRpc.result.id, taskId);
+
+  const canceled = await fetch(`${baseUrl}/a2a/jsonrpc`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "cancel-1",
+      method: "CancelTask",
+      params: { id: taskId }
+    })
+  }).then((response) => response.json());
+  assert.equal(canceled.result.status.state, "canceled");
+
+  const streamResponse = await fetch(`${baseUrl}/message:stream`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: {
+        messageId: "msg-a2a-stream",
+        role: "user",
+        parts: [{ kind: "text", text: "Stream one TendrilFlow A2A event." }]
+      }
+    })
+  });
+  const streamText = await streamResponse.text();
+  assert.equal(streamResponse.headers.get("content-type").split(";")[0], "text/event-stream");
+  assert.match(streamText, /^data: /);
+  assert.match(streamText, /Stream one TendrilFlow A2A event/);
+});
+
 test("HTTP API supports group chat before any task exists", async (t) => {
   const { baseUrl, server } = await startTestServer();
   t.after(() => server.close());
